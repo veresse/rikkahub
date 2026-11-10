@@ -14,6 +14,9 @@ import me.rerere.rikkahub.service.ChatFloatingTracker
 import me.rerere.rikkahub.service.ChatNotificationManager
 import me.rerere.rikkahub.service.ChatService
 import me.rerere.rikkahub.service.MediaCreationService
+import me.rerere.rikkahub.service.autochat.AutoChatExecutionService
+import me.rerere.rikkahub.service.autochat.AutoChatScheduler
+import me.rerere.rikkahub.service.autochat.AutoChatWorker
 import me.rerere.rikkahub.ui.floating.ChatFloatingWindows
 import me.rerere.rikkahub.ui.pages.extensions.workspace.WorkspaceTerminalSessionManager
 import me.rerere.rikkahub.utils.EmojiData
@@ -23,6 +26,7 @@ import me.rerere.rikkahub.utils.SoundEffectPlayer
 import me.rerere.rikkahub.utils.UpdateChecker
 import me.rerere.rikkahub.web.WebServerManager
 import me.rerere.tts.provider.TTSManager
+import org.koin.androidx.workmanager.dsl.worker
 import org.koin.dsl.module
 
 val appModule = module {
@@ -172,6 +176,34 @@ val appModule = module {
             folderRepo = get(),
             settingsStore = get(),
             filesManager = get()
+        )
+    }
+
+    single {
+        AutoChatExecutionService(
+            context = get(),
+            repository = get(),
+            settingsStore = get(),
+            chatService = get(),
+            conversationRepo = get(),
+            requestFactory = get(),
+        )
+    }
+
+    single {
+        AutoChatScheduler(
+            context = get(),
+            repository = get(),
+            lazyExecutionService = lazy { get() },
+        )
+    }
+
+    worker {
+        AutoChatWorker(
+            appContext = get(),
+            workerParams = get(),
+            executionService = get(),
+            scheduler = get(),
         )
     }
 }

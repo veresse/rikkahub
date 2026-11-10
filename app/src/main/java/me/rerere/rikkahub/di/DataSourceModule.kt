@@ -130,6 +130,14 @@ val dataSourceModule = module {
     }
 
     single {
+        get<AppDatabase>().autoChatRuleDao()
+    }
+
+    single {
+        get<AppDatabase>().autoChatRecordDao()
+    }
+
+    single {
         UsageRecorder(dao = get(), scope = get<AppScope>())
     }
 

@@ -122,6 +122,25 @@ class ChatRequestFactory(
         )
     }
 
+    /** 创建角色主动消息的请求上下文：禁用副作用工具，保留生效的系统提示词、记忆、模型参数和transformers */
+    suspend fun createAutoChatContext(settings: Settings, conversation: Conversation): ChatTurnContext {
+        val assistant = settings.getAssistantOf(conversation)
+        val model = settings.getChatModelOf(conversation)
+            ?: throw IllegalStateException("No chat model selected")
+        val provider = model.findProvider(settings.providers) ?: error("Provider not found")
+        return ChatTurnContext(
+            settings = settings,
+            assistant = assistant,
+            model = model,
+            providerSetting = provider,
+            conversationId = conversation.id,
+            conversationSystemPrompt = conversation.customSystemPrompt,
+            workspaceCwd = conversation.workspaceCwd,
+            memories = if (assistant.enableMemory) memoryRepository.getFiles(assistant.memoryId) else emptyList(),
+            tools = emptyList(), // 禁用副作用工具
+        )
+    }
+
     /**
      * 本轮交给 runAgent 的请求和钩子。[messages] 的最后一条是助手消息时从它继续，否则新建一条助手消息。
      * [processingStatus] 用来显示 OCR 这类输入转换的进度；[takePendingParts] 取出要在请求模型前写进助手消息的通知。

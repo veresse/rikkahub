@@ -293,6 +293,18 @@ class ChatService(
         block(session)
     }
 
+    /** 供后台任务或外部调用：在已存在的会话上安全执行操作；若会话不存在则抛出 NotFoundException */
+    suspend fun <T> withExistingSession(
+        conversationId: Uuid,
+        block: suspend (ConversationSession) -> T,
+    ): T = withLoadedSession(conversationId, createIfMissing = false, block = block)
+
+    /** 检查会话当前是否忙碌（正在生成、等待工具审批或压缩） */
+    fun isSessionBusy(conversationId: Uuid): Boolean {
+        val session = sessionManager.get(conversationId) ?: return false
+        return session.getJob() != null || session.state.value.isAwaitingToolApproval || session.isCompressing
+    }
+
     // 新建对话, 并添加预设消息
     private suspend fun newConversation(conversationId: Uuid): Conversation {
         val assistant = settingsStore.awaitLoaded().getCurrentAssistant()

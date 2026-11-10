@@ -40,6 +40,7 @@ import me.rerere.rikkahub.di.repositoryModule
 import me.rerere.rikkahub.di.viewModelModule
 import me.rerere.rikkahub.service.MediaCreationService
 import me.rerere.rikkahub.service.WebServerService
+import me.rerere.rikkahub.service.autochat.AutoChatScheduler
 import me.rerere.rikkahub.utils.CrashHandler
 import me.rerere.rikkahub.utils.DatabaseUtil
 import me.rerere.rikkahub.utils.JsonInstant
@@ -63,11 +64,13 @@ class RikkaHubApp : Application() {
     override fun onCreate() {
         super.onCreate()
         // Restore files and settings before eager Koin singletons or workers can access them.
+        var isDatabaseRestored = false
         try {
             val restored = runBlocking(Dispatchers.IO) {
                 BackupManager.applyPendingRestore(this@RikkaHubApp, JsonInstant)
             }
             if (restored) {
+                isDatabaseRestored = true
                 Toast.makeText(this, R.string.backup_page_restore_success, Toast.LENGTH_LONG).show()
             }
         } catch (e: RestoreFailedException) {
@@ -115,6 +118,7 @@ class RikkaHubApp : Application() {
         // Resume media generations interrupted by the last process death
         resumeMediaCreations()
         resumeMemoryConsolidation()
+        resumeAutoChat(isDatabaseRestored)
 
         // Increment launch count
         incrementLaunchCount()
@@ -128,6 +132,21 @@ class RikkaHubApp : Application() {
                 get<MediaCreationService>().resumePending()
             }.onFailure {
                 Log.e(TAG, "resumeMediaCreations failed", it)
+            }
+        }
+    }
+
+    private fun resumeAutoChat(isDatabaseRestored: Boolean) {
+        get<AppScope>().launch(Dispatchers.IO) {
+            runCatching {
+                val scheduler = get<AutoChatScheduler>()
+                if (isDatabaseRestored) {
+                    scheduler.onDatabaseRestored()
+                } else {
+                    scheduler.reconcile()
+                }
+            }.onFailure {
+                Log.e(TAG, "resumeAutoChat failed", it)
             }
         }
     }

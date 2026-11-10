@@ -133,6 +133,9 @@ import me.rerere.rikkahub.ui.pages.setting.SettingMediaPage
 import me.rerere.rikkahub.ui.pages.setting.SettingMediaProviderDetailPage
 import me.rerere.rikkahub.ui.pages.setting.SettingSpeechPage
 import me.rerere.rikkahub.ui.pages.setting.SettingWebPage
+import me.rerere.rikkahub.ui.pages.setting.autochat.SettingAutoChatDetailPage
+import me.rerere.rikkahub.ui.pages.setting.autochat.SettingAutoChatHistoryPage
+import me.rerere.rikkahub.ui.pages.setting.autochat.SettingAutoChatPage
 import me.rerere.rikkahub.ui.pages.share.handler.ShareHandlerPage
 import me.rerere.rikkahub.ui.pages.stats.StatsPage
 import me.rerere.rikkahub.ui.pages.translator.TranslatorPage
@@ -537,6 +540,18 @@ class RouteActivity : ComponentActivity() {
                                 SettingWebPage()
                             }
 
+                            entry<Screen.SettingAutoChat> {
+                                SettingAutoChatPage()
+                            }
+
+                            entry<Screen.SettingAutoChatDetail> { key ->
+                                SettingAutoChatDetailPage(ruleIdStr = key.ruleId)
+                            }
+
+                            entry<Screen.SettingAutoChatHistory> {
+                                SettingAutoChatHistoryPage()
+                            }
+
                             entry<Screen.Debug> {
                                 DebugPage()
                             }
@@ -779,6 +794,15 @@ sealed interface Screen : NavKey {
 
     @Serializable
     data object SettingFiles : Screen
+
+    @Serializable
+    data object SettingAutoChat : Screen
+
+    @Serializable
+    data class SettingAutoChatDetail(val ruleId: String) : Screen
+
+    @Serializable
+    data object SettingAutoChatHistory : Screen
 
     @Serializable
     data object SettingWeb : Screen

@@ -11,4 +11,10 @@ sealed class UIMessageAnnotation {
         val title: String,
         val url: String
     ) : UIMessageAnnotation()
+
+    @Serializable
+    @SerialName("auto_chat")
+    data class AutoChat(
+        val isTest: Boolean = false,
+    ) : UIMessageAnnotation()
 }
