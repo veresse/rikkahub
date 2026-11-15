@@ -137,10 +137,19 @@ async def export_backup(db: AsyncSession = Depends(get_db)):
             """, (n.id, n.conversation_id, n.node_index, json.dumps(n.messages, ensure_ascii=False), n.select_index))
 
         mem_res = await db.execute(select(MemoryModel))
+        mem_map: dict[tuple[str | None, str], list[str]] = {}
         for m in mem_res.scalars().all():
+            key = (m.assistant_id, m.path or "default.md")
+            if key not in mem_map:
+                mem_map[key] = []
+            if m.content.strip():
+                mem_map[key].append(m.content.strip())
+
+        for (ast_id, path), contents in mem_map.items():
+            merged_content = "\n\n".join(contents)
             cur.execute("""
-            INSERT INTO memory_file VALUES (?, ?, ?, ?)
-            """, (m.assistant_id, m.path, m.content, m.updated_at))
+            INSERT OR REPLACE INTO memory_file VALUES (?, ?, ?, ?)
+            """, (ast_id, path, merged_content, 1700000200000))
 
         conn.commit()
         conn.close()
