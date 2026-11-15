@@ -1,0 +1,19 @@
+[Unit]
+Description=RikkaHub Companion Server (伴侣后端服务)
+After=network.target
+
+[Service]
+Type=simple
+User=root
+WorkingDirectory=/opt/rikkahub/companion/server
+Environment="PYTHONUNBUFFERED=1"
+ExecStart=/opt/rikkahub/companion/server/.venv/bin/uvicorn companion.server.app.main:app --host 127.0.0.1 --port 8000 --workers 1
+
+# 安全限制
+Restart=always
+RestartSec=5s
+LimitNOFILE=65536
+MemoryMax=800M
+
+[Install]
+WantedBy=multi-user.target
