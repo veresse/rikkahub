@@ -15,18 +15,21 @@ fi
 .venv/bin/pip install --upgrade pip
 .venv/bin/pip install -r requirements.txt
 
-# 3. 部署 Systemd 服务
+# 3. 确保前端静态资源目录权限 (允许 Nginx 访问)
+chmod -R 755 /opt/rikkahub/companion/web/dist 2>/dev/null || true
+
+# 4. 部署 Systemd 服务
 cp /opt/rikkahub/companion/deploy/companion.service /etc/systemd/system/companion.service
 systemctl daemon-reload
 systemctl enable companion
 systemctl restart companion
 
-# 4. 部署 Nginx 配置
+# 5. 部署 Nginx 配置
 cp /opt/rikkahub/companion/deploy/nginx.conf /etc/nginx/sites-available/rikkahub-companion
 ln -sf /etc/nginx/sites-available/rikkahub-companion /etc/nginx/sites-enabled/rikkahub-companion
 rm -f /etc/nginx/sites-enabled/default
 nginx -t
-systemctl reload nginx
+systemctl restart nginx
 
 echo "=== 部署完成！伴侣服务已在后台常驻运行 ==="
 echo "查看服务状态: systemctl status companion"

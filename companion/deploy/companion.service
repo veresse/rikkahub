@@ -5,13 +5,14 @@ After=network.target
 [Service]
 Type=simple
 User=root
-WorkingDirectory=/opt/rikkahub/companion/server
+WorkingDirectory=/opt/rikkahub
 Environment="PYTHONUNBUFFERED=1"
+Environment="PYTHONPATH=/opt/rikkahub"
 ExecStart=/opt/rikkahub/companion/server/.venv/bin/uvicorn companion.server.app.main:app --host 127.0.0.1 --port 8000 --workers 1
 
-# 安全限制
+# 安全限制与自愈
 Restart=always
-RestartSec=5s
+RestartSec=3s
 LimitNOFILE=65536
 MemoryMax=800M
 
