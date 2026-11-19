@@ -12,7 +12,8 @@ from companion.server.app.routers import (
     memories,
     chat,
     import_export,
-    devices
+    devices,
+    app_update
 )
 
 @asynccontextmanager
@@ -44,6 +45,7 @@ app.include_router(memories.router, prefix=api_prefix)
 app.include_router(chat.router, prefix=api_prefix)
 app.include_router(import_export.router, prefix=api_prefix)
 app.include_router(devices.router, prefix=api_prefix)
+app.include_router(app_update.router, prefix=api_prefix)
 
 @app.get("/api/health")
 async def health_check():
