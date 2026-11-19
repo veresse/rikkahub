@@ -1,0 +1,88 @@
+name: Build Custom Release APK
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      version_name:
+        description: '发布版本号 (如 3.2.2，留空则使用默认配置)'
+        required: false
+        default: ''
+
+jobs:
+  build:
+    name: Build & Release Custom APK
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Set up JDK 21
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+          cache: 'gradle'
+
+      - name: Setup Android Keystore
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+        run: |
+          if [ -n "$KEYSTORE_BASE64" ]; then
+            echo "$KEYSTORE_BASE64" | base64 -d > app/custom-release.jks
+            echo "Keystore restored successfully."
+          else
+            echo "WARNING: KEYSTORE_BASE64 is not set in secrets! Build will fallback to default unsigned."
+          fi
+
+      - name: Grant execute permission for gradlew
+        run: chmod +x gradlew
+
+      - name: Build with Gradle
+        env:
+          KEYSTORE_FILE: custom-release.jks
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          ./gradlew assembleGithubRelease --no-daemon
+
+      - name: Determine Release Tag
+        id: vars
+        run: |
+          if [ -n "${{ github.event.inputs.version_name }}" ]; then
+            echo "tag=v${{ github.event.inputs.version_name }}" >> $GITHUB_OUTPUT
+            echo "version=${{ github.event.inputs.version_name }}" >> $GITHUB_OUTPUT
+          elif [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            TAG_NAME="${GITHUB_REF#refs/tags/}"
+            echo "tag=$TAG_NAME" >> $GITHUB_OUTPUT
+            echo "version=${TAG_NAME#v}" >> $GITHUB_OUTPUT
+          else
+            DATE_TAG="v3.2.1-custom-$(date +'%Y%m%d%H%M')"
+            echo "tag=$DATE_TAG" >> $GITHUB_OUTPUT
+            echo "version=3.2.1" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Upload APKs to GitHub Release
+        uses: softprops/action-gh-release@v2
+        if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
+        with:
+          tag_name: ${{ steps.vars.outputs.tag }}
+          name: "RikkaHub 专属增强版 ${{ steps.vars.outputs.tag }}"
+          body: |
+            ### RikkaHub 专属增强版（自动构建）
+            - 同步原作者最新功能与漏洞修复
+            - 内置夏以昼伴侣全双工打断与实体外设通信
+            - 阶梯滞回截断算法，激活 DeepSeek 10 倍 Prompt Cache 降费
+            - 支持手机端一键平滑覆盖更新（签名永久一致）
+          files: |
+            app/build/outputs/apk/github/release/*.apk
+          draft: false
+          prerelease: false

@@ -21,7 +21,8 @@ import me.rerere.rikkahub.BuildConfig
 import okhttp3.OkHttpClient
 import okhttp3.Request
 
-private const val API_URL = "https://updates.rikka-ai.com/"
+// 优先使用伴侣服务器自建更新源，自动对接 veresse/rikkahub 专属 GitHub Release
+private const val API_URL = "http://43.154.46.4:9090/api/app-update"
 
 class UpdateChecker(
     private val client: OkHttpClient,
