@@ -44,7 +44,7 @@ jobs:
       - name: Install web-ui dependencies
         run: |
           cd web-ui
-          pnpm install
+          pnpm install --no-frozen-lockfile
 
       - name: Setup Android Keystore
         env:
