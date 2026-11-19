@@ -14,3 +14,23 @@ local.properties
 *.keystore
 *.jks
 *keystore*.txt
+
+# Python virtual environments & bytecode
+.venv/
+*/.venv/
+*/*/.venv/
+venv/
+*/venv/
+__pycache__/
+*.py[cod]
+*$py.class
+*.sqlite
+*.db
+*.db-*
+data/
+*/data/
+
+# Node.js
+node_modules/
+*/node_modules/
+.vite/
