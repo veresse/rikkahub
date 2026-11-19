@@ -1,0 +1,57 @@
+name: Auto Sync Upstream (自动同步作者更新)
+
+on:
+  schedule:
+    # 每天北京时间 08:00、14:00、20:00 自动巡检 (UTC 00:00, 06:00, 12:00)
+    - cron: '0 0,6,12,18 * * *'
+  workflow_dispatch:
+    # 支持随时在 GitHub 网页上点击按钮立即主动检查同步
+
+jobs:
+  sync:
+    name: Check & Sync Upstream
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Checkout main branch
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Setup Git identity
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Fetch upstream repository
+        run: |
+          git remote add upstream https://github.com/rikkahub/rikkahub.git
+          git fetch upstream master
+
+      - name: Compare with upstream
+        id: check_diff
+        run: |
+          BEHIND=$(git rev-list --count HEAD..upstream/master)
+          echo "behind_count=$BEHIND" >> $GITHUB_OUTPUT
+          echo ">>> 相比作者 upstream/master 落后提交数: $BEHIND"
+
+      - name: Merge and Push
+        if: steps.check_diff.outputs.behind_count != '0'
+        run: |
+          echo ">>> 检测到作者有新更新，正在自动合并..."
+          git merge upstream/master --no-edit -m "chore(auto-sync): 自动同步原作者最新更新 (${{ steps.check_diff.outputs.behind_count }} commits)"
+          git push origin main
+          
+          # 自动生成发布标签，触发云端自动打包与 Release 发布
+          AUTO_TAG="v$(date +'%Y.%m.%d.%H%M')"
+          git tag $AUTO_TAG
+          git push origin $AUTO_TAG
+          echo ">>> 成功推送发布标签 $AUTO_TAG，将自动触发构建并发布专属 APK！"
+
+      - name: No updates
+        if: steps.check_diff.outputs.behind_count == '0'
+        run: |
+          echo ">>> 检查完毕：当前已是原作者最新代码，无需同步。"
