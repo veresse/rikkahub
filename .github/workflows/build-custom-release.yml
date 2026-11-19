@@ -53,6 +53,7 @@ jobs:
           if [ -n "$KEYSTORE_BASE64" ]; then
             echo "$KEYSTORE_BASE64" | tr -d '\r\n ' | base64 -d > app/custom-release.jks
             echo "Keystore restored successfully."
+            ls -lh app/custom-release.jks
           else
             echo "WARNING: KEYSTORE_BASE64 is not set in secrets!"
           fi
@@ -62,7 +63,7 @@ jobs:
 
       - name: Build with Gradle
         env:
-          KEYSTORE_FILE: custom-release.jks
+          KEYSTORE_FILE: ${{ github.workspace }}/app/custom-release.jks
           KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
           KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
           KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
