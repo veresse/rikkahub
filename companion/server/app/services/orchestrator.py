@@ -13,6 +13,49 @@ from companion.server.app.models.memory import MemoryModel
 from companion.server.app.services.deepseek_client import DeepSeekClient
 from companion.server.app.services.search_provider import SearchProvider
 
+# 上下文截断常数：与手机端阶梯滞回机制严格对齐
+CONTEXT_KEEP_RATIO = 0.6
+DEFAULT_CONTEXT_MESSAGE_LIMIT = 20  # 默认最大保留 20 条消息 (约 10 轮交互)，杜绝无脑全捞
+MAX_MEMORY_ITEMS = 10               # 最多注入 10 条核心记忆，防止上下文基底过重
+MAX_MEMORY_CHAR_LEN = 200          # 单条记忆截断长度上限
+
+def limit_context_hysteresis(messages: list[dict[str, str]], limit: int) -> list[dict[str, str]]:
+    """
+    按阶梯式(滞回)策略限制上下文消息数量，极大提高大模型 Prompt Cache 命中率。
+    
+    核心原理：
+    普通滑动窗口每多一条消息就向前滑动一条，导致上下文整个前缀每轮都发生变化，打碎 DeepSeek 的 Prompt Cache；
+    滞回算法在未超过 limit 时完全不移动起点；一旦超过 limit，一次性跳过 stride 条；
+    在接下来的连续 stride 轮对话中，截断起点保持绝对静止，从而最大化复用 DeepSeek 的前缀缓存，费用直降 90%。
+    """
+    if not messages:
+        return []
+
+    # 若 limit <= 0，使用默认的 20 条兜底保护
+    effective_limit = limit if limit > 0 else DEFAULT_CONTEXT_MESSAGE_LIMIT
+
+    if len(messages) <= effective_limit:
+        return messages
+
+    target = max(1, min(effective_limit, round(effective_limit * CONTEXT_KEEP_RATIO)))
+    stride = max(1, effective_limit - target)
+
+    # 阶梯步进计算截断点
+    start_index = min(len(messages) - 1, ((len(messages) - effective_limit) // stride + 1) * stride)
+
+    # 边界对齐：确保上下文第一条必须是 user 角色消息 (避免从半截 assistant 回复开头导致模型幻觉)
+    adjusted_start = start_index
+    while adjusted_start < len(messages) and messages[adjusted_start].get("role") != "user":
+        adjusted_start += 1
+
+    # 兜底：如果往后找不到 user 消息，则往前找 user 消息
+    if adjusted_start >= len(messages):
+        adjusted_start = start_index
+        while adjusted_start > 0 and messages[adjusted_start].get("role") != "user":
+            adjusted_start -= 1
+
+    return messages[adjusted_start:]
+
 # 内存会话锁字典，保证同一会话同一时刻单轮生成
 _CONVERSATION_LOCKS: dict[str, asyncio.Lock] = {}
 
@@ -49,7 +92,7 @@ class ChatOrchestrator:
         if conv.custom_system_prompt:
             system_content_parts.append(conv.custom_system_prompt.strip())
 
-        # 检索记忆 (若开启)
+        # 检索记忆 (若开启，限制最多 10 条，且单条长度受限，保证前缀稳定)
         if assistant.enable_memory:
             mem_query = select(MemoryModel)
             if assistant.use_global_memory:
@@ -57,12 +100,18 @@ class ChatOrchestrator:
             else:
                 mem_query = mem_query.where(MemoryModel.assistant_id == assistant.id)
 
+            # 按 updated_at 倒序取最近更新的记忆，最多 MAX_MEMORY_ITEMS 条
+            mem_query = mem_query.order_by(MemoryModel.updated_at.desc()).limit(MAX_MEMORY_ITEMS)
             mem_res = await db.execute(mem_query)
-            memories = mem_res.scalars().all()
+            memories = list(mem_res.scalars().all())
+
+            # 再次按 id 稳定升序排序，确保生成的 System Prompt 字符串字节级一致，绝不破坏 Prompt Cache
+            memories.sort(key=lambda m: str(m.id))
+
             if memories:
-                memory_texts = "\n".join([f"- {m.content.strip()}" for m in memories if m.content.strip()])
+                memory_texts = "\n".join([f"- {m.content.strip()[:MAX_MEMORY_CHAR_LEN]}" for m in memories if m.content.strip()])
                 if memory_texts:
-                    system_content_parts.append(f"\n【关于用户的长期记忆】\n{memory_texts}")
+                    system_content_parts.append(f"\n【关于用户的核心记忆】\n{memory_texts}")
 
         system_message = {"role": "system", "content": "\n\n".join(system_content_parts)}
 
@@ -90,9 +139,8 @@ class ChatOrchestrator:
             if text_content.strip():
                 history_messages.append({"role": role, "content": text_content.strip()})
 
-        # 4. 根据角色的 context_message_limit 进行截断
-        if assistant.context_message_limit > 0 and len(history_messages) > assistant.context_message_limit:
-            history_messages = history_messages[-assistant.context_message_limit:]
+        # 4. 采用阶梯式(滞回)算法进行上下文截断：固定台阶起点，最大化激活 Prompt Cache
+        history_messages = limit_context_hysteresis(history_messages, assistant.context_message_limit)
 
         # 5. 组合全部消息
         full_messages = [system_message] + history_messages + [{"role": "user", "content": user_text}]
@@ -132,6 +180,7 @@ class ChatOrchestrator:
             client = DeepSeekClient()
             full_response_text = ""
             full_reasoning_text = ""
+            latest_usage = None
 
             yield {"type": "status", "status": "generating"}
 
@@ -150,6 +199,9 @@ class ChatOrchestrator:
                 elif chunk_type == "error":
                     yield chunk
                     return
+                elif chunk_type == "usage":
+                    latest_usage = chunk["usage"]
+                    yield chunk
 
             # 生成完成，保存到数据库
             # 构建新的 UIMessage 结构
@@ -168,6 +220,8 @@ class ChatOrchestrator:
             if full_reasoning_text:
                 assistant_msg["parts"].append({"reasoning": full_reasoning_text})
             assistant_msg["parts"].append({"text": full_response_text})
+            if latest_usage:
+                assistant_msg["tokenUsage"] = latest_usage
 
             async with db.begin():
                 if regenerate_node_id:

@@ -36,7 +36,8 @@ class DeepSeekClient:
         payload: dict[str, Any] = {
             "model": model or settings.DEEPSEEK_DEFAULT_MODEL,
             "messages": messages,
-            "stream": True
+            "stream": True,
+            "stream_options": {"include_usage": True}
         }
         if temperature is not None:
             payload["temperature"] = temperature
@@ -81,6 +82,10 @@ class DeepSeekClient:
                             # 工具调用 (Tool Calls)
                             if "tool_calls" in delta:
                                 yield {"type": "tool_call", "delta": delta["tool_calls"]}
+
+                            # 统计信息 (Usage 包含 prompt_cache_hit_tokens)
+                            if "usage" in chunk and chunk["usage"]:
+                                yield {"type": "usage", "usage": chunk["usage"]}
 
                         except json.JSONDecodeError:
                             continue
