@@ -1,3 +1,11 @@
+import sys
+from pathlib import Path
+
+# 确保项目根路径加入 sys.path
+project_root = Path(__file__).resolve().parent.parent.parent.parent
+if str(project_root) not in sys.path:
+    sys.path.insert(0, str(project_root))
+
 import pytest
 from companion.server.app.services.orchestrator import (
     limit_context_hysteresis,
