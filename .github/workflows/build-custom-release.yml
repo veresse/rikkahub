@@ -7,9 +7,14 @@ on:
   workflow_dispatch:
     inputs:
       version_name:
-        description: '发布版本号 (如 3.2.2，留空则使用默认配置)'
+        description: 'APK 与发布版本号（如 3.3.1，留空则自动递增构建版本）'
         required: false
         default: ''
+  workflow_call:
+    inputs:
+      source_ref:
+        type: string
+        required: true
 
 jobs:
   build:
@@ -22,7 +27,32 @@ jobs:
       - name: Checkout Code
         uses: actions/checkout@v4
         with:
+          ref: ${{ inputs.source_ref || github.ref }}
           fetch-depth: 0
+
+      - name: Determine APK version and release tag
+        id: vars
+        env:
+          REQUESTED_VERSION: ${{ inputs.version_name }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          VERSION_CODE=$(( $(date +%s) - 1577836800 ))
+          BASE_VERSION=$(sed -nE 's/.*versionName = .*"([0-9]+\.[0-9]+\.[0-9]+)".*/\1/p' app/build.gradle.kts | head -n 1)
+          if [ -n "$REQUESTED_VERSION" ]; then
+            VERSION="$REQUESTED_VERSION"
+          elif [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            VERSION="${GITHUB_REF#refs/tags/v}"
+          else
+            VERSION="$BASE_VERSION.$VERSION_CODE"
+          fi
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+(\.[0-9]+)?$ ]]; then
+            echo "::error::Version must contain three or four numeric components (for example 3.3.1 or 3.3.1.12)."
+            exit 1
+          fi
+          echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+          echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
+          echo "code=$VERSION_CODE" >> "$GITHUB_OUTPUT"
 
       - name: Set up JDK 21
         uses: actions/setup-java@v4
@@ -74,30 +104,16 @@ jobs:
           KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
           KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
           KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+          APK_VERSION_NAME: ${{ steps.vars.outputs.version }}
+          APK_VERSION_CODE: ${{ steps.vars.outputs.code }}
         run: |
-          ./gradlew assembleGithubRelease --no-daemon --stacktrace
-
-      - name: Determine Release Tag
-        id: vars
-        run: |
-          if [ -n "${{ github.event.inputs.version_name }}" ]; then
-            echo "tag=v${{ github.event.inputs.version_name }}" >> $GITHUB_OUTPUT
-            echo "version=${{ github.event.inputs.version_name }}" >> $GITHUB_OUTPUT
-          elif [[ "${{ github.ref }}" == refs/tags/* ]]; then
-            TAG_NAME="${GITHUB_REF#refs/tags/}"
-            echo "tag=$TAG_NAME" >> $GITHUB_OUTPUT
-            echo "version=${TAG_NAME#v}" >> $GITHUB_OUTPUT
-          else
-            DATE_TAG="v3.2.1-custom-$(date +'%Y%m%d%H%M')"
-            echo "tag=$DATE_TAG" >> $GITHUB_OUTPUT
-            echo "version=3.2.1" >> $GITHUB_OUTPUT
-          fi
+          ./gradlew assembleGithubRelease -PcustomVersionName="$APK_VERSION_NAME" -PcustomVersionCode="$APK_VERSION_CODE" --no-daemon --stacktrace
 
       - name: Upload APKs to GitHub Release
         uses: softprops/action-gh-release@v2
-        if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
         with:
           tag_name: ${{ steps.vars.outputs.tag }}
+          target_commitish: ${{ inputs.source_ref || github.sha }}
           name: "RikkaHub 专属增强版 ${{ steps.vars.outputs.tag }}"
           body: |
             ### RikkaHub 专属增强版（自动构建）

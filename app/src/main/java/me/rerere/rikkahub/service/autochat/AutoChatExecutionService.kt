@@ -61,6 +61,17 @@ class AutoChatExecutionService(
     suspend fun executeOccurrence(
         occurrenceId: Uuid,
         isManualTest: Boolean = false
+    ): AutoChatExecutionResult = execute(occurrenceId, isManualTest)
+
+    suspend fun executeManualTest(record: AutoChatRecord, rule: AutoChatRule): AutoChatExecutionResult {
+        require(record.occurrenceType == AutoChatType.MANUAL_TEST && record.ruleId == rule.id)
+        return execute(record.id, isManualTest = true, ruleSnapshot = rule)
+    }
+
+    private suspend fun execute(
+        occurrenceId: Uuid,
+        isManualTest: Boolean,
+        ruleSnapshot: AutoChatRule? = null,
     ): AutoChatExecutionResult = withContext(Dispatchers.IO) {
         val record = repository.getRecordById(occurrenceId)
             ?: return@withContext AutoChatExecutionResult.Failed(IllegalArgumentException("Occurrence not found: $occurrenceId"))
@@ -79,7 +90,7 @@ class AutoChatExecutionService(
             }
         }
 
-        val rule = repository.getRuleById(record.ruleId)
+        val rule = ruleSnapshot ?: repository.getRuleById(record.ruleId)
         if (rule == null || (!rule.enabled && !isManualTest)) {
             repository.updateRecord(
                 record.copy(
@@ -108,7 +119,9 @@ class AutoChatExecutionService(
                 )
             )
             // 自动暂停规则并提示重新绑定，绝不降级
-            repository.updateRule(rule.copy(enabled = false))
+            if (!isManualTest) {
+                repository.updateRule(rule.copy(enabled = false))
+            }
             return@withContext AutoChatExecutionResult.Failed(IllegalStateException(reason))
         }
 

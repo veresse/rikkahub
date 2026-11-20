@@ -97,6 +97,22 @@ class AutoChatRepository(
     suspend fun insertRecord(record: AutoChatRecord): Long =
         recordDAO.insert(AutoChatRecordEntity.fromModel(record))
 
+    suspend fun createManualTestRecord(rule: AutoChatRule, targetDate: String, nowMillis: Long): AutoChatRecord {
+        // Keep the history FK valid for drafts without replacing an existing rule (or enabling a draft).
+        ruleDAO.insertIfAbsent(AutoChatRuleEntity.fromModel(rule.copy(enabled = false)))
+        val record = AutoChatRecord(
+            ruleId = rule.id,
+            assistantId = rule.assistantId,
+            conversationId = rule.conversationId,
+            occurrenceType = AutoChatType.MANUAL_TEST,
+            targetDate = targetDate,
+            scheduledTime = nowMillis,
+            actualTime = nowMillis,
+            status = AutoChatStatus.RUNNING,
+        )
+        return recordDAO.insertManualRecord(AutoChatRecordEntity.fromModel(record)).toModel()
+    }
+
     suspend fun updateRecord(record: AutoChatRecord) {
         recordDAO.update(AutoChatRecordEntity.fromModel(record))
     }

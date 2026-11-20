@@ -29,6 +29,9 @@ interface AutoChatRuleDAO {
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insert(rule: AutoChatRuleEntity)
 
+    @Insert(onConflict = OnConflictStrategy.IGNORE)
+    suspend fun insertIfAbsent(rule: AutoChatRuleEntity): Long
+
     @Update
     suspend fun update(rule: AutoChatRuleEntity)
 

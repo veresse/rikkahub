@@ -107,6 +107,7 @@ fun SettingAutoChatDetailPage(
 
     val isNew = existingRule == null
     val isDefaultTemplate = ruleIdStr == "default"
+    val draftRuleId = remember(ruleIdStr) { Uuid.random() }
 
     // 表单状态
     var ruleName by remember(existingRule) {
@@ -215,7 +216,7 @@ fun SettingAutoChatDetailPage(
         val aId = selectedAssistantId ?: return null
         val cId = selectedConversationId ?: return null
         return AutoChatRule(
-            id = existingRule?.id ?: Uuid.random(),
+            id = existingRule?.id ?: draftRuleId,
             name = ruleName.trim(),
             assistantId = aId,
             conversationId = cId,

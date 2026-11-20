@@ -2,6 +2,7 @@ package me.rerere.rikkahub.ui.pages.setting.autochat
 
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
@@ -92,7 +93,14 @@ class AutoChatViewModel(
     fun testRule(rule: AutoChatRule) {
         viewModelScope.launch {
             _testState.value = TestState.Testing
-            val result = scheduler.triggerManualTest(rule)
+            val result = try {
+                scheduler.triggerManualTest(rule)
+            } catch (e: CancellationException) {
+                _testState.value = TestState.Idle
+                throw e
+            } catch (e: Exception) {
+                AutoChatExecutionResult.Failed(e)
+            }
             _testState.value = when (result) {
                 is AutoChatExecutionResult.Success -> TestState.Success(result.text)
                 is AutoChatExecutionResult.Failed -> TestState.Failed(result.error.message ?: "Unknown error")

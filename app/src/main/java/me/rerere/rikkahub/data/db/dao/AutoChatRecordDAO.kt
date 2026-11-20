@@ -5,6 +5,7 @@ import androidx.room.Delete
 import androidx.room.Insert
 import androidx.room.OnConflictStrategy
 import androidx.room.Query
+import androidx.room.Transaction
 import androidx.room.Update
 import kotlinx.coroutines.flow.Flow
 import me.rerere.rikkahub.data.db.entity.AutoChatRecordEntity
@@ -82,6 +83,24 @@ interface AutoChatRecordDAO {
 
     @Insert(onConflict = OnConflictStrategy.IGNORE)
     suspend fun insert(record: AutoChatRecordEntity): Long
+
+    @Query(
+        """
+        SELECT MIN(slot_index) FROM auto_chat_records
+        WHERE rule_id = :ruleId AND target_date = :targetDate AND occurrence_type = 'MANUAL_TEST'
+        """
+    )
+    suspend fun getMinimumManualSlot(ruleId: String, targetDate: String): Int?
+
+    @Transaction
+    suspend fun insertManualRecord(record: AutoChatRecordEntity): AutoChatRecordEntity {
+        require(record.occurrenceType == "MANUAL_TEST")
+        val minimumSlot = (getMinimumManualSlot(record.ruleId, record.targetDate) ?: 0).coerceAtMost(0)
+        check(minimumSlot > Int.MIN_VALUE) { "Manual test slots exhausted" }
+        val allocated = record.copy(slotIndex = minimumSlot - 1)
+        check(insert(allocated) != -1L) { "Could not persist manual test occurrence: ${record.id}" }
+        return allocated
+    }
 
     @Update
     suspend fun update(record: AutoChatRecordEntity)

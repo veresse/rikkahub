@@ -188,19 +188,11 @@ class AutoChatScheduler(
      * 立即测试：走同一角色、会话、上下文和模型生成链路，独立测试标记，不计入限额与间隔
      */
     suspend fun triggerManualTest(rule: AutoChatRule): AutoChatExecutionResult = withContext(Dispatchers.IO) {
-        val testRecord = AutoChatRecord(
-            id = Uuid.random(),
-            ruleId = rule.id,
-            assistantId = rule.assistantId,
-            conversationId = rule.conversationId,
-            occurrenceType = AutoChatType.MANUAL_TEST,
+        val testRecord = repository.createManualTestRecord(
+            rule = rule,
             targetDate = timeEngine.getTodayDateString(),
-            slotIndex = -1,
-            scheduledTime = System.currentTimeMillis(),
-            actualTime = System.currentTimeMillis(),
-            status = AutoChatStatus.RUNNING,
+            nowMillis = timeEngine.nowMillis(),
         )
-        repository.insertRecord(testRecord)
-        lazyExecutionService.value.executeOccurrence(testRecord.id, isManualTest = true)
+        lazyExecutionService.value.executeManualTest(testRecord, rule)
     }
 }
