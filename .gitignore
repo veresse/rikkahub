@@ -27,8 +27,8 @@ __pycache__/
 *.sqlite
 *.db
 *.db-*
-data/
-*/data/
+/data/
+/*/data/
 
 # Node.js
 node_modules/

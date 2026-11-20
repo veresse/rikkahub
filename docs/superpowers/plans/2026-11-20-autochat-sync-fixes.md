@@ -15,6 +15,8 @@ Invoke the release workflow as a reusable job after successful sync, since GITHU
 - [x] Diagnose manual test insertion and upstream ancestry.
 - [x] Add manual occurrence persistence regression tests and fix draft execution.
 - [x] Update reusable build and synchronization workflows; actionlint passes.
-- [ ] Integrate current upstream and preserve database migration compatibility.
-- [ ] Compile, execute JVM tests, validate workflow syntax and review diff.
+- [x] Integrate current upstream and preserve database migration compatibility.
+- [x] Compile, execute JVM tests, validate workflow syntax and review diff.
 - [ ] Commit and push fixes to the user repository.
+
+Verification: combined app and unit-test Kotlin compilation succeeded; JUnitCore passed 19 manual-test/version/parser tests using the project's exact runtime dependency versions. Six Node SQLite checks passed, including generated Room 35 schema comparison and data preservation. actionlint passed both workflows; upstream/master is an ancestor and behind count is zero. Android device instrumentation and remote workflow execution have not been performed.

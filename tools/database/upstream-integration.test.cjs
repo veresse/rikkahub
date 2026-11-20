@@ -34,6 +34,15 @@ const snapshot = (db) => db.prepare("SELECT name FROM sqlite_master WHERE type =
 const fork33 = historical('c7be873b', 33);
 const upstream34 = historical('358e2931', 34);
 const expected = { entities: [...upstream34.entities, ...fork33.entities.filter(e => e.tableName.startsWith('auto_chat_'))] };
+test('generated Room schema matches the migration target', () => {
+  const actual = new DatabaseSync(':memory:');
+  const target = new DatabaseSync(':memory:');
+  create(actual, JSON.parse(readFileSync(path.join(root, schemas, '35.json'), 'utf8')).database);
+  create(target, expected);
+  assert.deepEqual(snapshot(actual), snapshot(target));
+  actual.close();
+  target.close();
+});
 test('database version and factory register the explicit fork upgrade paths', () => {
   const database = readFileSync(path.join(root, 'app/src/main/java/me/rerere/rikkahub/data/db/AppDatabase.kt'), 'utf8');
   const factory = readFileSync(path.join(root, 'app/src/main/java/me/rerere/rikkahub/data/db/AppDatabaseFactory.kt'), 'utf8');

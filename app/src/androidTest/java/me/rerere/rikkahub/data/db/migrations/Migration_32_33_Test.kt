@@ -42,8 +42,8 @@ class Migration_32_33_Test {
             close()
         }
 
-        // 同时校验迁移后的表结构和索引与 33 的 schema 一致
-        val db = helper.runMigrationsAndValidate(testDb, 33, true, Migration_32_33)
+        // 校验合并版本的完整升级路径及最终结构。
+        val db = helper.runMigrationsAndValidate(testDb, 35, true, Migration_32_33, Migration_33_35)
 
         val query = "SELECT * FROM message_node WHERE conversation_id = 'conv' ORDER BY node_index ASC LIMIT 2 OFFSET 1"
         val ids = db.query(query).use { cursor ->
@@ -77,7 +77,7 @@ class Migration_32_33_Test {
             close()
         }
 
-        val db = helper.runMigrationsAndValidate(testDb, 33, true, Migration_32_33)
+        val db = helper.runMigrationsAndValidate(testDb, 35, true, Migration_32_33, Migration_33_35)
 
         val ids = (0 until 6 step 2).flatMap { offset ->
             db.query(

@@ -340,7 +340,7 @@ class ChatService(
     /** 检查会话当前是否忙碌（正在生成、等待工具审批或压缩） */
     fun isSessionBusy(conversationId: Uuid): Boolean {
         val session = sessionManager.get(conversationId) ?: return false
-        return session.getJob() != null || session.state.value.isAwaitingToolApproval || session.isCompressing
+        return session.getJob() != null || session.state.value.isAwaitingToolApproval
     }
 
     // 新建对话, 并添加预设消息
