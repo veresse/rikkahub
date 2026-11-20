@@ -14,22 +14,18 @@ import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.serialization.Serializable
-import kotlinx.serialization.json.Json
 import me.rerere.common.http.await
 import me.rerere.rikkahub.AppScope
 import me.rerere.rikkahub.BuildConfig
 import okhttp3.OkHttpClient
 import okhttp3.Request
 
-// 优先使用伴侣服务器自建更新源，自动对接 veresse/rikkahub 专属 GitHub Release
-private const val API_URL = "http://43.154.46.4:9090/api/app-update"
+private const val API_URL = "https://api.github.com/repos/veresse/rikkahub/releases/latest"
 
 class UpdateChecker(
     private val client: OkHttpClient,
     appScope: AppScope,
 ) {
-    private val json = Json { ignoreUnknownKeys = true }
-
     val updateState: StateFlow<UiState<UpdateInfo>> = checkUpdate().stateIn(
         scope = appScope,
         started = SharingStarted.Lazily,
@@ -41,23 +37,26 @@ class UpdateChecker(
         emit(
             UiState.Success(
                 data = try {
-                    val response = client.newCall(
+                    client.newCall(
                         Request.Builder()
                             .url(API_URL)
                             .get()
+                            .header("Accept", "application/vnd.github+json")
+                            .header("X-GitHub-Api-Version", "2022-11-28")
                             .addHeader(
                                 "User-Agent",
                                 "RikkaHub ${BuildConfig.VERSION_NAME} #${BuildConfig.VERSION_CODE}"
                             )
                             .build()
-                    ).await()
-                    if (response.isSuccessful) {
-                        json.decodeFromString<UpdateInfo>(response.body.string())
-                    } else {
-                        throw Exception("Failed to fetch update info")
+                    ).await().use { response ->
+                        check(response.isSuccessful) {
+                            "GitHub update check failed: HTTP ${response.code} ${response.message}"
+                        }
+                        parseGitHubRelease(response.body.string())
                     }
                 } catch (e: Exception) {
-                    throw Exception("Failed to fetch update info", e)
+                    if (e is kotlinx.coroutines.CancellationException) throw e
+                    throw Exception("Failed to fetch update info: ${e.message}", e)
                 }
             )
         )
