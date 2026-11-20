@@ -26,8 +26,8 @@ android {
         applicationId = "me.rerere.rikkahub"
         minSdk = 26
         targetSdk = 37
-        versionCode = 197
-        versionName = "3.2.1"
+        versionCode = providers.gradleProperty("customVersionCode").orNull?.toInt() ?: 199
+        versionName = providers.gradleProperty("customVersionName").orNull ?: "3.3.1"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 

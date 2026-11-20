@@ -25,7 +25,9 @@ import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.produceState
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
@@ -43,7 +45,10 @@ import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.dp
 import dev.chrisbanes.haze.HazeState
 import dev.chrisbanes.haze.hazeSource
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.flow.conflate
 import kotlinx.coroutines.flow.drop
+import kotlinx.coroutines.withContext
 import kotlinx.datetime.toJavaLocalDateTime
 import me.rerere.ai.core.MessageRole
 import me.rerere.ai.provider.Model
@@ -54,6 +59,7 @@ import me.rerere.hugeicons.stroke.Attachment01
 import me.rerere.hugeicons.stroke.Cancel01
 import me.rerere.hugeicons.stroke.FavouriteCircle
 import me.rerere.hugeicons.stroke.Image01
+import me.rerere.hugeicons.stroke.Package01
 import me.rerere.hugeicons.stroke.Search01
 import me.rerere.hugeicons.stroke.SearchRemove
 import me.rerere.hugeicons.stroke.Wrench01
@@ -71,12 +77,15 @@ import java.time.LocalDateTime
 import java.time.format.DateTimeFormatter
 import java.time.format.FormatStyle
 import java.util.Locale
+import kotlin.uuid.Uuid
 
 /**
  * 概览里的一张卡片：一轮对话 = 一条用户消息 + 后面跟着的助手回复（工具调用会拆成多个节点，这里合并）。
  * 对话开头没有用户消息时（如开场白），[user] 为空。
  */
 private data class PreviewRound(
+    // 这一轮第一个节点的 id，用作列表 key
+    val id: Uuid,
     // 点击跳转的目标，取这一轮第一个节点
     val firstIndex: Int,
     val lastIndex: Int,
@@ -87,6 +96,8 @@ private data class PreviewRound(
     val replyText: String,
     val replyParts: List<UIMessagePart>,
     val favorite: Boolean,
+    // 压缩检查点单独成一张卡片，userText 是摘要
+    val checkpoint: Boolean,
 ) {
     fun matches(query: String): Boolean =
         userText.contains(query, ignoreCase = true) || replyText.contains(query, ignoreCase = true)
@@ -95,13 +106,18 @@ private data class PreviewRound(
 private fun List<MessageNode>.toPreviewRounds(): List<PreviewRound> {
     val groups = mutableListOf<MutableList<IndexedValue<MessageNode>>>()
     forEachIndexed { index, node ->
-        if (node.currentMessage.role == MessageRole.USER || groups.isEmpty()) groups.add(mutableListOf())
+        // 检查点本身是 USER 消息会自己开一组；它后面的节点也要另起一组，不能并进检查点卡片
+        val afterCheckpoint = groups.lastOrNull()?.last()?.value?.currentMessage?.isContextCheckpoint == true
+        if (node.currentMessage.role == MessageRole.USER || groups.isEmpty() || afterCheckpoint) {
+            groups.add(mutableListOf())
+        }
         groups.last().add(IndexedValue(index, node))
     }
     return groups.map { group ->
         val user = group.first().value.currentMessage.takeIf { it.role == MessageRole.USER }
         val replies = group.map { it.value.currentMessage }.filter { it.role != MessageRole.USER }
         PreviewRound(
+            id = group.first().value.id,
             firstIndex = group.first().index,
             lastIndex = group.last().index,
             user = user,
@@ -110,6 +126,7 @@ private fun List<MessageNode>.toPreviewRounds(): List<PreviewRound> {
             replyText = replies.map { it.toPreviewText() }.filter { it.isNotEmpty() }.joinToString(" "),
             replyParts = replies.flatMap { it.parts },
             favorite = group.any { it.value.isFavorite },
+            checkpoint = user?.isContextCheckpoint == true,
         )
     }
 }
@@ -131,7 +148,15 @@ internal fun ChatListPreview(
     var searchQuery by rememberSaveable { mutableStateOf("") }
     val query = searchQuery.trim()
 
-    val rounds = remember(conversation.messageNodes) { conversation.messageNodes.toPreviewRounds() }
+    // 长对话里逐条做正则清洗很慢，放到后台算；没算完时为 null。
+    // 生成中节点每个 chunk 都在变，conflate 掉中间状态，只算最新的
+    val nodes by rememberUpdatedState(conversation.messageNodes)
+    val loadedRounds by produceState<List<PreviewRound>?>(initialValue = null) {
+        snapshotFlow { nodes }
+            .conflate()
+            .collect { value = withContext(Dispatchers.Default) { it.toPreviewRounds() } }
+    }
+    val rounds = loadedRounds.orEmpty()
     val filtered = remember(rounds, query) {
         if (query.isEmpty()) rounds else rounds.filter { it.matches(query) }
     }
@@ -145,11 +170,12 @@ internal fun ChatListPreview(
 
     // 打开时的阅读位置；概览期间聊天列表不动，记一次就够
     val currentIndex = remember { chatListState.firstVisibleItemIndex }
-    val currentRound = remember(rounds) {
-        rounds.indexOfFirst { currentIndex in it.firstIndex..it.lastIndex }
-    }
-    // listState 由外部持有（顶栏胶囊要读它），每次打开都重新定位：停在当前轮的前一轮，让上面露出一点上下文
-    LaunchedEffect(Unit) {
+    // listState 由外部持有（顶栏胶囊要读它），每次打开都重新定位：停在当前轮的前一轮，让上面露出一点上下文。
+    // 要等卡片算出来、列表里有内容之后才能滚
+    val loaded = loadedRounds != null
+    LaunchedEffect(loaded) {
+        if (!loaded) return@LaunchedEffect
+        val currentRound = rounds.indexOfFirst { currentIndex in it.firstIndex..it.lastIndex }
         listState.scrollToItem((currentRound - 1).coerceAtLeast(0))
     }
     // 搜索框固定在列表外，滚到中间时改搜索词，结果要从头看
@@ -173,7 +199,7 @@ internal fun ChatListPreview(
                 .topFadingEdge(listTop)
                 .hazeSource(state = hazeState),
         ) {
-            if (filtered.isEmpty()) {
+            if (loaded && filtered.isEmpty()) {
                 item(key = PreviewEmptyKey) {
                     Column(
                         modifier = Modifier
@@ -197,7 +223,17 @@ internal fun ChatListPreview(
                 }
             }
 
-            items(items = filtered, key = { conversation.messageNodes[it.firstIndex].id }) { round ->
+            items(items = filtered, key = { it.id }) { round ->
+                if (round.checkpoint) {
+                    PreviewCheckpointCard(
+                        round = round,
+                        query = query,
+                        isCurrent = currentIndex in round.firstIndex..round.lastIndex,
+                        onClick = { onJumpToMessage(round.firstIndex) },
+                        modifier = Modifier.animateItem(),
+                    )
+                    return@items
+                }
                 val reply = round.reply
                 PreviewRoundCard(
                     round = round,
@@ -376,6 +412,69 @@ private fun PreviewRoundCard(
     }
 }
 
+/**
+ * 压缩检查点：用色调容器和图标和普通对话区分开，一眼能看出上下文从哪里开始被摘要替代。
+ */
+@Composable
+private fun PreviewCheckpointCard(
+    round: PreviewRound,
+    query: String,
+    isCurrent: Boolean,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+) {
+    val colors = MaterialTheme.colorScheme
+    Surface(
+        onClick = onClick,
+        modifier = modifier.fillMaxWidth(),
+        shape = MaterialTheme.shapes.large,
+        color = colors.secondaryContainer,
+        contentColor = colors.onSecondaryContainer,
+        border = if (isCurrent) BorderStroke(1.5.dp, colors.primary) else null,
+    ) {
+        Column(
+            modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp),
+            verticalArrangement = Arrangement.spacedBy(6.dp),
+        ) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                Icon(
+                    imageVector = HugeIcons.Package01,
+                    contentDescription = null,
+                    modifier = Modifier.size(18.dp),
+                )
+                Text(
+                    text = stringResource(R.string.chat_page_compress_checkpoint_title),
+                    style = MaterialTheme.typography.titleSmallEmphasized,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.weight(1f),
+                )
+                round.user?.let { user ->
+                    Text(
+                        text = remember(user.createdAt) {
+                            user.createdAt.toJavaLocalDateTime().toPreviewTimeString()
+                        },
+                        style = MaterialTheme.typography.labelSmall,
+                        maxLines = 1,
+                    )
+                }
+            }
+            if (round.userText.isNotEmpty()) {
+                HighlightedSnippet(
+                    text = round.userText,
+                    query = query,
+                    maxLines = 2,
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = colors.onSecondaryContainer.copy(alpha = 0.8f),
+                )
+            }
+        }
+    }
+}
+
 @Composable
 private fun HighlightedSnippet(
     text: String,
@@ -388,7 +487,8 @@ private fun HighlightedSnippet(
     val highlightTextColor = MaterialTheme.colorScheme.onTertiaryContainer
     val annotated = remember(text, query, highlightColor, highlightTextColor) {
         buildHighlightedText(
-            text = extractMatchingSnippet(text, query),
+            // Text 会把整段文字都排版一遍才截到 maxLines，长回复必须先截短
+            text = extractMatchingSnippet(text, query).take(SnippetMaxLength),
             query = query,
             highlightColor = highlightColor,
             highlightTextColor = highlightTextColor,
@@ -522,6 +622,9 @@ private fun extractMatchingSnippet(text: String, query: String): String {
 }
 
 private const val SnippetContextLength = 24
+
+// 卡片最多显示两行，留足宽屏和小字号的余量
+private const val SnippetMaxLength = 300
 
 private fun buildHighlightedText(
     text: String,
