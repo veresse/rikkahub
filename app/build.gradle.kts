@@ -26,8 +26,8 @@ android {
         applicationId = "me.rerere.rikkahub"
         minSdk = 26
         targetSdk = 37
-        versionCode = providers.gradleProperty("customVersionCode").orNull?.toInt() ?: 199
-        versionName = providers.gradleProperty("customVersionName").orNull ?: "3.3.1"
+        versionCode = 198
+        versionName = "3.3.1"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
@@ -46,6 +46,12 @@ android {
             include("arm64-v8a", "x86_64")
             isUniversalApk = true
         }
+    }
+
+    // Apply fork release overrides separately so upstream version bumps merge normally.
+    defaultConfig {
+        providers.gradleProperty("customVersionCode").orNull?.let { versionCode = it.toInt() }
+        providers.gradleProperty("customVersionName").orNull?.let { versionName = it }
     }
 
     signingConfigs {
