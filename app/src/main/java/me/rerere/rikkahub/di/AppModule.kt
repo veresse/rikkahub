@@ -205,6 +205,10 @@ val appModule = module {
     }
 
     worker {
+        me.rerere.rikkahub.service.AppUpdateWorker(get(), get(), get(), get())
+    }
+
+    worker {
         AutoChatWorker(
             appContext = get(),
             workerParams = get(),

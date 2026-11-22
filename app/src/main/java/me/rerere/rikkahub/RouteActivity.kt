@@ -218,6 +218,7 @@ class RouteActivity : ComponentActivity() {
                         .build()
                 }
                 AppRoutes()
+                me.rerere.rikkahub.ui.components.ui.AppUpdatePrompt()
             }
         }
     }

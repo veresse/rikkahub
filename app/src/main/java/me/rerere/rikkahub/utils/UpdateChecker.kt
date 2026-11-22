@@ -1,10 +1,6 @@
 package me.rerere.rikkahub.utils
 
-import android.app.DownloadManager
 import android.content.Context
-import android.os.Environment
-import android.widget.Toast
-import androidx.core.net.toUri
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.SharingStarted
@@ -30,7 +26,9 @@ class UpdateChecker(
         initialValue = UiState.Loading,
     )
 
-    private fun checkUpdate(): Flow<UiState<UpdateInfo>> = pollUpdateInfo {
+    private fun checkUpdate(): Flow<UiState<UpdateInfo>> = pollUpdateInfo { fetchUpdate() }.flowOn(Dispatchers.IO)
+
+    suspend fun fetchUpdate(): UpdateInfo = kotlinx.coroutines.withContext(Dispatchers.IO) {
         try {
             client.newCall(
                 Request.Builder()
@@ -53,29 +51,10 @@ class UpdateChecker(
             if (e is kotlinx.coroutines.CancellationException) throw e
             throw Exception("Failed to fetch update info: ${e.message}", e)
         }
-    }.flowOn(Dispatchers.IO)
+    }
 
     fun downloadUpdate(context: Context, download: UpdateDownload) {
-        runCatching {
-            val request = DownloadManager.Request(download.url.toUri()).apply {
-                // 设置下载时通知栏的标题和描述
-                setTitle(download.name)
-                setDescription("正在下载更新包...")
-                // 下载完成后通知栏可见
-                setNotificationVisibility(DownloadManager.Request.VISIBILITY_VISIBLE_NOTIFY_COMPLETED)
-                // 设置文件保存路径
-                setDestinationInExternalPublicDir(Environment.DIRECTORY_DOWNLOADS, download.name)
-                // 允许下载的文件类型
-                setMimeType("application/vnd.android.package-archive")
-            }
-            // 获取系统的DownloadManager
-            val dm = context.getSystemService(Context.DOWNLOAD_SERVICE) as DownloadManager
-            dm.enqueue(request)
-            // 你可以保存返回的downloadId到本地，以便后续查询下载进度或状态
-        }.onFailure {
-            Toast.makeText(context, "Failed to update", Toast.LENGTH_SHORT).show()
-            context.openUrl(download.url) // 跳转到下载页面
-        }
+        context.startActivity(android.content.Intent(context, me.rerere.rikkahub.ui.activity.AppUpdateActivity::class.java))
     }
 }
 

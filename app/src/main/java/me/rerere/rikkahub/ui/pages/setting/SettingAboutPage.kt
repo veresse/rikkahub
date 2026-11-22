@@ -178,6 +178,16 @@ fun SettingAboutPage() {
                     val containerColor = MaterialTheme.colorScheme.primaryContainer
                     val contentColor = MaterialTheme.colorScheme.onPrimaryContainer
                     CardGroup {
+                        if (!BuildConfig.IS_PLAY_STORE) {
+                            item(
+                                onClick = {
+                                    context.startActivity(android.content.Intent(context,
+                                        me.rerere.rikkahub.ui.activity.AppUpdateActivity::class.java))
+                                },
+                                headlineContent = { Text("检查更新") },
+                                supportingContent = { Text("下载新版本并在应用内安装") },
+                            )
+                        }
                         item(
                             modifier = Modifier.combinedClickable(
                                 onClick = {},
@@ -227,4 +237,3 @@ fun SettingAboutPage() {
         }
     }
 }
-
