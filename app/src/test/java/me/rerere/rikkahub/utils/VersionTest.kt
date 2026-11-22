@@ -7,6 +7,13 @@ import org.junit.Test
 class VersionTest {
 
     @Test
+    fun `published custom builds compare newer than older installed builds`() {
+        assertTrue(Version("3.3.1.217352194") > Version("3.2.1"))
+        assertTrue(Version("3.3.1.217500000") > Version("3.3.1.217352194"))
+        assertEquals(0, Version.compare("3.3.1.217352194", "3.3.1.217352194"))
+    }
+
+    @Test
     fun `basic version comparison`() {
         assertTrue(Version("1.0.0") < Version("2.0.0"))
         assertTrue(Version("1.0.0") < Version("1.1.0"))

@@ -9,8 +9,6 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.SharingStarted
 import kotlinx.coroutines.flow.StateFlow
-import kotlinx.coroutines.flow.catch
-import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOn
 import kotlinx.coroutines.flow.stateIn
 import kotlinx.serialization.Serializable
@@ -28,40 +26,33 @@ class UpdateChecker(
 ) {
     val updateState: StateFlow<UiState<UpdateInfo>> = checkUpdate().stateIn(
         scope = appScope,
-        started = SharingStarted.Lazily,
+        started = SharingStarted.WhileSubscribed(stopTimeoutMillis = 5_000, replayExpirationMillis = 0),
         initialValue = UiState.Loading,
     )
 
-    private fun checkUpdate(): Flow<UiState<UpdateInfo>> = flow {
-        emit(UiState.Loading)
-        emit(
-            UiState.Success(
-                data = try {
-                    client.newCall(
-                        Request.Builder()
-                            .url(API_URL)
-                            .get()
-                            .header("Accept", "application/vnd.github+json")
-                            .header("X-GitHub-Api-Version", "2022-11-28")
-                            .addHeader(
-                                "User-Agent",
-                                "RikkaHub ${BuildConfig.VERSION_NAME} #${BuildConfig.VERSION_CODE}"
-                            )
-                            .build()
-                    ).await().use { response ->
-                        check(response.isSuccessful) {
-                            "GitHub update check failed: HTTP ${response.code} ${response.message}"
-                        }
-                        parseGitHubRelease(response.body.string())
-                    }
-                } catch (e: Exception) {
-                    if (e is kotlinx.coroutines.CancellationException) throw e
-                    throw Exception("Failed to fetch update info: ${e.message}", e)
+    private fun checkUpdate(): Flow<UiState<UpdateInfo>> = pollUpdateInfo {
+        try {
+            client.newCall(
+                Request.Builder()
+                    .url(API_URL)
+                    .get()
+                    .header("Accept", "application/vnd.github+json")
+                    .header("X-GitHub-Api-Version", "2022-11-28")
+                    .addHeader(
+                        "User-Agent",
+                        "RikkaHub ${BuildConfig.VERSION_NAME} #${BuildConfig.VERSION_CODE}"
+                    )
+                    .build()
+            ).await().use { response ->
+                check(response.isSuccessful) {
+                    "GitHub update check failed: HTTP ${response.code} ${response.message}"
                 }
-            )
-        )
-    }.catch {
-        emit(UiState.Error(it))
+                parseGitHubRelease(response.body.string())
+            }
+        } catch (e: Exception) {
+            if (e is kotlinx.coroutines.CancellationException) throw e
+            throw Exception("Failed to fetch update info: ${e.message}", e)
+        }
     }.flowOn(Dispatchers.IO)
 
     fun downloadUpdate(context: Context, download: UpdateDownload) {

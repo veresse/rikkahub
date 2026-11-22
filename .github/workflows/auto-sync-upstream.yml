@@ -44,6 +44,8 @@ jobs:
           BEHIND=$(git rev-list --count HEAD..upstream/master)
           echo "behind_count=$BEHIND" >> $GITHUB_OUTPUT
           echo ">>> 相比作者 upstream/master 落后提交数: $BEHIND"
+          echo "### Upstream check" >> "$GITHUB_STEP_SUMMARY"
+          echo "New upstream commits: $BEHIND" >> "$GITHUB_STEP_SUMMARY"
 
       - name: Merge and Push
         id: merge
@@ -62,11 +64,13 @@ jobs:
           git push origin main
           echo "updated=true" >> "$GITHUB_OUTPUT"
           echo "revision=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "Merged upstream; release build follows in the build job." >> "$GITHUB_STEP_SUMMARY"
 
       - name: No updates
         if: steps.check_diff.outputs.behind_count == '0'
         run: |
           echo ">>> 检查完毕：当前已是原作者最新代码，无需同步。"
+          echo "No new upstream commits. No APK was built or published by this run." >> "$GITHUB_STEP_SUMMARY"
 
   build:
     needs: sync
