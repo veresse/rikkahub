@@ -18,7 +18,7 @@ from typing import Any
 from companion.server.app.config import settings
 from companion.server.app.services.action_tools import ROBOT_TOOL_NAMES
 from companion.server.app.services.device_registry import ActionResult, get_device_link
-from companion.server.app.services.events import get_event_bus
+from companion.server.app.services.events import get_event_bus, publish_async
 from companion.shared.catalog import CatalogError, get_action, resolve_params
 
 logger = logging.getLogger(__name__)
@@ -150,12 +150,13 @@ class _DeviceScheduler:
     async def submit(
         self, command: dict[str, Any], *, timeout_ms: int, override: bool = False
     ) -> ActionResult:
-        if len(self.queue) >= MAX_PENDING_COMMANDS:
-            return ActionResult(status="failed", detail="queue_full")
         if not self._allow_rate():
             return ActionResult(status="failed", detail="rate_limited")
         if override:
+            # 覆盖必须先于容量判断：队列已满时也要让最新一条替换旧角度。
             self._drop_superseded(command.get("type"))
+        if len(self.queue) >= MAX_PENDING_COMMANDS:
+            return ActionResult(status="failed", detail="queue_full")
 
         job = _Job(command=command, future=asyncio.get_running_loop().create_future())
         self.queue.append(job)
@@ -200,12 +201,12 @@ class _DeviceScheduler:
         `action.result(failed, detail="timeout")`；执行阶段的超时由 worker 的
         `_command_timeout_ms` 负责。
         """
-        if len(self.queue) >= MAX_PENDING_COMMANDS:
-            return ActionResult(status="failed", detail="queue_full")
         if not self._allow_rate():
             return ActionResult(status="failed", detail="rate_limited")
         if override:
             self._drop_superseded(command.get("type"))
+        if len(self.queue) >= MAX_PENDING_COMMANDS:
+            return ActionResult(status="failed", detail="queue_full")
 
         job = _Job(
             command=command,
@@ -264,10 +265,6 @@ class _DeviceScheduler:
         action_id = command.get("action_id")
         if not isinstance(action_id, str) or not action_id:
             return
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            return
         event = {
             "v": 2,
             "type": "action.result",
@@ -285,7 +282,7 @@ class _DeviceScheduler:
             status,
             detail,
         )
-        loop.create_task(get_event_bus().publish(event))
+        publish_async(get_event_bus(), event)
 
     async def _send_stop(self, reason: str) -> ActionResult:
         command = {
@@ -439,7 +436,9 @@ class ActionOrchestrator:
 
         if name == "robot.get_status":
             try:
-                status = await asyncio.wait_for(link.get_status(), timeout=3.0)
+                status = await asyncio.wait_for(
+                    link.get_status(), timeout=settings.DEVICE_STATUS_TIMEOUT_SECONDS
+                )
             except asyncio.TimeoutError:
                 return self._fail("timeout", "设备状态查询超时")
             except Exception:

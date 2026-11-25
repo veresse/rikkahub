@@ -419,6 +419,10 @@
 `device_offline`、`stopped`（急停）、`internal_error`。
 带 `action_id` 的命令其 `remote.ack` 也会回填同一个 `action_id`，App 可据此把结果对回请求。
 
+同一个 `action_id` 的 `action.result` 只会出现一次：服务端已经广播终态后，设备迟到的
+重复回执会被丢弃。`queue_full` / `rate_limited` / 参数非法等**未入队**的请求只通过
+`remote.ack ok=false` 返回，不产生 `action.result`。
+
 ### 8.3 服务端 → App 对话 SSE（`POST /api/chat/completions`）
 
 App 携带 `Authorization: Bearer <app_token>` 发起请求，响应为 `text/event-stream`，每行格式 `data: <json>`。
@@ -453,12 +457,19 @@ App 携带 `Authorization: Bearer <app_token>` 发起请求，响应为 `text/ev
   执行超时或设备断开的命令一定会有终态 `action.result`；执行超时同时下发 `action.stop(server_cancel)`。
 - App 与 LLM 共用同一设备队列，遵守第 7 节仲裁规则；只对 `protocol_version >= 2` 的设备下发
   v2 控制消息，v1 设备返回 `remote.ack ok=false error=unsupported_protocol`。
+- 每条命令只广播一次终态：服务端已结算（执行超时、急停、断连）后，设备针对同一 `action_id`
+  的迟到/重复 `action.result` 会被丢弃；不在本会话 `_pending` 中的 `action_id` 也不会广播，
+  因此 `action.result.source` 恒为 `llm` 或 `app`。
+- 聊天 SSE 被客户端断开/停止时，只中止**本轮**在途的 `robot.*` 命令并下发
+  `action.stop(server_cancel)`；不会清空共享队列或打断 App 同时进行的遥控动作。
 - `remote.get_status` 不新增下行消息，服务端把当前缓存的 `device.report` 快照只回给请求方，
   并带 `source="server"`（设备状态变化本身会主动上报）。
 - App Token 被 `POST /api/auth/tokens/{id}/revoke` 或 `/api/auth/logout` 撤销时，该 Token 的
   `/app/ws` 连接以 `4401 token_revoked` 关闭；已过期 Token 在下次握手时被拒绝。
 - 设备 Token 被 `DELETE /api/devices/{id}` 撤销时，已建立的 `/device/ws` 以
   `4401 device_revoked` 关闭，并清理该设备的队列。
+- 队列已满时 `action.play` 返回 `remote.ack ok=false error=queue_full`（只走 ack，不广播
+  `action.result`）；`servo.move`/`volume.set` 会先替换同类型未下发的旧命令，再判断容量。
 
 ---
 

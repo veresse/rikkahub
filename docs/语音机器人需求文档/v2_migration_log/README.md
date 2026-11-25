@@ -27,3 +27,4 @@
 | 05 | Block D-1：设备 WebSocket 网关 | ✅ 已完成 | `/device/ws` 握手/v1 降级/会话替换/回执关联/上报落库；120 passed |
 | 06 | Block D-2：App WebSocket 网关与超时强停 | ✅ 已完成 | `/app/ws` 遥控/广播/撤销断开；超时下发 `action.stop`；133 passed |
 | 07 | Phase 2 审查修复（Block C / D-1 / D-2） | ✅ 已完成 | 终态事件、在途超时、v1 门控、撤销竞态、上报 writer、设备撤销断连；143 passed |
+| 08 | Phase 2 二次审查修复 | ✅ 已完成 | 终态去重、取消只停本轮、覆盖优先于容量、上报冲刷、后台广播；153 passed |

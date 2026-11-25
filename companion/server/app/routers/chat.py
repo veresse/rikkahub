@@ -1,4 +1,3 @@
-import asyncio
 import json
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
@@ -6,8 +5,6 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from pydantic import BaseModel
 
 from companion.server.app.database import get_db
-from companion.server.app.services.action_orchestrator import ActionOrchestrator
-from companion.server.app.services.device_registry import resolve_device_for_conversation
 from companion.server.app.services.orchestrator import ChatOrchestrator
 
 router = APIRouter(prefix="/chat", tags=["chat"])
@@ -23,11 +20,6 @@ async def chat_completions(req: ChatRequest, db: AsyncSession = Depends(get_db))
     流式对话接口 (Server-Sent Events 协议)
     前端通过 EventSource 或 fetch 流式读取事件
     """
-    try:
-        device = await resolve_device_for_conversation(db, req.conversation_id)
-    except Exception:
-        device = None
-
     async def event_generator():
         try:
             async for chunk in ChatOrchestrator.stream_chat(
@@ -37,13 +29,6 @@ async def chat_completions(req: ChatRequest, db: AsyncSession = Depends(get_db))
                 regenerate_node_id=req.regenerate_node_id
             ):
                 yield f"data: {json.dumps(chunk, ensure_ascii=False)}\n\n"
-        except (asyncio.CancelledError, GeneratorExit):
-            # 客户端断开/用户停止：不要让已排队的动作继续驱动舵机。
-            if device is not None:
-                await asyncio.shield(
-                    ActionOrchestrator().stop(device.id, "server_cancel")
-                )
-            raise
         except Exception as e:
             err_payload = {"type": "error", "error": str(e)}
             yield f"data: {json.dumps(err_payload, ensure_ascii=False)}\n\n"

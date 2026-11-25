@@ -7,6 +7,7 @@
 - 单轮 3 次动作上限、非法 JSON 参数、工具回合上限
 """
 
+import asyncio
 import json
 
 import pytest
@@ -90,6 +91,7 @@ async def seed(
     with_device: bool = True,
     protocol_version: int = 2,
     capabilities: tuple[str, ...] = ("action",),
+    is_active: bool = True,
 ) -> None:
     session.add(
         AssistantModel(
@@ -113,6 +115,7 @@ async def seed(
                 bound_assistant_id=ASSISTANT_ID,
                 bound_conversation_id=CONVERSATION_ID,
                 last_seen_at=1,
+                is_active=is_active,
             )
         )
     await session.commit()
@@ -296,6 +299,71 @@ async def test_v1_device_gets_no_tools(session, monkeypatch):
     ]
     assert any("固件" in text or "不支持" in text for text in system_contents)
     assert all("当前离线" not in text for text in system_contents)
+
+
+async def test_revoked_device_gets_inactive_note(session, monkeypatch):
+    await seed(session, is_active=False)
+    fake = ScriptedDeepSeek([[content("设备已经解绑啦。")]])
+    _install(monkeypatch, fake)
+
+    _ = [
+        e
+        async for e in ChatOrchestrator.stream_chat(session, CONVERSATION_ID, "点点头")
+    ]
+
+    assert fake.calls[0]["tools"] is None
+    system_contents = [
+        m["content"] for m in fake.calls[0]["messages"] if m.get("role") == "system"
+    ]
+    assert any("撤销" in text for text in system_contents)
+    assert all("没有绑定" not in text for text in system_contents)
+
+
+class HangingActionLink(FakeLink):
+    """动作永不回执，用于验证聊天取消时的定向急停。"""
+
+    async def send(self, command: dict) -> ActionResult:
+        self.commands.append(command)
+        if command.get("type") == "action.stop":
+            return ActionResult(status="done")
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+
+async def _wait_for(predicate, timeout: float = 2.0):
+    async def _poll():
+        while True:
+            value = predicate()
+            if value:
+                return value
+            await asyncio.sleep(0.01)
+
+    return await asyncio.wait_for(_poll(), timeout)
+
+
+async def test_cancelled_chat_stream_stops_inflight_action(session, monkeypatch):
+    await seed(session)
+    link = HangingActionLink()
+    register_device_link(DEVICE_ID, link)
+    fake = ScriptedDeepSeek([[tool_call(0, "c1", "robot.action", '{"name": "nod"}')]])
+    _install(monkeypatch, fake)
+
+    async def consume() -> None:
+        async for _ in ChatOrchestrator.stream_chat(session, CONVERSATION_ID, "点点头"):
+            pass
+
+    task = asyncio.create_task(consume())
+    await _wait_for(
+        lambda: next((c for c in link.commands if c.get("type") == "action.play"), None)
+    )
+
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    stops = [c for c in link.commands if c.get("type") == "action.stop"]
+    assert len(stops) == 1
+    assert stops[0]["reason"] == "server_cancel"
 
 
 async def test_fourth_action_call_is_blocked(session, monkeypatch):

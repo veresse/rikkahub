@@ -81,7 +81,7 @@ if __name__ == "__main__":
         host=settings.HOST,
         port=settings.PORT,
         reload=settings.DEBUG,
-        ws_ping_interval=25.0,
-        ws_ping_timeout=10.0,
-        ws_max_size=1_048_576,
+        ws_ping_interval=settings.WS_PING_INTERVAL_SECONDS,
+        ws_ping_timeout=settings.WS_PING_TIMEOUT_SECONDS,
+        ws_max_size=settings.WS_MAX_MESSAGE_BYTES,
     )

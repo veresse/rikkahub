@@ -82,7 +82,10 @@ class Settings(BaseSettings):
 
     # WebSocket 网关
     DEVICE_HELLO_TIMEOUT_SECONDS: float = 5.0
+    DEVICE_STATUS_TIMEOUT_SECONDS: float = 3.0
     WS_MAX_MESSAGE_BYTES: int = 64 * 1024
+    WS_PING_INTERVAL_SECONDS: float = 25.0
+    WS_PING_TIMEOUT_SECONDS: float = 10.0
 
     # 限制与配额 (防 Zip 炸弹和滥用)
     MAX_UPLOAD_SIZE_BYTES: int = 100 * 1024 * 1024  # 100 MB

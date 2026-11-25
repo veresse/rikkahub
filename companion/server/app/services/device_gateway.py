@@ -27,7 +27,7 @@ from companion.server.app.services.device_registry import (
     register_device_link,
     unregister_device_link,
 )
-from companion.server.app.services.events import EventBus, get_event_bus
+from companion.server.app.services.events import EventBus, get_event_bus, publish_async
 from companion.shared.catalog import get_catalog
 
 logger = logging.getLogger(__name__)
@@ -41,12 +41,15 @@ TILT_MAX = 45.0
 OFFSET_LIMIT = 30.0
 VALID_CODECS = {"opus"}
 VALID_FRAME_MS = {20, 60}
-MAX_STATUS_TIMEOUT_SECONDS = 3.0
+VALID_SAMPLE_RATES = {"uplink": {16000}, "downlink": {16000, 24000}}
 
 DEFAULT_AUDIO = {
     "uplink": {"codec": "opus", "sample_rate": 16000, "channels": 1, "frame_ms": 60},
     "downlink": {"codec": "opus", "sample_rate": 24000, "channels": 1, "frame_ms": 60},
 }
+
+# writer 的停止哨兵
+_WRITER_STOP = object()
 
 
 class WSChannel(Protocol):
@@ -102,7 +105,7 @@ class DeviceSession:
         self._sources: dict[str, str] = {}
         self._send_lock = asyncio.Lock()
         # 上报合并队列：设备高频上报时只保留最新一条，避免阻塞读循环。
-        self._report_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=1)
+        self._report_queue: asyncio.Queue[Any] = asyncio.Queue(maxsize=1)
         self._report_handler: (
             Callable[[DeviceSession, dict[str, Any]], Awaitable[None]] | None
         ) = None
@@ -204,6 +207,8 @@ class DeviceSession:
         self._writer = asyncio.create_task(self._writer_loop())
 
     def queue_report(self, report: dict[str, Any]) -> None:
+        if self.closed:
+            return
         try:
             self._report_queue.put_nowait(report)
         except asyncio.QueueFull:
@@ -217,14 +222,49 @@ class DeviceSession:
                 pass
 
     async def _writer_loop(self) -> None:
-        while not self.closed:
+        while True:
             report = await self._report_queue.get()
+            if report is _WRITER_STOP:
+                return
             if self._report_handler is None:
                 continue
             try:
                 await self._report_handler(self, report)
+            except asyncio.CancelledError:
+                raise
             except Exception:
                 logger.exception("device report handler failed: %s", self.device_id)
+
+    async def _flush_reports(self) -> None:
+        """把合并队列里剩下的上报处理完；用于正常下线前保住最后一条状态。"""
+        while True:
+            try:
+                report = self._report_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                return
+            if report is _WRITER_STOP or self._report_handler is None:
+                continue
+            try:
+                await self._report_handler(self, report)
+            except Exception:
+                logger.exception("device report flush failed: %s", self.device_id)
+
+    async def stop_writer(self) -> None:
+        """优雅停止 writer：先冲刷最后一条上报，再让循环自行退出。"""
+        writer = self._writer
+        if writer is None or writer.done():
+            return
+        await self._flush_reports()
+        for _ in range(3):
+            try:
+                self._report_queue.put_nowait(_WRITER_STOP)
+                break
+            except asyncio.QueueFull:
+                await self._flush_reports()
+        try:
+            await asyncio.wait_for(writer, timeout=1.0)
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            writer.cancel()
 
     def _stop_writer(self) -> None:
         if self._writer and not self._writer.done():
@@ -242,11 +282,18 @@ class DeviceSession:
             self.closed = True
             return False
 
-    def resolve_result(self, action_id: str, status: str, detail: str) -> str:
-        """把 `action.result` 交给等待中的工具调用，返回指令来源。"""
-        source = self._sources.get(action_id, "")
+    def resolve_result(self, action_id: str, status: str, detail: str) -> str | None:
+        """把 `action.result` 交给等待中的工具调用。
+
+        只有仍在等待的命令才会返回来源；服务端已结算（超时/急停/断连）或
+        从未下发的 `action_id` 一律返回 `None`，由调用方丢弃，避免同一
+        `action_id` 被广播两次、或广播出协议枚举之外的 `source=""`。
+        """
         future = self._pending.get(action_id)
-        if future is not None and not future.done():
+        if future is None or future.done():
+            return None
+        source = self._sources.get(action_id, "")
+        if not future.done():
             future.set_result(
                 ActionResult(status=status, detail=detail, action_id=action_id)
             )
@@ -457,10 +504,10 @@ class DeviceGateway:
                 and codec in VALID_CODECS
                 and isinstance(sample_rate, int)
                 and not isinstance(sample_rate, bool)
-                and sample_rate > 0
+                and sample_rate in VALID_SAMPLE_RATES[direction]
                 and isinstance(channels, int)
                 and not isinstance(channels, bool)
-                and channels in (1, 2)
+                and channels == 1
                 and isinstance(frame_ms, int)
                 and not isinstance(frame_ms, bool)
                 and frame_ms in VALID_FRAME_MS
@@ -503,6 +550,8 @@ class DeviceGateway:
             self._sessions.discard(session)
             was_current = get_device_link(session.device_id) is session
             if was_current:
+                # 下线前把最后一条上报落库，避免重连后快照回退。
+                await session.stop_writer()
                 unregister_device_link(session.device_id, link=session)
                 invalidate_device_scheduler(session.device_id)
             if not session.closed:
@@ -551,7 +600,12 @@ class DeviceGateway:
             status = str(message.get("status") or "failed")
             detail = str(message.get("detail") or "")
             source = session.resolve_result(action_id, status, detail)
-            await self.bus.publish(
+            if source is None:
+                # 服务端已广播过终态（超时/急停/断连）或该 action_id 不是本
+                # 会话下发的；迟到回执只更新设备内部状态，不再打扰 App。
+                return
+            publish_async(
+                self.bus,
                 {
                     "v": 2,
                     "type": "action.result",
@@ -561,7 +615,7 @@ class DeviceGateway:
                     "detail": detail,
                     "source": source,
                     "ts": now_ms(),
-                }
+                },
             )
             return
 
@@ -571,7 +625,8 @@ class DeviceGateway:
             return
 
         if message_type == "voice.event":
-            await self.bus.publish(
+            publish_async(
+                self.bus,
                 {
                     "v": 2,
                     "type": "voice.event",
@@ -580,7 +635,7 @@ class DeviceGateway:
                     "turn_id": message.get("turn_id"),
                     "text": message.get("text"),
                     "ts": now_ms(),
-                }
+                },
             )
             return
 

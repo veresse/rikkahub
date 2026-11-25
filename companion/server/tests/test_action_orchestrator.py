@@ -320,6 +320,8 @@ async def test_expired_queued_command_is_dropped_with_terminal_event(monkeypatch
         assert event["status"] == "failed"
         assert event["detail"] == "timeout"
         assert not any(c.get("action_id") == "late" for c in link.commands)
+        # 纯排队超时不得急停：设备当前执行的是另一条命令。
+        assert not any(c.get("type") == "action.stop" for c in link.commands)
     finally:
         bus.unsubscribe(collect)
         mod.invalidate_device_scheduler("dev-queue")
@@ -364,3 +366,110 @@ async def test_scheduler_enqueue_returns_queued_immediately():
         scheduler._stopped = True
         if scheduler.worker and not scheduler.worker.done():
             scheduler.worker.cancel()
+
+
+async def test_cancelled_submit_stops_its_own_inflight_action():
+    """聊天流取消时只停本轮在途命令，不做全局急停。"""
+    link = HangingLink()
+    scheduler = _DeviceScheduler("dev-cancel", link)
+    try:
+        task = asyncio.create_task(
+            scheduler.submit(
+                {"v": 2, "type": "action.play", "action_id": "c1", "source": "llm"},
+                timeout_ms=5_000,
+            )
+        )
+        await _collect_until(
+            lambda: next((c for c in link.commands if c.get("action_id") == "c1"), None)
+        )
+
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+
+        stops = [c for c in link.commands if c.get("type") == "action.stop"]
+        assert len(stops) == 1
+        assert stops[0]["reason"] == "server_cancel"
+    finally:
+        scheduler._stopped = True
+        if scheduler.worker and not scheduler.worker.done():
+            scheduler.worker.cancel()
+
+
+async def test_queue_full_still_allows_override():
+    """队列已满时，覆盖语义必须先把同类旧命令替换掉，而不是直接 queue_full。"""
+    link = FakeLink(delay=0.2)
+    scheduler = _DeviceScheduler("dev-full", link)
+    try:
+        await scheduler.enqueue(
+            {"v": 2, "type": "action.play", "action_id": "busy", "name": "nod", "source": "app"}
+        )
+        await _collect_until(
+            lambda: next((c for c in link.commands if c.get("action_id") == "busy"), None)
+        )
+        await scheduler.enqueue(
+            {"v": 2, "type": "servo.move", "action_id": "m2", "source": "app"}
+        )
+        for index in range(7):
+            await scheduler.enqueue(
+                {
+                    "v": 2,
+                    "type": "action.play",
+                    "action_id": f"fill-{index}",
+                    "name": "nod",
+                    "source": "app",
+                }
+            )
+        assert len(scheduler.queue) == 8
+
+        result = await scheduler.enqueue(
+            {"v": 2, "type": "servo.move", "action_id": "m3", "source": "app"},
+            override=True,
+        )
+
+        assert result.status == "queued", result
+        assert [job.command["action_id"] for job in scheduler.queue].count("m3") == 1
+        assert not any(job.command["action_id"] == "m2" for job in scheduler.queue)
+    finally:
+        scheduler._stopped = True
+        if scheduler.worker and not scheduler.worker.done():
+            scheduler.worker.cancel()
+
+
+class ExplodingLink:
+    async def send(self, command: dict) -> ActionResult:
+        if command.get("type") == "action.stop":
+            return ActionResult(status="done")
+        raise RuntimeError("link broken")
+
+    async def get_status(self) -> dict:
+        return {}
+
+
+async def test_link_failure_emits_terminal_internal_error():
+    import companion.server.app.services.action_orchestrator as mod
+    from companion.server.app.services.events import get_event_bus
+
+    scheduler = _DeviceScheduler("dev-broken", ExplodingLink())
+    mod._SCHEDULERS["dev-broken"] = scheduler
+    bus = get_event_bus()
+    events: list[dict] = []
+
+    async def collect(event: dict) -> None:
+        events.append(event)
+
+    bus.subscribe(collect)
+    try:
+        result = await scheduler.enqueue(
+            {"v": 2, "type": "idle.set", "action_id": "boom", "source": "app"}
+        )
+        assert result.status == "queued"
+
+        event = await _collect_until(
+            lambda: next((e for e in events if e.get("action_id") == "boom"), None)
+        )
+        assert event["status"] == "failed"
+        assert event["detail"] == "internal_error"
+    finally:
+        bus.unsubscribe(collect)
+        mod.invalidate_device_scheduler("dev-broken")

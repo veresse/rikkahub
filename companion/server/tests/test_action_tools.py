@@ -7,6 +7,8 @@ from companion.shared.catalog import get_action_names
 from companion.server.app.services.action_tools import (
     ROBOT_TOOL_NAMES,
     build_robot_tools,
+    offline_note,
+    robot_tool_injection,
     should_inject_robot_tools,
 )
 
@@ -85,3 +87,23 @@ def test_injection_requires_switch_online_v2_and_capability():
     assert should_inject_robot_tools(
         assistant, SimpleNamespace(protocol_version=2, capabilities_json=[]), online=True
     ) is False
+
+
+def test_injection_reason_distinguishes_revoked_device():
+    assistant = SimpleNamespace(enable_action_sync=True)
+    revoked = SimpleNamespace(
+        is_active=False, protocol_version=2, capabilities_json=["action"]
+    )
+
+    ok, reason = robot_tool_injection(assistant, revoked, online=False)
+
+    assert ok is False
+    assert reason == "inactive"
+    assert "撤销" in offline_note(reason)
+
+    ok, reason = robot_tool_injection(
+        assistant, SimpleNamespace(protocol_version=2, capabilities_json=["action"]), online=False
+    )
+    assert ok is False and reason == "offline"
+    ok, reason = robot_tool_injection(assistant, None, online=True)
+    assert ok is False and reason == "unbound"

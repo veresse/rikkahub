@@ -277,6 +277,10 @@ class ChatOrchestrator:
                             if device is None:
                                 result = {"ok": False, "error": "device_offline"}
                             else:
+                                # 客户端断开/用户停止会以 CancelledError 传到
+                                # `_DeviceScheduler.submit()`，由调度器只中止本轮
+                                # 在途命令并下发 action.stop，不做全局急停，
+                                # 因此不会打断 App 同时进行的遥控动作。
                                 result = await action_orchestrator.execute_tool(
                                     tool_name, parsed_args, device.id, turn
                                 )

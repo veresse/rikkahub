@@ -61,7 +61,9 @@ def reset_device_links() -> None:
 async def resolve_device_for_conversation(db: AsyncSession, conversation_id: str):
     """找会话绑定的设备；没有会话级绑定时回退到角色级绑定。
 
-    只返回 `is_active` 的设备，避免已撤销设备继续接收指令。
+    返回最近绑定/在线的设备，包括**已撤销**的设备：调用方需要它来区分
+    “从没绑定过（unbound）”和“绑定过但已被撤销（inactive）”。是否可用由
+    `robot_tool_injection()` 判定；未激活的设备永远拿不到 `DeviceLink`。
     """
     from companion.server.app.models.conversation import ConversationModel
     from companion.server.app.models.device import DeviceModel
@@ -72,11 +74,11 @@ async def resolve_device_for_conversation(db: AsyncSession, conversation_id: str
 
     result = await db.execute(
         select(DeviceModel)
-        .where(
-            DeviceModel.is_active.is_(True),
-            DeviceModel.bound_conversation_id == conversation_id,
+        .where(DeviceModel.bound_conversation_id == conversation_id)
+        .order_by(
+            DeviceModel.is_active.desc(),
+            DeviceModel.last_seen_at.desc().nullslast(),
         )
-        .order_by(DeviceModel.last_seen_at.desc().nullslast())
     )
     device = result.scalars().first()
     if device is not None:
@@ -85,10 +87,12 @@ async def resolve_device_for_conversation(db: AsyncSession, conversation_id: str
     result = await db.execute(
         select(DeviceModel)
         .where(
-            DeviceModel.is_active.is_(True),
             DeviceModel.bound_conversation_id.is_(None),
             DeviceModel.bound_assistant_id == conversation.assistant_id,
         )
-        .order_by(DeviceModel.last_seen_at.desc().nullslast())
+        .order_by(
+            DeviceModel.is_active.desc(),
+            DeviceModel.last_seen_at.desc().nullslast(),
+        )
     )
     return result.scalars().first()

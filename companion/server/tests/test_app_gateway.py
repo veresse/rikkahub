@@ -15,7 +15,7 @@ from companion.server.app.services.device_registry import (
     reset_device_links,
 )
 from companion.server.app.services.action_orchestrator import reset_action_schedulers
-from companion.server.app.services.events import EventBus
+from companion.server.app.services.events import get_event_bus
 
 TOKEN_ID = "tok-app-gateway"
 DEVICE_ID = "dev-app-gateway"
@@ -88,7 +88,8 @@ class HangingLink:
 
 class Harness:
     def __init__(self):
-        self.bus = EventBus()
+        # 与生产一致：AppGateway 与调度器终态都走同一个全局事件总线。
+        self.bus = get_event_bus()
         self.events: list[dict] = []
         self.bus.subscribe(self._collect)
         self.gateway = AppGateway(self.bus)
@@ -115,9 +116,11 @@ class Harness:
 def _clean_state():
     reset_device_links()
     reset_action_schedulers()
+    get_event_bus().clear()
     yield
     reset_device_links()
     reset_action_schedulers()
+    get_event_bus().clear()
 
 
 async def _stop(task: asyncio.Task, channel: FakeChannel) -> None:
@@ -382,56 +385,61 @@ async def test_ack_includes_action_id_for_action_commands():
 
 
 async def test_superseded_command_receives_terminal_event():
-    from companion.server.app.services.events import get_event_bus
-
     link = HangingLink()
     register_device_link(DEVICE_ID, link)
     harness = Harness()
     task, channel = await harness.connect()
 
-    bus = get_event_bus()
-    events: list[dict] = []
+    first = await harness.remote(
+        channel, {"type": "remote.servo.move", "pan": 0, "tilt": 0, "request_id": "r1"}
+    )
+    assert first["ok"] is True
+    await wait_until(
+        lambda: next((c for c in link.commands if c.get("type") == "servo.move"), None)
+    )
 
-    async def collect(event: dict) -> None:
-        events.append(event)
+    superseded = await harness.remote(
+        channel, {"type": "remote.servo.move", "pan": 10, "tilt": 0, "request_id": "r2"}
+    )
+    replacement = await harness.remote(
+        channel, {"type": "remote.servo.move", "pan": 20, "tilt": 0, "request_id": "r3"}
+    )
+    assert superseded["ok"] is True and superseded["action_id"]
+    assert replacement["ok"] is True and replacement["action_id"]
 
-    bus.subscribe(collect)
-    try:
-        first = await harness.remote(
-            channel, {"type": "remote.servo.move", "pan": 0, "tilt": 0, "request_id": "r1"}
-        )
-        assert first["ok"] is True
-        await wait_until(
-            lambda: next((c for c in link.commands if c.get("type") == "servo.move"), None)
-        )
+    # App 的 WebSocket 自身必须收到服务端终态，而不只是事件总线上的记录。
+    message = await channel.wait_sent(
+        lambda m: m.get("type") == "action.result"
+        and m.get("action_id") == superseded["action_id"]
+    )
+    assert message["status"] == "failed"
+    assert message["detail"] == "superseded"
+    assert message["source"] == "app"
+    assert message["device_id"] == DEVICE_ID
 
-        superseded = await harness.remote(
-            channel, {"type": "remote.servo.move", "pan": 10, "tilt": 0, "request_id": "r2"}
-        )
-        replacement = await harness.remote(
-            channel, {"type": "remote.servo.move", "pan": 20, "tilt": 0, "request_id": "r3"}
-        )
-        assert superseded["ok"] is True and superseded["action_id"]
-        assert replacement["ok"] is True and replacement["action_id"]
+    await _stop(task, channel)
 
-        event = await wait_until(
-            lambda: next(
-                (
-                    e
-                    for e in events
-                    if e.get("type") == "action.result"
-                    and e.get("action_id") == superseded["action_id"]
-                ),
-                None,
-            )
-        )
-        assert event["status"] == "failed"
-        assert event["detail"] == "superseded"
-        assert event["source"] == "app"
 
-        await _stop(task, channel)
-    finally:
-        bus.unsubscribe(collect)
+async def test_inflight_timeout_reaches_app_over_ws(monkeypatch):
+    import companion.server.app.services.action_orchestrator as mod
+
+    monkeypatch.setattr(mod, "DEFAULT_COMMAND_TIMEOUT_MS", 50)
+    link = HangingLink()
+    register_device_link(DEVICE_ID, link)
+    harness = Harness()
+    task, channel = await harness.connect()
+
+    ack = await harness.remote(channel, {"type": "remote.idle.set", "enabled": False})
+    assert ack["ok"] is True and ack["action_id"]
+
+    message = await channel.wait_sent(
+        lambda m: m.get("type") == "action.result" and m.get("action_id") == ack["action_id"]
+    )
+    assert message["status"] == "failed"
+    assert message["detail"] == "timeout"
+    assert any(c.get("type") == "action.stop" for c in link.commands)
+
+    await _stop(task, channel)
 
 
 async def test_v1_link_rejects_remote_control():

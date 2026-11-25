@@ -55,7 +55,9 @@
 ### 3.1 调度器与终态
 
 - 每条 App 命令在以下路径都会收到 `action.result(failed, detail=...)`：
-  `queue_full`、`superseded`、排队 `timeout`、执行 `timeout`、`device_offline`、`internal_error`、`stopped`。
+  `superseded`、排队 `timeout`、执行 `timeout`、`device_offline`、`internal_error`、`stopped`。
+  `queue_full`、`rate_limited` 与参数非法属于「未入队」，只通过 `remote.ack ok=false` 返回，
+  不会广播 `action.result`（见 08 日志的修正）。
 - 排队超时只决定「是否还值得下发」，不再从入队开始计算执行超时；执行超时从真正 `link.send` 开始。
 - worker 用 `asyncio.wait_for(link.send(...), timeout=_command_timeout_ms(...))` 包住发送；
   超时后广播终态并下发 `action.stop(server_cancel)`。
@@ -71,7 +73,9 @@
 - `remote.ack` 对带 `action_id` 的命令回填 `action_id`，App 可把 `action.result` 对回请求。
 - `protocol_version < 2` 的设备统一回 `unsupported_protocol`，不下发 v2 信封。
 - `revoke()` 维护 1h TTL 的撤销集合；握手完成挂载时同步复核，封住「鉴权通过后才挂上」的竞态。
-- 广播只转发协议允许的事件类型；每个 session 的发送有 2s 超时，并由 `gather` 并发，慢客户端不阻塞设备读循环。
+- 广播只转发协议允许的事件类型；每个 session 的发送有 2s 超时，并由 `gather` 并发。发送仍在
+  同一事件循环中执行，慢客户端最多占用 2s；设备读循环内的 `action.result`/`voice.event`
+  已改为后台发布（08 日志），不再被 App 发送阻塞。
 - `shutdown()` 清空会话并退订；`_on_message` 有总兜底并回 `internal_error` ack。
 
 ### 3.3 设备网关
@@ -95,6 +99,8 @@
 
 ## 4. 实际执行的命令与真实输出
 
+07 提交时（`c8ceb3b9`）：
+
 ```text
 $ & "...\companion-venv\Scripts\python.exe" -m pytest -q companion
 ........................................................................ [ 50%]
@@ -102,17 +108,7 @@ $ & "...\companion-venv\Scripts\python.exe" -m pytest -q companion
 143 passed in 4.66s
 ```
 
-```text
-$ & "...\companion-venv\Scripts\python.exe" -m pytest -q companion/server/tests/test_app_gateway.py
-......................                                                   [100%]
-22 passed
-```
-
-```text
-$ & "...\companion-venv\Scripts\python.exe" -m pytest -q companion/server/tests/test_device_gateway.py
-...................                                                      [100%]
-19 passed
-```
+二次审查后的最新结果见 `08_phase2_review_round2.md`（153 passed）。
 
 ## 5. 与计划的偏差 / Ruling
 

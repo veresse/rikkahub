@@ -289,6 +289,86 @@ async def test_action_result_resolves_pending_command(seeded_device):
     await _stop(task, channel)
 
 
+async def test_settled_action_result_is_not_rebroadcast(seeded_device):
+    harness = Harness()
+    task, channel, _ = await harness.connected()
+    link = get_device_link(DEVICE_ID)
+
+    send_task = asyncio.create_task(
+        link.send(
+            {
+                "type": "action.play",
+                "action_id": "act-dup",
+                "name": "nod",
+                "source": "app",
+            }
+        )
+    )
+    await channel.wait_sent(lambda m: m.get("action_id") == "act-dup")
+    channel.push(
+        {"v": 2, "type": "action.result", "action_id": "act-dup", "status": "done"}
+    )
+    assert (await asyncio.wait_for(send_task, timeout=2.0)).status == "done"
+    await wait_until(
+        lambda: next((e for e in harness.events if e["type"] == "action.result"), None)
+    )
+
+    # 服务端已结算（例如超时后急停），设备迟到的同一 action_id 回执不得二次广播。
+    channel.push(
+        {
+            "v": 2,
+            "type": "action.result",
+            "action_id": "act-dup",
+            "status": "failed",
+            "detail": "stopped",
+        }
+    )
+    channel.push({"v": 2, "type": "device.report", "volume": 66})
+    await wait_until(
+        lambda: next((e for e in harness.events if e["type"] == "device.report"), None)
+    )
+
+    results = [e for e in harness.events if e["type"] == "action.result"]
+    assert len(results) == 1
+    assert results[0]["status"] == "done"
+
+    await _stop(task, channel)
+
+
+async def test_unknown_action_result_is_not_broadcast(seeded_device):
+    harness = Harness()
+    task, channel, _ = await harness.connected()
+
+    channel.push(
+        {"v": 2, "type": "action.result", "action_id": "never-sent", "status": "done"}
+    )
+    channel.push({"v": 2, "type": "device.report", "volume": 67})
+    await wait_until(
+        lambda: next((e for e in harness.events if e["type"] == "device.report"), None)
+    )
+
+    assert not [e for e in harness.events if e["type"] == "action.result"]
+
+    await _stop(task, channel)
+
+
+async def test_last_report_is_persisted_on_disconnect(seeded_device):
+    harness = Harness()
+    task, channel, _ = await harness.connected()
+
+    channel.push(
+        {"v": 2, "type": "device.report", "volume": 23, "state": "speaking"}
+    )
+    channel.push(None)
+    await asyncio.wait_for(task, timeout=2.0)
+
+    async with AsyncSessionLocal() as session:
+        device = await session.get(DeviceModel, DEVICE_ID)
+        assert device.volume == 23
+        assert device.state == "speaking"
+        assert device.last_report_json["volume"] == 23
+
+
 async def test_device_report_updates_snapshot_and_publishes_event(seeded_device):
     harness = Harness()
     task, channel, _ = await harness.connected()
