@@ -14,3 +14,6 @@ local.properties
 *.keystore
 *.jks
 *keystore*.txt
+__pycache__/
+*.py[cod]
+.pytest_cache/

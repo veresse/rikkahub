@@ -1,0 +1,429 @@
+{
+  "version": "2.0.0",
+  "updated_at": "2026-11-25",
+  "description": "实体语音陪伴机器人（第二代）动作库单一事实源。Server 工具 Schema、Android App 遥控按钮与 ESP32 固件动作表均从此文件派生。角度单位统一为度（deg）。",
+  "limits": {
+    "pan": {
+      "min": -90.0,
+      "max": 90.0,
+      "center": 0.0,
+      "positive_direction": "right",
+      "description": "水平轴，中位 0°，负=左，正=右。"
+    },
+    "tilt": {
+      "min": -20.0,
+      "max": 45.0,
+      "center": 0.0,
+      "positive_direction": "down",
+      "description": "俯仰轴，中位 0°，负=抬头，正=低头。"
+    },
+    "volume": {
+      "min": 0,
+      "max": 100,
+      "default": 70,
+      "muted": 0,
+      "description": "扬声器音量；0 为静音，但不影响麦克风采集与对话状态机。"
+    },
+    "intensity": {
+      "levels": [1, 2, 3],
+      "labels_zh": {
+        "1": "轻",
+        "2": "中",
+        "3": "用力"
+      }
+    },
+    "speed": {
+      "levels": [1, 2, 3],
+      "labels_zh": {
+        "1": "慢",
+        "2": "中",
+        "3": "快"
+      },
+      "one_way_ms": {
+        "1": 900,
+        "2": 500,
+        "3": 300
+      },
+      "authored_at_level": 2
+    },
+    "repeat": {
+      "min": 1,
+      "max": 5,
+      "default": 1
+    },
+    "default_max_duration_ms": 3000,
+    "hard_max_duration_ms": 5000,
+    "max_actions_per_turn": 3,
+    "rate_limit_per_second": 10
+  },
+  "expressions": {
+    "idle": "待机/默认表情",
+    "listening": "聆听",
+    "thinking": "思考/搜索",
+    "speaking": "说话",
+    "surprised": "惊讶",
+    "sleep": "闭眼/睡觉",
+    "error": "错误/断网"
+  },
+  "categories": {
+    "basic": "归位与看向",
+    "social": "回应与礼貌",
+    "emotion": "情绪表达",
+    "mimic": "拟态动作"
+  },
+  "actions": [
+    {
+      "name": "home",
+      "label_zh": "归位",
+      "category": "basic",
+      "semantics": "平滑回至校准中位 (0, 0)",
+      "axes": ["pan", "tilt"],
+      "supports": {"intensity": false, "speed": true, "repeat": false},
+      "default_params": {"intensity": 2, "speed": 2, "repeat": 1},
+      "intensity_scale": [0.33, 0.67, 1.0],
+      "keyframes": [
+        {"at_ms": 0, "pan": 0.0, "tilt": 0.0, "ease": "ease_in_out"}
+      ],
+      "linked_expression": null,
+      "holds_position": false,
+      "max_duration_ms": 3000,
+      "llm_description_zh": "让头部平滑回到中位。用户说“回来”“归位”“正前方”时使用。"
+    },
+    {
+      "name": "nod",
+      "label_zh": "点头",
+      "category": "social",
+      "semantics": "点头/同意；intensity 控制幅度，speed 控制速度，repeat 控制次数",
+      "axes": ["tilt"],
+      "supports": {"intensity": true, "speed": true, "repeat": true},
+      "default_params": {"intensity": 2, "speed": 2, "repeat": 1},
+      "intensity_scale": [0.6, 0.85, 1.0],
+      "keyframes": [
+        {"at_ms": 0, "pan": 0.0, "tilt": 0.0, "ease": "ease_out"},
+        {"at_ms": 250, "pan": 0.0, "tilt": 22.0, "ease": "ease_in_out"},
+        {"at_ms": 500, "pan": 0.0, "tilt": 0.0, "ease": "ease_in"}
+      ],
+      "linked_expression": null,
+      "holds_position": false,
+      "max_duration_ms": 3000,
+      "llm_description_zh": "点头表示同意/收到。轻点一下用 intensity=1，特别用力用 intensity=3；连点两下用 repeat=2。"
+    },
+    {
+      "name": "shake",
+      "label_zh": "摇头",
+      "category": "social",
+      "semantics": "摇头/否定；intensity 控制幅度，speed 控制速度，repeat 控制次数",
+      "axes": ["pan"],
+      "supports": {"intensity": true, "speed": true, "repeat": true},
+      "default_params": {"intensity": 2, "speed": 2, "repeat": 1},
+      "intensity_scale": [0.6, 0.85, 1.0],
+      "keyframes": [
+        {"at_ms": 0, "pan": 0.0, "tilt": 0.0, "ease": "ease_in_out"},
+        {"at_ms": 150, "pan": -30.0, "tilt": 0.0, "ease": "ease_in_out"},
+        {"at_ms": 450, "pan": 30.0, "tilt": 0.0, "ease": "ease_in_out"},
+        {"at_ms": 600, "pan": 0.0, "tilt": 0.0, "ease": "ease_in_out"}
+      ],
+      "linked_expression": null,
+      "holds_position": false,
+      "max_duration_ms": 3000,
+      "llm_description_zh": "摇头表示否定/不赞同。轻摇用 intensity=1，用力摇头用 intensity=3。"
+    },
+    {
+      "name": "look_left",
+      "label_zh": "看左边",
+      "category": "basic",
+      "semantics": "看向左侧，随后保持（直到下一个指令或自动回中策略）",
+      "axes": ["pan"],
+      "supports": {"intensity": true, "speed": true, "repeat": false},
+      "default_params": {"intensity": 2, "speed": 2, "repeat": 1},
+      "intensity_scale": [0.33, 0.6, 1.0],
+      "keyframes": [
+        {"at_ms": 0, "pan": 0.0, "tilt": 0.0, "ease": "ease_in_out"},
+        {"at_ms": 450, "pan": -75.0, "tilt": 0.0, "ease": "ease_in_out"}
+      ],
+      "linked_expression": null,
+      "holds_position": true,
+      "max_duration_ms": 3000,
+      "llm_description_zh": "头部转向左边看。默认中档约 45°，轻档约 25°，用力档约 75°。"
+    },
+    {
+      "name": "look_right",
+      "label_zh": "看右边",
+      "category": "basic",
+      "semantics": "看向右侧，随后保持（直到下一个指令或自动回中策略）",
+      "axes": ["pan"],
+      "supports": {"intensity": true, "speed": true, "repeat": false},
+      "default_params": {"intensity": 2, "speed": 2, "repeat": 1},
+      "intensity_scale": [0.33, 0.6, 1.0],
+      "keyframes": [
+        {"at_ms": 0, "pan": 0.0, "tilt": 0.0, "ease": "ease_in_out"},
+        {"at_ms": 450, "pan": 75.0, "tilt": 0.0, "ease": "ease_in_out"}
+      ],
+      "linked_expression": null,
+      "holds_position": true,
+      "max_duration_ms": 3000,
+      "llm_description_zh": "头部转向右边看。默认中档约 45°，轻档约 25°，用力档约 75°。"
+    },
+    {
+      "name": "look_up",
+      "label_zh": "抬头",
+      "category": "basic",
+      "semantics": "抬头向上看",
+      "axes": ["tilt"],
+      "supports": {"intensity": true, "speed": true, "repeat": false},
+      "default_params": {"intensity": 2, "speed": 2, "repeat": 1},
+      "intensity_scale": [0.4, 0.7, 1.0],
+      "keyframes": [
+        {"at_ms": 0, "pan": 0.0, "tilt": 0.0, "ease": "ease_in_out"},
+        {"at_ms": 400, "pan": 0.0, "tilt": -20.0, "ease": "ease_in_out"}
+      ],
+      "linked_expression": null,
+      "holds_position": true,
+      "max_duration_ms": 3000,
+      "llm_description_zh": "抬头向上看（负俯仰角）。适合“看看上面”“抬头”等请求。"
+    },
+    {
+      "name": "look_down",
+      "label_zh": "低头",
+      "category": "basic",
+      "semantics": "低头向下看",
+      "axes": ["tilt"],
+      "supports": {"intensity": true, "speed": true, "repeat": false},
+      "default_params": {"intensity": 2, "speed": 2, "repeat": 1},
+      "intensity_scale": [0.33, 0.67, 1.0],
+      "keyframes": [
+        {"at_ms": 0, "pan": 0.0, "tilt": 0.0, "ease": "ease_in_out"},
+        {"at_ms": 400, "pan": 0.0, "tilt": 45.0, "ease": "ease_in_out"}
+      ],
+      "linked_expression": null,
+      "holds_position": true,
+      "max_duration_ms": 3000,
+      "llm_description_zh": "低头向下看（正俯仰角）。轻档约 15°，中档约 30°，用力档约 45°。"
+    },
+    {
+      "name": "look_around",
+      "label_zh": "环视",
+      "category": "basic",
+      "semantics": "左右各看一次后回中",
+      "axes": ["pan", "tilt"],
+      "supports": {"intensity": false, "speed": true, "repeat": false},
+      "default_params": {"intensity": 2, "speed": 2, "repeat": 1},
+      "intensity_scale": [1.0, 1.0, 1.0],
+      "keyframes": [
+        {"at_ms": 0, "pan": 0.0, "tilt": 0.0, "ease": "ease_in_out"},
+        {"at_ms": 500, "pan": -45.0, "tilt": 0.0, "ease": "ease_in_out"},
+        {"at_ms": 1500, "pan": 45.0, "tilt": 0.0, "ease": "ease_in_out"},
+        {"at_ms": 2000, "pan": 0.0, "tilt": 0.0, "ease": "ease_in_out"}
+      ],
+      "linked_expression": null,
+      "holds_position": false,
+      "max_duration_ms": 3000,
+      "llm_description_zh": "左右环视一圈再回正。适合“看看周围”“找找看”。"
+    },
+    {
+      "name": "bow",
+      "label_zh": "鞠躬",
+      "category": "social",
+      "semantics": "低头保持短暂停顿后回中，深度随 intensity",
+      "axes": ["tilt"],
+      "supports": {"intensity": true, "speed": true, "repeat": false},
+      "default_params": {"intensity": 2, "speed": 2, "repeat": 1},
+      "intensity_scale": [0.5, 0.75, 1.0],
+      "keyframes": [
+        {"at_ms": 0, "pan": 0.0, "tilt": 0.0, "ease": "ease_in_out"},
+        {"at_ms": 450, "pan": 0.0, "tilt": 40.0, "ease": "ease_in_out"},
+        {"at_ms": 900, "pan": 0.0, "tilt": 40.0, "ease": "linear"},
+        {"at_ms": 1350, "pan": 0.0, "tilt": 0.0, "ease": "ease_in_out"}
+      ],
+      "linked_expression": null,
+      "holds_position": false,
+      "max_duration_ms": 3000,
+      "llm_description_zh": "鞠躬/致谢。深度随 intensity 变化，适合“谢谢”“拜托了”。"
+    },
+    {
+      "name": "peek",
+      "label_zh": "探头偷看",
+      "category": "social",
+      "semantics": "小幅 pan 偏移 + 微低/抬头停顿后回位",
+      "axes": ["pan", "tilt"],
+      "supports": {"intensity": true, "speed": true, "repeat": false},
+      "default_params": {"intensity": 2, "speed": 2, "repeat": 1},
+      "intensity_scale": [0.6, 0.85, 1.0],
+      "keyframes": [
+        {"at_ms": 0, "pan": 0.0, "tilt": 0.0, "ease": "ease_in_out"},
+        {"at_ms": 400, "pan": -25.0, "tilt": -8.0, "ease": "ease_in_out"},
+        {"at_ms": 900, "pan": -25.0, "tilt": -8.0, "ease": "linear"},
+        {"at_ms": 1300, "pan": 0.0, "tilt": 0.0, "ease": "ease_in_out"}
+      ],
+      "linked_expression": null,
+      "holds_position": false,
+      "max_duration_ms": 3000,
+      "llm_description_zh": "好奇地探头偷看一眼再回来。适合“偷偷看看”“好奇”等语气。"
+    },
+    {
+      "name": "surprised",
+      "label_zh": "惊吓",
+      "category": "emotion",
+      "semantics": "快速抬头至 -18° + 短停顿 + 回位",
+      "axes": ["tilt"],
+      "supports": {"intensity": false, "speed": true, "repeat": false},
+      "default_params": {"intensity": 2, "speed": 2, "repeat": 1},
+      "intensity_scale": [1.0, 1.0, 1.0],
+      "keyframes": [
+        {"at_ms": 0, "pan": 0.0, "tilt": 0.0, "ease": "ease_out"},
+        {"at_ms": 180, "pan": 0.0, "tilt": -18.0, "ease": "ease_out"},
+        {"at_ms": 550, "pan": 0.0, "tilt": -18.0, "ease": "linear"},
+        {"at_ms": 800, "pan": 0.0, "tilt": 0.0, "ease": "ease_in_out"}
+      ],
+      "linked_expression": "surprised",
+      "holds_position": false,
+      "max_duration_ms": 3000,
+      "llm_description_zh": "被吓到/惊讶地快速抬头。触发时同步切换惊讶表情。"
+    },
+    {
+      "name": "sleep",
+      "label_zh": "睡觉",
+      "category": "emotion",
+      "semantics": "缓慢低头至 +35° 并保持，不自动回中，直到唤醒或新指令",
+      "axes": ["tilt"],
+      "supports": {"intensity": false, "speed": true, "repeat": false},
+      "default_params": {"intensity": 2, "speed": 1, "repeat": 1},
+      "intensity_scale": [1.0, 1.0, 1.0],
+      "keyframes": [
+        {"at_ms": 0, "pan": 0.0, "tilt": 0.0, "ease": "ease_in_out"},
+        {"at_ms": 1200, "pan": 0.0, "tilt": 35.0, "ease": "ease_in_out"}
+      ],
+      "linked_expression": "sleep",
+      "holds_position": true,
+      "max_duration_ms": 3000,
+      "llm_description_zh": "缓慢低头进入睡觉姿态并保持，同时闭眼。用户说“睡觉吧”“晚安”时使用。"
+    },
+    {
+      "name": "wake",
+      "label_zh": "唤醒",
+      "category": "emotion",
+      "semantics": "从低头缓慢抬至 0° + 一次小幅 nod",
+      "axes": ["tilt"],
+      "supports": {"intensity": false, "speed": true, "repeat": false},
+      "default_params": {"intensity": 2, "speed": 2, "repeat": 1},
+      "intensity_scale": [1.0, 1.0, 1.0],
+      "keyframes": [
+        {"at_ms": 0, "pan": 0.0, "tilt": 35.0, "ease": "ease_in_out"},
+        {"at_ms": 800, "pan": 0.0, "tilt": 0.0, "ease": "ease_in_out"},
+        {"at_ms": 1100, "pan": 0.0, "tilt": 10.0, "ease": "ease_in_out"},
+        {"at_ms": 1400, "pan": 0.0, "tilt": 0.0, "ease": "ease_in_out"}
+      ],
+      "linked_expression": "idle",
+      "holds_position": false,
+      "max_duration_ms": 3000,
+      "llm_description_zh": "从睡觉姿态醒来，抬头并轻轻点一下。用户说“醒醒”“起床了”时使用。"
+    },
+    {
+      "name": "panic",
+      "label_zh": "慌张",
+      "category": "emotion",
+      "semantics": "快速小幅连续左右急摇（±15°–±25°）",
+      "axes": ["pan"],
+      "supports": {"intensity": true, "speed": true, "repeat": true},
+      "default_params": {"intensity": 2, "speed": 3, "repeat": 2},
+      "intensity_scale": [0.6, 0.8, 1.0],
+      "keyframes": [
+        {"at_ms": 0, "pan": 0.0, "tilt": 0.0, "ease": "ease_in_out"},
+        {"at_ms": 80, "pan": -20.0, "tilt": 0.0, "ease": "ease_in_out"},
+        {"at_ms": 240, "pan": 20.0, "tilt": 0.0, "ease": "ease_in_out"},
+        {"at_ms": 400, "pan": -20.0, "tilt": 0.0, "ease": "ease_in_out"},
+        {"at_ms": 480, "pan": 0.0, "tilt": 0.0, "ease": "ease_in_out"}
+      ],
+      "linked_expression": "surprised",
+      "holds_position": false,
+      "max_duration_ms": 3000,
+      "llm_description_zh": "慌张地小幅快速左右摇头。适合被追问、害羞或慌乱的情境。"
+    },
+    {
+      "name": "swing",
+      "label_zh": "摇摆",
+      "category": "emotion",
+      "semantics": "中幅连续左右韵律摆动，拟态身体摇摆",
+      "axes": ["pan"],
+      "supports": {"intensity": true, "speed": true, "repeat": true},
+      "default_params": {"intensity": 2, "speed": 2, "repeat": 1},
+      "intensity_scale": [0.6, 0.85, 1.0],
+      "keyframes": [
+        {"at_ms": 0, "pan": 0.0, "tilt": 0.0, "ease": "ease_in_out"},
+        {"at_ms": 350, "pan": -30.0, "tilt": 0.0, "ease": "ease_in_out"},
+        {"at_ms": 1050, "pan": 30.0, "tilt": 0.0, "ease": "ease_in_out"},
+        {"at_ms": 1750, "pan": -30.0, "tilt": 0.0, "ease": "ease_in_out"},
+        {"at_ms": 2450, "pan": 30.0, "tilt": 0.0, "ease": "ease_in_out"},
+        {"at_ms": 2800, "pan": 0.0, "tilt": 0.0, "ease": "ease_in_out"}
+      ],
+      "linked_expression": null,
+      "holds_position": false,
+      "max_duration_ms": 3000,
+      "llm_description_zh": "开心地左右摇摆，像身体在晃。适合愉快、期待的语气。"
+    },
+    {
+      "name": "tilt_left",
+      "label_zh": "向左歪头",
+      "category": "mimic",
+      "semantics": "pan 小角度左偏 + tilt 微抬组合，拟态歪头",
+      "axes": ["pan", "tilt"],
+      "supports": {"intensity": true, "speed": true, "repeat": false},
+      "default_params": {"intensity": 2, "speed": 2, "repeat": 1},
+      "intensity_scale": [0.6, 0.85, 1.0],
+      "keyframes": [
+        {"at_ms": 0, "pan": 0.0, "tilt": 0.0, "ease": "ease_in_out"},
+        {"at_ms": 450, "pan": -18.0, "tilt": -8.0, "ease": "ease_in_out"},
+        {"at_ms": 900, "pan": -18.0, "tilt": -8.0, "ease": "linear"},
+        {"at_ms": 1250, "pan": 0.0, "tilt": 0.0, "ease": "ease_in_out"}
+      ],
+      "linked_expression": null,
+      "holds_position": false,
+      "max_duration_ms": 3000,
+      "llm_description_zh": "向左歪头，做出疑惑/卖萌的拟态。真 roll 轴歪头由双轴组合模拟。"
+    },
+    {
+      "name": "tilt_right",
+      "label_zh": "向右歪头",
+      "category": "mimic",
+      "semantics": "pan 小角度右偏 + tilt 微抬组合，拟态歪头",
+      "axes": ["pan", "tilt"],
+      "supports": {"intensity": true, "speed": true, "repeat": false},
+      "default_params": {"intensity": 2, "speed": 2, "repeat": 1},
+      "intensity_scale": [0.6, 0.85, 1.0],
+      "keyframes": [
+        {"at_ms": 0, "pan": 0.0, "tilt": 0.0, "ease": "ease_in_out"},
+        {"at_ms": 450, "pan": 18.0, "tilt": -8.0, "ease": "ease_in_out"},
+        {"at_ms": 900, "pan": 18.0, "tilt": -8.0, "ease": "linear"},
+        {"at_ms": 1250, "pan": 0.0, "tilt": 0.0, "ease": "ease_in_out"}
+      ],
+      "linked_expression": null,
+      "holds_position": false,
+      "max_duration_ms": 3000,
+      "llm_description_zh": "向右歪头，做出疑惑/卖萌的拟态。真 roll 轴歪头由双轴组合模拟。"
+    },
+    {
+      "name": "dance",
+      "label_zh": "跳舞",
+      "category": "emotion",
+      "semantics": "预设多关键帧组合序列，允许超过普通动作 3000ms 上限",
+      "axes": ["pan", "tilt"],
+      "supports": {"intensity": false, "speed": true, "repeat": false},
+      "default_params": {"intensity": 2, "speed": 2, "repeat": 1},
+      "intensity_scale": [1.0, 1.0, 1.0],
+      "keyframes": [
+        {"at_ms": 0, "pan": 0.0, "tilt": 0.0, "ease": "ease_in_out"},
+        {"at_ms": 400, "pan": -35.0, "tilt": 15.0, "ease": "ease_in_out"},
+        {"at_ms": 900, "pan": 35.0, "tilt": 15.0, "ease": "ease_in_out"},
+        {"at_ms": 1400, "pan": -35.0, "tilt": -10.0, "ease": "ease_in_out"},
+        {"at_ms": 1900, "pan": 35.0, "tilt": -10.0, "ease": "ease_in_out"},
+        {"at_ms": 2400, "pan": -25.0, "tilt": 20.0, "ease": "ease_in_out"},
+        {"at_ms": 2900, "pan": 25.0, "tilt": 20.0, "ease": "ease_in_out"},
+        {"at_ms": 3400, "pan": 0.0, "tilt": 0.0, "ease": "ease_in_out"}
+      ],
+      "linked_expression": null,
+      "holds_position": false,
+      "max_duration_ms": 5000,
+      "llm_description_zh": "跳一段小舞蹈（多段组合动作）。适合用户明确要求“跳个舞”“开心地扭一扭”。"
+    }
+  ]
+}
