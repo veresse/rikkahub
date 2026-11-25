@@ -96,6 +96,7 @@ class ImportService:
                     existing.enable_memory = a["enable_memory"]
                     existing.use_global_memory = a["use_global_memory"]
                     existing.enable_web_search = a["enable_web_search"]
+                    existing.enable_action_sync = a["enable_action_sync"]
                     existing.raw_snapshot = a["raw_snapshot"]
                 else:
                     db.add(AssistantModel(**a))

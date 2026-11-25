@@ -408,6 +408,31 @@
 
 **不缓存、不补发。**
 
+### 8.3 服务端 → App 对话 SSE（`POST /api/chat/completions`）
+
+App 携带 `Authorization: Bearer <app_token>` 发起请求，响应为 `text/event-stream`，每行格式 `data: <json>`。
+
+| type | 字段 | 说明 |
+| :--- | :--- | :--- |
+| `status` | `status`、可选 `results/message` | `generating` / `searching` / `search_done` |
+| `content` | `delta` | 正文增量；收到即可送入 TTS 分句缓冲，不必等整段结束 |
+| `reasoning` | `delta` | 思考链增量（reasoner 模型） |
+| `tool_result` | `tool`、`result` | 某一轮机器人工具的执行结果 |
+| `usage` | `usage` | Token 统计（含 `prompt_cache_hit_tokens`） |
+| `error` | `error` | 统一错误文本 |
+| `done` | `finish_reason` | 本次流结束 |
+
+`tool_result` 成功与失败示例：
+
+```json
+{"type":"tool_result","tool":"robot.action","result":{"ok":true,"action_id":"uuid","status":"done"}}
+{"type":"tool_result","tool":"robot.action","result":{"ok":false,"error":"action_limit_exceeded","message":"单轮最多 3 次动作工具调用"}}
+```
+
+- 只有 5 个 `robot.*` 工具会产生 `tool_result`；动作下发与正文流并行，模型可在下一轮根据结果续说。
+- 设备离线/未绑定时不会出现 `tool_result`，也不会注入任何 `robot.*` 工具。
+- `content` 可能跨越多轮出现（工具调用前后的正文都会推送）；App 应按顺序拼接展示。
+
 ---
 
 ## 9. 状态机

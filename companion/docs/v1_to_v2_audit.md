@@ -225,7 +225,9 @@ Android 根工程基线：`gradlew --version` 通过（Gradle 9.6.0 / JDK 17）�
 - Block A：`companion/shared/actions.json`、JSON Schema、校验器、`companion/docs/protocol_v2.md`。
 - Block B：App Bearer Token、设备 Token 哈希、配对码落库、Alembic 可逆迁移、删除 `companion/web`、
   Nginx/systemd/部署脚本改为非 root 且只反代 REST/WS。
-- 当前测试：`64 passed`（明细见 `docs/语音机器人需求文档/v2_migration_log/03_phase2_auth_alembic_web_removal.md`）。
+- Block C：`ActionOrchestrator`、流式 tool-call 聚合、动态注入 5 个 `robot.*` 工具、单轮限次/排队/限速/
+  覆盖/急停、对话 SSE 新增 `tool_result`。
+- 当前测试：`93 passed`（明细见 `docs/语音机器人需求文档/v2_migration_log/04_phase2_action_orchestrator_tool_loop.md`）。
 
-仍未实现：`/device/ws`、`/app/ws`、动作编排、DeepSeek 工具循环、音频链路、App、固件。
+仍未实现：`/device/ws`、`/app/ws`、动作超时强停、音频链路、App、固件。
 

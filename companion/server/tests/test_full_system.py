@@ -146,6 +146,8 @@ async def test_full_service_pipeline(mock_backup_zip: Path):
         assert ast_resp.status_code == 200
         assistants = ast_resp.json()
         assert any(a["name"] == "夏以昼" for a in assistants)
+        # v1 备份未携带 enableActionSync，升级后默认开启动作联动
+        assert all(a["enable_action_sync"] is True for a in assistants)
 
         # 6. 验证会话与多候选分支树获取
         conv_resp = await client.get("/api/conversations", headers=headers)

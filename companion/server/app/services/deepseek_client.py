@@ -21,8 +21,9 @@ class DeepSeekClient:
         产出字典格式：
         - {"type": "content", "delta": "..."}
         - {"type": "reasoning", "delta": "..."} (思考链内容)
-        - {"type": "tool_call", "tool_call": {...}}
-        - {"type": "done", "finish_reason": "stop"}
+        - {"type": "tool_call", "delta": [...]} (OpenAI 流式 tool_calls 增量)
+        - {"type": "usage", "usage": {...}}
+        - {"type": "done", "finish_reason": "stop|tool_calls"}
         """
         if not self.api_key:
             yield {"type": "error", "error": "DeepSeek API Key 未配置，请在设置中配置"}
@@ -56,12 +57,13 @@ class DeepSeekClient:
                         yield {"type": "error", "error": f"API 错误 ({response.status_code}): {err_text.decode('utf-8', errors='ignore')}"}
                         return
 
+                    done_reason = "stop"
                     async for line in response.aiter_lines():
                         if not line or not line.startswith("data: "):
                             continue
                         data_str = line[6:].strip()
                         if data_str == "[DONE]":
-                            yield {"type": "done", "finish_reason": "stop"}
+                            yield {"type": "done", "finish_reason": done_reason}
                             break
 
                         try:
@@ -70,6 +72,9 @@ class DeepSeekClient:
                             if not choices:
                                 continue
                             delta = choices[0].get("delta", {})
+                            choice_finish = choices[0].get("finish_reason")
+                            if choice_finish:
+                                done_reason = choice_finish
 
                             # 思考链提取 (DeepSeek Reasoner 模型会返回 reasoning_content)
                             if "reasoning_content" in delta and delta["reasoning_content"]:

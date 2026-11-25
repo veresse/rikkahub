@@ -17,6 +17,9 @@ RikkaHub 的独立轻量化 Linux 服务端，作为角色、记忆、会话与�
   设备 Token 与 App Token 分表存储，互不通用。
 - **动作契约**：`companion/shared/actions.json` 是 Server / App / 固件共享的 18 动作单一事实源，
   通过 `GET /api/actions/catalog` 下发。
+- **动作编排**：设备在线且角色开启动作联动时，向 DeepSeek 注入 5 个 `robot.*` 工具；单轮最多 3 次动作，
+  每设备串行排队（上限 8）、10 条/秒限速、音量/舵机后写覆盖、急停清空队列；执行结果以 `tool_result`
+  回传对话流。设备离线或未绑定时不注入工具，只给模型一句状态提示。
 - **可逆迁移**：Alembic 管理数据库结构，v1 存量库可平滑升级（设备明文 Token 会转为哈希）。
 
 ## 启动与运行
@@ -75,8 +78,8 @@ python -c "from companion.server.app.security.password import hash_password; pri
 | PUT | `/api/devices/{id}`、`PUT /api/devices/bind` | App | 重命名/绑定 |
 | DELETE | `/api/devices/{id}` | App | 撤销设备（软删除，旧 Token 立即失效） |
 
-设备/App WebSocket（`/device/ws`、`/app/ws`）与动作编排、音频链路属于后续 Block，协议已定稿于
-`companion/docs/protocol_v2.md`。
+设备/App WebSocket（`/device/ws`、`/app/ws`）与音频链路属于后续 Block；动作编排已接入对话 SSE
+（事件见 `companion/docs/protocol_v2.md` 8.3）。
 
 ## 数据库迁移
 

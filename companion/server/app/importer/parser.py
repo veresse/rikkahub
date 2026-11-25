@@ -55,6 +55,7 @@ class BackupParser:
                 "enable_memory": bool(raw.get("enableMemory", False)),
                 "use_global_memory": bool(raw.get("useGlobalMemory", False)),
                 "enable_web_search": bool(raw.get("enableWebSearch", False)),
+                "enable_action_sync": bool(raw.get("enableActionSync", True)),
                 "model_id": str(raw.get("chatModelId")) if raw.get("chatModelId") else None,
                 "raw_snapshot": raw  # 保存完整原始 JSON，避免信息丢失
             }

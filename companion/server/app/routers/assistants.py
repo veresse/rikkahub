@@ -19,6 +19,7 @@ class AssistantCreateOrUpdate(BaseModel):
     enable_memory: bool = False
     use_global_memory: bool = False
     enable_web_search: bool = False
+    enable_action_sync: bool = True
     avatar: dict[str, Any] = {}
 
 @router.get("")
@@ -36,6 +37,7 @@ async def list_assistants(db: AsyncSession = Depends(get_db)):
             "enable_memory": a.enable_memory,
             "use_global_memory": a.use_global_memory,
             "enable_web_search": a.enable_web_search,
+            "enable_action_sync": a.enable_action_sync,
             "avatar": a.avatar
         }
         for a in assistants
@@ -56,6 +58,7 @@ async def get_assistant(assistant_id: str, db: AsyncSession = Depends(get_db)):
         "enable_memory": a.enable_memory,
         "use_global_memory": a.use_global_memory,
         "enable_web_search": a.enable_web_search,
+        "enable_action_sync": a.enable_action_sync,
         "avatar": a.avatar
     }
 
@@ -72,6 +75,7 @@ async def create_assistant(data: AssistantCreateOrUpdate, db: AsyncSession = Dep
         enable_memory=data.enable_memory,
         use_global_memory=data.use_global_memory,
         enable_web_search=data.enable_web_search,
+        enable_action_sync=data.enable_action_sync,
         avatar=data.avatar
     )
     async with db.begin():
@@ -92,6 +96,7 @@ async def update_assistant(assistant_id: str, data: AssistantCreateOrUpdate, db:
         a.enable_memory = data.enable_memory
         a.use_global_memory = data.use_global_memory
         a.enable_web_search = data.enable_web_search
+        a.enable_action_sync = data.enable_action_sync
         a.avatar = data.avatar
     return {"status": "updated"}
 
