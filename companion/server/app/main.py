@@ -26,6 +26,7 @@ async def lifespan(app: FastAPI):
     await init_db()
     yield
     await ws.device_gateway.shutdown()
+    await ws.app_gateway.shutdown()
 
 
 app = FastAPI(

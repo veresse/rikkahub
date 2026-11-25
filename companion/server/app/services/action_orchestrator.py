@@ -51,6 +51,7 @@ class ActionTurnState:
 class _Job:
     command: dict[str, Any]
     future: asyncio.Future[ActionResult] = field(repr=False)
+    deadline: float | None = None
 
 
 class _DeviceScheduler:
@@ -85,12 +86,20 @@ class _DeviceScheduler:
                     continue
                 self.current = job
                 try:
-                    result = await self.link.send(job.command)
-                except Exception:
-                    result = ActionResult(status="failed", detail="internal_error")
-                if not job.future.done():
-                    job.future.set_result(result)
-                self.current = None
+                    if job.deadline is not None and time.monotonic() > job.deadline:
+                        if not job.future.done():
+                            job.future.set_result(
+                                ActionResult(status="failed", detail="timeout")
+                            )
+                        continue
+                    try:
+                        result = await self.link.send(job.command)
+                    except Exception:
+                        result = ActionResult(status="failed", detail="internal_error")
+                    if not job.future.done():
+                        job.future.set_result(result)
+                finally:
+                    self.current = None
         finally:
             self.current = None
             self.worker = None
@@ -104,14 +113,7 @@ class _DeviceScheduler:
             return ActionResult(status="failed", detail="rate_limited")
 
         if override:
-            kept: deque[_Job] = deque()
-            for job in self.queue:
-                if job.command.get("type") == command.get("type"):
-                    if not job.future.done():
-                        job.future.set_result(ActionResult(status="failed", detail="superseded"))
-                else:
-                    kept.append(job)
-            self.queue = kept
+            self._drop_superseded(command.get("type"))
 
         if len(self.queue) >= MAX_PENDING_COMMANDS:
             return ActionResult(status="failed", detail="queue_full")
@@ -123,23 +125,58 @@ class _DeviceScheduler:
         try:
             return await asyncio.wait_for(asyncio.shield(job.future), timeout_ms / 1000)
         except asyncio.TimeoutError:
-            if not job.future.done():
-                job.future.set_result(ActionResult(status="timeout", detail="timeout"))
-            try:
-                self.queue.remove(job)
-            except ValueError:
-                pass
+            self._abort(job)
+            # 设备没在预期时间内回执，主动急停，避免舵机继续跑一个
+            # 服务端已经放弃的动作。
+            await self._send_stop("server_cancel")
             return ActionResult(status="timeout", detail="timeout")
 
-    async def stop(self, reason: str) -> ActionResult:
-        stopped = ActionResult(status="failed", detail="stopped")
-        if self.current is not None and not self.current.future.done():
-            self.current.future.set_result(stopped)
-        for job in self.queue:
-            if not job.future.done():
-                job.future.set_result(stopped)
-        self.queue.clear()
+    async def enqueue(
+        self, command: dict[str, Any], *, timeout_ms: int, override: bool = False
+    ) -> ActionResult:
+        """App 遥控用：入队后立刻返回 `queued`，结果走事件广播。
 
+        排队超过 `timeout_ms` 仍未下发的命令会被 worker 丢弃并标记
+        `failed(timeout)`，遥控方通过事件流观察最终结果。
+        """
+        if not self._allow_rate():
+            return ActionResult(status="failed", detail="rate_limited")
+        if override:
+            self._drop_superseded(command.get("type"))
+        if len(self.queue) >= MAX_PENDING_COMMANDS:
+            return ActionResult(status="failed", detail="queue_full")
+
+        job = _Job(
+            command=command,
+            future=asyncio.get_running_loop().create_future(),
+            deadline=time.monotonic() + timeout_ms / 1000,
+        )
+        self.queue.append(job)
+        self._ensure_worker()
+        # 让 worker 有机会在本调用返回前把命令写进通道。
+        await asyncio.sleep(0)
+        return ActionResult(status="queued")
+
+    def _abort(self, job: _Job) -> None:
+        if not job.future.done():
+            job.future.set_result(ActionResult(status="timeout", detail="timeout"))
+        try:
+            self.queue.remove(job)
+        except ValueError:
+            pass
+
+    def _drop_superseded(self, command_type: Any) -> None:
+        """覆盖语义：同类型未下发的旧指令标记 superseded 并出队。"""
+        kept: deque[_Job] = deque()
+        for job in self.queue:
+            if job.command.get("type") == command_type:
+                if not job.future.done():
+                    job.future.set_result(ActionResult(status="failed", detail="superseded"))
+            else:
+                kept.append(job)
+        self.queue = kept
+
+    async def _send_stop(self, reason: str) -> ActionResult:
         command = {
             "v": 2,
             "type": "action.stop",
@@ -151,6 +188,16 @@ class _DeviceScheduler:
         except Exception:
             return ActionResult(status="failed", detail="internal_error")
 
+    async def stop(self, reason: str) -> ActionResult:
+        stopped = ActionResult(status="failed", detail="stopped")
+        if self.current is not None and not self.current.future.done():
+            self.current.future.set_result(stopped)
+        for job in self.queue:
+            if not job.future.done():
+                job.future.set_result(stopped)
+        self.queue.clear()
+        return await self._send_stop(reason)
+
 
 _SCHEDULERS: dict[str, _DeviceScheduler] = {}
 
@@ -159,6 +206,15 @@ def invalidate_device_scheduler(device_id: str) -> None:
     scheduler = _SCHEDULERS.pop(device_id, None)
     if scheduler and scheduler.worker and not scheduler.worker.done():
         scheduler.worker.cancel()
+
+
+def get_device_scheduler(device_id: str, link: Any) -> _DeviceScheduler:
+    """按设备取唯一调度器；设备链路变化时自动重建，避免向旧连接发指令。"""
+    scheduler = _SCHEDULERS.get(device_id)
+    if scheduler is None or scheduler.link is not link:
+        scheduler = _DeviceScheduler(device_id, link)
+        _SCHEDULERS[device_id] = scheduler
+    return scheduler
 
 
 def reset_action_schedulers() -> None:
@@ -186,11 +242,7 @@ class ActionOrchestrator:
         return self._resolve(device_id)
 
     def _scheduler(self, device_id: str, link: Any) -> _DeviceScheduler:
-        scheduler = _SCHEDULERS.get(device_id)
-        if scheduler is None or scheduler.link is not link:
-            scheduler = _DeviceScheduler(device_id, link)
-            _SCHEDULERS[device_id] = scheduler
-        return scheduler
+        return get_device_scheduler(device_id, link)
 
     @staticmethod
     def _coerce_args(arguments: Any) -> dict[str, Any] | None:

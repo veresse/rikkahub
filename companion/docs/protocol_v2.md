@@ -433,6 +433,16 @@ App 携带 `Authorization: Bearer <app_token>` 发起请求，响应为 `text/ev
 - 设备离线/未绑定时不会出现 `tool_result`，也不会注入任何 `robot.*` 工具。
 - `content` 可能跨越多轮出现（工具调用前后的正文都会推送）；App 应按顺序拼接展示。
 
+### 8.4 服务端实现补充
+
+- `remote.*` 受理后立即回 `remote.ack(ok=true)`；`action.play`/`servo.move`/`volume.set` 等
+  只表示**已入队**，最终结果通过 `action.result` 与 `device.report` 广播。
+- App 与 LLM 共用同一设备队列，遵守第 7 节仲裁规则。
+- `remote.get_status` 不新增下行消息，服务端直接把当前缓存的 `device.report` 快照广播给 App
+  （设备状态变化本身会主动上报）。
+- App Token 被 `POST /api/auth/tokens/{id}/revoke` 或 `/api/auth/logout` 撤销时，该 Token 的
+  `/app/ws` 连接以 `4401 token_revoked` 关闭；已过期 Token 在下次握手时被拒绝。
+
 ---
 
 ## 9. 状态机

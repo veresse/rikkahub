@@ -108,6 +108,7 @@ async def logout(
         .values(revoked_at=_now_ms())
     )
     await db.commit()
+    await _close_ws_connections(auth.token_id)
     return {"status": "logged_out"}
 
 
@@ -144,4 +145,12 @@ async def revoke_token(
         .values(revoked_at=_now_ms())
     )
     await db.commit()
+    await _close_ws_connections(token_id)
     return {"status": "revoked", "token_id": token_id}
+
+
+async def _close_ws_connections(token_id: str) -> None:
+    """撤销 Token 后立刻断开它已建立的 `/app/ws` 连接。"""
+    from companion.server.app.routers.ws import app_gateway
+
+    await app_gateway.revoke(token_id)

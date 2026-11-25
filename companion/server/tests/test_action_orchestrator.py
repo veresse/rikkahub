@@ -8,6 +8,7 @@ import pytest
 from companion.server.app.services.action_orchestrator import (
     ActionOrchestrator,
     ActionTurnState,
+    _DeviceScheduler,
     reset_action_schedulers,
 )
 from companion.server.app.services.device_registry import (
@@ -202,3 +203,51 @@ async def test_set_idle_requires_boolean():
     assert ok["ok"] is True
     bad = await orch.execute_tool("robot.set_idle", {"enabled": "yes"}, "dev-1", _turn())
     assert bad["error"] == "invalid_arguments"
+
+
+class HangingLink:
+    """动作永不回执，用于验证调度器超时强停。"""
+
+    def __init__(self):
+        self.commands: list[dict] = []
+
+    async def send(self, command: dict) -> ActionResult:
+        self.commands.append(command)
+        if command.get("type") == "action.stop":
+            return ActionResult(status="done")
+        await asyncio.Event().wait()
+        raise AssertionError("unreachable")
+
+    async def get_status(self) -> dict:
+        return {}
+
+
+async def test_scheduler_timeout_sends_action_stop():
+    link = HangingLink()
+    scheduler = _DeviceScheduler("dev-timeout", link)
+
+    result = await scheduler.submit(
+        {"v": 2, "type": "action.play", "action_id": "a1", "source": "llm"},
+        timeout_ms=30,
+    )
+
+    assert result.status == "timeout"
+    stops = [c for c in link.commands if c.get("type") == "action.stop"]
+    assert len(stops) == 1
+    assert stops[0]["reason"] == "server_cancel"
+
+
+async def test_scheduler_enqueue_returns_queued_immediately():
+    link = FakeLink(delay=0.2)
+    scheduler = _DeviceScheduler("dev-enqueue", link)
+
+    started = time.monotonic()
+    result = await scheduler.enqueue(
+        {"v": 2, "type": "action.play", "action_id": "a2", "source": "app"},
+        timeout_ms=3000,
+    )
+    elapsed = time.monotonic() - started
+
+    assert result.status == "queued"
+    assert elapsed < 0.1
+    assert any(c.get("action_id") == "a2" for c in link.commands)

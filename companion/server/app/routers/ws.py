@@ -16,12 +16,14 @@ from fastapi import APIRouter, WebSocket
 from companion.server.app.config import settings
 from companion.server.app.database import AsyncSessionLocal
 from companion.server.app.security.ws_auth import authenticate_ws, parse_bearer_header
+from companion.server.app.services.app_gateway import AppGateway
 from companion.server.app.services.device_gateway import DeviceGateway
 
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
 device_gateway = DeviceGateway()
+app_gateway = AppGateway()
 
 
 class StarletteChannel:
@@ -91,3 +93,8 @@ async def serve_websocket(
 @router.websocket("/device/ws")
 async def device_ws(websocket: WebSocket) -> None:
     await serve_websocket(websocket, expected="device", gateway=device_gateway)
+
+
+@router.websocket("/app/ws")
+async def app_ws(websocket: WebSocket) -> None:
+    await serve_websocket(websocket, expected="app", gateway=app_gateway)
