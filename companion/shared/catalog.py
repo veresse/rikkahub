@@ -217,14 +217,20 @@ def estimate_duration_ms(action: dict[str, Any], params: dict[str, Any] | None =
 
 
 def resolve_params(action: dict[str, Any], params: dict[str, Any] | None) -> dict[str, int]:
-    """把模型/App 传入参数与动作默认值合并，并做边界与能力校验。"""
+    """把模型/App 传入参数与动作默认值合并，并做边界与能力校验。
+
+    动作不支持的参数按协议直接忽略并使用默认值（而不是报错）；
+    显式 `None` 视为缺省。
+    """
     limits = get_catalog()["limits"]
     defaults = action["default_params"]
     supports = action["supports"]
     params = params or {}
 
     def int_param(key: str) -> int:
-        value = params.get(key, defaults[key])
+        value = params.get(key)
+        if value is None or supports.get(key, True) is False:
+            return int(defaults[key])
         if isinstance(value, bool) or not isinstance(value, int):
             raise CatalogError(f"{key} 必须是整数，收到 {value!r}")
         return value
@@ -232,13 +238,6 @@ def resolve_params(action: dict[str, Any], params: dict[str, Any] | None) -> dic
     intensity = int_param("intensity")
     speed = int_param("speed")
     repeat = int_param("repeat")
-
-    if not supports["intensity"] and intensity != defaults["intensity"]:
-        raise CatalogError(f"动作 {action['name']} 不支持 intensity 参数")
-    if not supports["speed"] and speed != defaults["speed"]:
-        raise CatalogError(f"动作 {action['name']} 不支持 speed 参数")
-    if not supports["repeat"] and repeat != 1:
-        raise CatalogError(f"动作 {action['name']} 不支持 repeat 参数")
 
     if intensity not in limits["intensity"]["levels"]:
         raise CatalogError(f"intensity 必须为 1/2/3，收到 {intensity}")

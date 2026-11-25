@@ -227,7 +227,11 @@ Android 根工程基线：`gradlew --version` 通过（Gradle 9.6.0 / JDK 17）�
   Nginx/systemd/部署脚本改为非 root 且只反代 REST/WS。
 - Block C：`ActionOrchestrator`、流式 tool-call 聚合、动态注入 5 个 `robot.*` 工具、单轮限次/排队/限速/
   覆盖/急停、对话 SSE 新增 `tool_result`。
-- 当前测试：`93 passed`（明细见 `docs/语音机器人需求文档/v2_migration_log/04_phase2_action_orchestrator_tool_loop.md`）。
+- Block D-1：`/device/ws` 握手、v1 降级、会话替换、`action.result` 关联、上报落库与上线/离线广播。
+- Block D-2：`/app/ws` App 遥控、事件广播、Token 撤销断开、调度器执行超时 `action.stop`。
+- 审查修复：服务端终态事件、在途发送超时、v1 控制门控、每连接限速、撤销竞态、
+  上报合并写出、设备撤销断连；测试增至 `143 passed`。明细见
+  `docs/语音机器人需求文档/v2_migration_log/07_phase2_review_fixes.md`。
 
-仍未实现：`/device/ws`、`/app/ws`、动作超时强停、音频链路、App、固件。
+仍未实现：音频链路、Phase 3 双模拟器与端到端测试、Android App、ESP32 固件。
 

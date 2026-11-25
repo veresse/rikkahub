@@ -152,11 +152,11 @@
 
 | 码 | 含义 |
 | :--- | :--- |
-| `4401` | Token 无效/已撤销 |
-| `4403` | 权限不匹配（App Token 连设备通道等） |
-| `4408` | hello 超时 |
-| `4409` | 被同设备新连接替换 |
-| `4429` | 连接/消息速率超限 |
+| `4401` | Token 无效/已撤销（device 通道 reason=`device_revoked`） |
+| `4403` | 身份或协议不匹配：reason=`unknown_device` / `device_mismatch` / `unsupported_protocol` |
+| `4408` | hello 超时或首帧非法：reason=`hello_timeout` / `invalid_hello` |
+| `4409` | 被同设备新连接替换：reason=`replaced` |
+| `4429` | 连接/消息速率超限（预留，当前用 `remote.ack(rate_limited)`） |
 | `1011` | 服务端内部错误 |
 
 ---
@@ -371,7 +371,7 @@
 | `remote.action.stop` | `reason` | 急停 |
 | `remote.calibrate.preview` | `pan_offset,tilt_offset` | 校准预览 |
 | `remote.calibrate.save` | `pan_offset,tilt_offset` | 保存到 NVS |
-| `remote.get_status` | — | 请求设备立即上报 |
+| `remote.get_status` | — | 读取服务端缓存的最近一次上报（不下发控制消息） |
 
 示例：
 
@@ -395,9 +395,9 @@
 | :--- | :--- | :--- |
 | `device.status` | `device_id, online, reason` | 上线/离线 |
 | `device.report` | 同设备上报 | 实时状态 |
-| `action.result` | `device_id, action_id, status, detail, source` | 执行结果 |
+| `action.result` | `device_id, action_id, status, detail, source` | 执行结果（设备上报或服务端终态） |
 | `conversation.turn_state` | `conversation_id, state`（`idle/generating`） | 会话是否正在生成 |
-| `remote.ack` | `request_id, ok, error` | 遥控请求受理结果 |
+| `remote.ack` | `request_id, ok, error?, action_id?` | 遥控请求受理结果 |
 | `error` | `code, message, request_id?` | 统一错误 |
 
 设备离线时，`remote.*` 立即返回：
@@ -407,6 +407,17 @@
 ```
 
 **不缓存、不补发。**
+
+`remote.ack(ok=true)` 只表示命令已受理/入队；对被覆盖、排队超时、执行超时、设备离线的命令，
+服务端会额外广播一条 `action.result`：
+
+```json
+{"v":2,"type":"action.result","device_id":"uuid","action_id":"uuid","status":"failed","detail":"superseded","source":"app"}
+```
+
+`detail` 取值：`superseded`（被同类新命令覆盖）、`timeout`（排队或执行超时）、
+`device_offline`、`stopped`（急停）、`internal_error`。
+带 `action_id` 的命令其 `remote.ack` 也会回填同一个 `action_id`，App 可据此把结果对回请求。
 
 ### 8.3 服务端 → App 对话 SSE（`POST /api/chat/completions`）
 
@@ -435,13 +446,19 @@ App 携带 `Authorization: Bearer <app_token>` 发起请求，响应为 `text/ev
 
 ### 8.4 服务端实现补充
 
+- 所有 `remote.*`（含 `action.stop`、`calibrate.preview`、`get_status` 与参数非法的请求）都按
+  每连接 10 条/秒滑动窗口限速，超限回 `remote.ack ok=false error=rate_limited`。
 - `remote.*` 受理后立即回 `remote.ack(ok=true)`；`action.play`/`servo.move`/`volume.set` 等
-  只表示**已入队**，最终结果通过 `action.result` 与 `device.report` 广播。
-- App 与 LLM 共用同一设备队列，遵守第 7 节仲裁规则。
-- `remote.get_status` 不新增下行消息，服务端直接把当前缓存的 `device.report` 快照广播给 App
-  （设备状态变化本身会主动上报）。
+  只表示**已入队**，最终结果通过 `action.result` 与 `device.report` 广播。被覆盖、排队超时、
+  执行超时或设备断开的命令一定会有终态 `action.result`；执行超时同时下发 `action.stop(server_cancel)`。
+- App 与 LLM 共用同一设备队列，遵守第 7 节仲裁规则；只对 `protocol_version >= 2` 的设备下发
+  v2 控制消息，v1 设备返回 `remote.ack ok=false error=unsupported_protocol`。
+- `remote.get_status` 不新增下行消息，服务端把当前缓存的 `device.report` 快照只回给请求方，
+  并带 `source="server"`（设备状态变化本身会主动上报）。
 - App Token 被 `POST /api/auth/tokens/{id}/revoke` 或 `/api/auth/logout` 撤销时，该 Token 的
   `/app/ws` 连接以 `4401 token_revoked` 关闭；已过期 Token 在下次握手时被拒绝。
+- 设备 Token 被 `DELETE /api/devices/{id}` 撤销时，已建立的 `/device/ws` 以
+  `4401 device_revoked` 关闭，并清理该设备的队列。
 
 ---
 

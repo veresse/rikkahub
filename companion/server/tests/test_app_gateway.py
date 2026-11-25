@@ -89,7 +89,12 @@ class HangingLink:
 class Harness:
     def __init__(self):
         self.bus = EventBus()
+        self.events: list[dict] = []
+        self.bus.subscribe(self._collect)
         self.gateway = AppGateway(self.bus)
+
+    async def _collect(self, event: dict) -> None:
+        self.events.append(event)
 
     async def connect(self) -> tuple[asyncio.Task, FakeChannel]:
         channel = FakeChannel()
@@ -358,5 +363,119 @@ async def test_rate_limit_acks_error_after_ten_per_second():
     assert all(ack["ok"] for ack in acks[:10])
     assert acks[10]["ok"] is False
     assert acks[10]["error"] == "rate_limited"
+
+    await _stop(task, channel)
+
+
+async def test_ack_includes_action_id_for_action_commands():
+    link = FakeLink()
+    register_device_link(DEVICE_ID, link)
+    harness = Harness()
+    task, channel = await harness.connect()
+
+    ack = await harness.remote(channel, {"type": "remote.action.play", "name": "nod"})
+    assert ack["ok"] is True
+    assert ack["action_id"]
+    assert ack["action_id"] == link.commands[0]["action_id"]
+
+    await _stop(task, channel)
+
+
+async def test_superseded_command_receives_terminal_event():
+    from companion.server.app.services.events import get_event_bus
+
+    link = HangingLink()
+    register_device_link(DEVICE_ID, link)
+    harness = Harness()
+    task, channel = await harness.connect()
+
+    bus = get_event_bus()
+    events: list[dict] = []
+
+    async def collect(event: dict) -> None:
+        events.append(event)
+
+    bus.subscribe(collect)
+    try:
+        first = await harness.remote(
+            channel, {"type": "remote.servo.move", "pan": 0, "tilt": 0, "request_id": "r1"}
+        )
+        assert first["ok"] is True
+        await wait_until(
+            lambda: next((c for c in link.commands if c.get("type") == "servo.move"), None)
+        )
+
+        superseded = await harness.remote(
+            channel, {"type": "remote.servo.move", "pan": 10, "tilt": 0, "request_id": "r2"}
+        )
+        replacement = await harness.remote(
+            channel, {"type": "remote.servo.move", "pan": 20, "tilt": 0, "request_id": "r3"}
+        )
+        assert superseded["ok"] is True and superseded["action_id"]
+        assert replacement["ok"] is True and replacement["action_id"]
+
+        event = await wait_until(
+            lambda: next(
+                (
+                    e
+                    for e in events
+                    if e.get("type") == "action.result"
+                    and e.get("action_id") == superseded["action_id"]
+                ),
+                None,
+            )
+        )
+        assert event["status"] == "failed"
+        assert event["detail"] == "superseded"
+        assert event["source"] == "app"
+
+        await _stop(task, channel)
+    finally:
+        bus.unsubscribe(collect)
+
+
+async def test_v1_link_rejects_remote_control():
+    class V1Link(FakeLink):
+        protocol_version = 1
+
+    link = V1Link()
+    register_device_link(DEVICE_ID, link)
+    harness = Harness()
+    task, channel = await harness.connect()
+
+    ack = await harness.remote(channel, {"type": "remote.action.play", "name": "nod"})
+    assert ack["ok"] is False
+    assert ack["error"] == "unsupported_protocol"
+    assert link.commands == []
+
+    await _stop(task, channel)
+
+
+async def test_connection_attaching_after_revoke_is_closed():
+    harness = Harness()
+    await harness.gateway.revoke(TOKEN_ID)
+
+    channel = FakeChannel()
+    task = asyncio.create_task(harness.gateway.handle(TOKEN_ID, channel))
+    await asyncio.wait_for(task, timeout=2.0)
+    assert channel.closed == (4401, "token_revoked")
+
+
+async def test_rate_limit_covers_stop_and_get_status():
+    register_device_link(DEVICE_ID, FakeLink())
+    harness = Harness()
+    task, channel = await harness.connect()
+
+    for index in range(10):
+        ack = await harness.remote(
+            channel, {"type": "remote.get_status", "request_id": f"q-{index}"}
+        )
+        assert ack["ok"] is True
+
+    blocked = await harness.remote(
+        channel, {"type": "remote.action.stop", "reason": "user_stop", "request_id": "stop"}
+    )
+    assert blocked["ok"] is False
+    assert blocked["error"] == "rate_limited"
 
     await _stop(task, channel)

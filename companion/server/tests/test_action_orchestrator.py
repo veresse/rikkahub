@@ -225,29 +225,142 @@ class HangingLink:
 async def test_scheduler_timeout_sends_action_stop():
     link = HangingLink()
     scheduler = _DeviceScheduler("dev-timeout", link)
+    try:
+        result = await scheduler.submit(
+            {"v": 2, "type": "action.play", "action_id": "a1", "source": "llm"},
+            timeout_ms=30,
+        )
 
-    result = await scheduler.submit(
-        {"v": 2, "type": "action.play", "action_id": "a1", "source": "llm"},
-        timeout_ms=30,
+        assert result.status == "timeout"
+        stops = [c for c in link.commands if c.get("type") == "action.stop"]
+        assert len(stops) == 1
+        assert stops[0]["reason"] == "server_cancel"
+    finally:
+        scheduler._stopped = True
+        if scheduler.worker and not scheduler.worker.done():
+            scheduler.worker.cancel()
+
+
+async def _collect_until(predicate, timeout: float = 2.0):
+    async def _poll():
+        while True:
+            value = predicate()
+            if value:
+                return value
+            await asyncio.sleep(0.01)
+
+    return await asyncio.wait_for(_poll(), timeout)
+
+
+async def test_inflight_command_timeout_emits_terminal_and_stop(monkeypatch):
+    import companion.server.app.services.action_orchestrator as mod
+    from companion.server.app.services.events import get_event_bus
+
+    monkeypatch.setattr(mod, "DEFAULT_COMMAND_TIMEOUT_MS", 50)
+    link = HangingLink()
+    scheduler = _DeviceScheduler("dev-force", link)
+    mod._SCHEDULERS["dev-force"] = scheduler
+    bus = get_event_bus()
+    events: list[dict] = []
+
+    async def collect(event: dict) -> None:
+        events.append(event)
+
+    bus.subscribe(collect)
+    try:
+        result = await scheduler.enqueue(
+            {"v": 2, "type": "idle.set", "action_id": "term-1", "source": "app"}
+        )
+        assert result.status == "queued"
+
+        event = await _collect_until(
+            lambda: next((e for e in events if e.get("action_id") == "term-1"), None)
+        )
+        assert event["status"] == "failed"
+        assert event["detail"] == "timeout"
+        assert event["source"] == "app"
+        assert any(c.get("type") == "action.stop" for c in link.commands)
+    finally:
+        bus.unsubscribe(collect)
+        mod.invalidate_device_scheduler("dev-force")
+
+
+async def test_expired_queued_command_is_dropped_with_terminal_event(monkeypatch):
+    import companion.server.app.services.action_orchestrator as mod
+    from companion.server.app.services.events import get_event_bus
+
+    link = FakeLink(delay=0.15)
+    scheduler = _DeviceScheduler("dev-queue", link)
+    mod._SCHEDULERS["dev-queue"] = scheduler
+    bus = get_event_bus()
+    events: list[dict] = []
+
+    async def collect(event: dict) -> None:
+        events.append(event)
+
+    bus.subscribe(collect)
+    try:
+        first = await scheduler.enqueue(
+            {"v": 2, "type": "action.play", "action_id": "first", "name": "nod", "source": "app"}
+        )
+        assert first.status == "queued"
+        await _collect_until(
+            lambda: next((c for c in link.commands if c.get("action_id") == "first"), None)
+        )
+
+        monkeypatch.setattr(mod, "QUEUE_MAX_WAIT_MS", 20)
+        second = await scheduler.enqueue(
+            {"v": 2, "type": "idle.set", "action_id": "late", "source": "app"}
+        )
+        assert second.status == "queued"
+
+        event = await _collect_until(
+            lambda: next((e for e in events if e.get("action_id") == "late"), None)
+        )
+        assert event["status"] == "failed"
+        assert event["detail"] == "timeout"
+        assert not any(c.get("action_id") == "late" for c in link.commands)
+    finally:
+        bus.unsubscribe(collect)
+        mod.invalidate_device_scheduler("dev-queue")
+
+
+async def test_invalidate_scheduler_does_not_resurrect_worker():
+    import companion.server.app.services.action_orchestrator as mod
+
+    link = FakeLink(delay=0.05)
+    scheduler = _DeviceScheduler("dev-inv", link)
+    mod._SCHEDULERS["dev-inv"] = scheduler
+
+    await scheduler.enqueue(
+        {"v": 2, "type": "action.play", "action_id": "inv-1", "name": "nod", "source": "app"}
+    )
+    await scheduler.enqueue(
+        {"v": 2, "type": "idle.set", "action_id": "inv-2", "source": "app"}
     )
 
-    assert result.status == "timeout"
-    stops = [c for c in link.commands if c.get("type") == "action.stop"]
-    assert len(stops) == 1
-    assert stops[0]["reason"] == "server_cancel"
+    mod.invalidate_device_scheduler("dev-inv")
+    await asyncio.sleep(0.2)
+
+    assert not any(c.get("action_id") == "inv-2" for c in link.commands)
+    assert scheduler._stopped is True
 
 
 async def test_scheduler_enqueue_returns_queued_immediately():
     link = FakeLink(delay=0.2)
     scheduler = _DeviceScheduler("dev-enqueue", link)
+    try:
+        started = time.monotonic()
+        result = await scheduler.enqueue(
+            {"v": 2, "type": "action.play", "action_id": "a2", "source": "app"}
+        )
+        elapsed = time.monotonic() - started
 
-    started = time.monotonic()
-    result = await scheduler.enqueue(
-        {"v": 2, "type": "action.play", "action_id": "a2", "source": "app"},
-        timeout_ms=3000,
-    )
-    elapsed = time.monotonic() - started
-
-    assert result.status == "queued"
-    assert elapsed < 0.1
-    assert any(c.get("action_id") == "a2" for c in link.commands)
+        assert result.status == "queued"
+        assert elapsed < 0.1
+        await asyncio.sleep(0.02)
+        assert any(c.get("action_id") == "a2" for c in link.commands)
+    finally:
+        scheduler._stopped = True
+        if scheduler.worker and not scheduler.worker.done():
+            scheduler.worker.cancel()

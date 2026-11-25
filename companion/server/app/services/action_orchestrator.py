@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import time
 import uuid
 from collections import deque
@@ -17,17 +18,15 @@ from typing import Any
 from companion.server.app.config import settings
 from companion.server.app.services.action_tools import ROBOT_TOOL_NAMES
 from companion.server.app.services.device_registry import ActionResult, get_device_link
+from companion.server.app.services.events import get_event_bus
 from companion.shared.catalog import CatalogError, get_action, resolve_params
+
+logger = logging.getLogger(__name__)
 
 MAX_PENDING_COMMANDS = 8
 MAX_COMMANDS_PER_SECOND = 10
 RATE_WINDOW_SECONDS = 1.0
 DEFAULT_COMMAND_TIMEOUT_MS = 3000
-
-# 只有“真正让机器人动起来”的工具计入单轮次数；音量/待机/状态查询不计。
-COUNTED_TOOLS = {"robot.action", "robot.move_head"}
-# 覆盖语义：排队中同类指令只保留最后一条。
-OVERRIDE_KINDS = {"volume.set", "servo.move"}
 
 
 def _now_ms() -> int:
@@ -51,7 +50,32 @@ class ActionTurnState:
 class _Job:
     command: dict[str, Any]
     future: asyncio.Future[ActionResult] = field(repr=False)
+    # 排队陈旧判定（不是执行超时）；超过该时刻仍未下发就丢弃。
     deadline: float | None = None
+    sent: bool = False
+    started: asyncio.Event = field(default_factory=asyncio.Event, repr=False)
+    emitted: bool = False
+
+
+# App 遥控命令允许在队列里等待的最长时间；执行超时另行按命令类型计算。
+QUEUE_MAX_WAIT_MS = 30_000
+
+
+def _command_timeout_ms(command: dict[str, Any]) -> int:
+    """一条指令从下发到设备回执的服务器侧预算。"""
+    kind = command.get("type")
+    if kind == "action.play":
+        try:
+            base = int(get_action(str(command.get("name")))["max_duration_ms"])
+        except KeyError:
+            base = DEFAULT_COMMAND_TIMEOUT_MS
+        return base + settings.ACTION_RESULT_TIMEOUT_EXTRA_MS
+    if kind == "servo.move":
+        speed = command.get("speed", 500)
+        if isinstance(speed, bool) or not isinstance(speed, int):
+            speed = 500
+        return max(DEFAULT_COMMAND_TIMEOUT_MS, speed + 1000)
+    return DEFAULT_COMMAND_TIMEOUT_MS
 
 
 class _DeviceScheduler:
@@ -64,6 +88,7 @@ class _DeviceScheduler:
         self.worker: asyncio.Task | None = None
         self.current: _Job | None = None
         self._events: deque[float] = deque()
+        self._stopped = False
 
     def _allow_rate(self) -> bool:
         now = time.monotonic()
@@ -75,81 +100,117 @@ class _DeviceScheduler:
         return True
 
     def _ensure_worker(self) -> None:
+        if self._stopped:
+            return
         if self.worker is None or self.worker.done():
             self.worker = asyncio.create_task(self._worker_loop())
 
     async def _worker_loop(self) -> None:
         try:
-            while self.queue:
+            while self.queue and not self._stopped:
                 job = self.queue.popleft()
                 if job.future.done():
                     continue
                 self.current = job
                 try:
                     if job.deadline is not None and time.monotonic() > job.deadline:
-                        if not job.future.done():
-                            job.future.set_result(
-                                ActionResult(status="failed", detail="timeout")
-                            )
+                        self._terminate(job, "failed", "timeout")
                         continue
+                    job.sent = True
+                    job.started.set()
                     try:
-                        result = await self.link.send(job.command)
+                        result = await asyncio.wait_for(
+                            self.link.send(job.command),
+                            timeout=_command_timeout_ms(job.command) / 1000,
+                        )
+                    except asyncio.TimeoutError:
+                        self._terminate(job, "failed", "timeout")
+                        await self._send_stop("server_cancel")
+                        continue
+                    except asyncio.CancelledError:
+                        raise
                     except Exception:
-                        result = ActionResult(status="failed", detail="internal_error")
-                    if not job.future.done():
-                        job.future.set_result(result)
+                        self._terminate(job, "failed", "internal_error")
+                        continue
+                    # 设备自己上报的结果已经由 DeviceGateway 广播；这里只补链路层
+                    # 失败（无 action_id）这类设备不会自己上报的终态，避免 App
+                    # 永远停在 queued。
+                    device_reported = result.action_id == job.command.get("action_id")
+                    self._terminate(
+                        job, result.status, result.detail, emit=not device_reported
+                    )
                 finally:
                     self.current = None
         finally:
             self.current = None
             self.worker = None
-            if self.queue:
+            if self.queue and not self._stopped:
                 self._ensure_worker()
 
     async def submit(
         self, command: dict[str, Any], *, timeout_ms: int, override: bool = False
     ) -> ActionResult:
-        if not self._allow_rate():
-            return ActionResult(status="failed", detail="rate_limited")
-
-        if override:
-            self._drop_superseded(command.get("type"))
-
         if len(self.queue) >= MAX_PENDING_COMMANDS:
             return ActionResult(status="failed", detail="queue_full")
+        if not self._allow_rate():
+            return ActionResult(status="failed", detail="rate_limited")
+        if override:
+            self._drop_superseded(command.get("type"))
 
         job = _Job(command=command, future=asyncio.get_running_loop().create_future())
         self.queue.append(job)
         self._ensure_worker()
 
+        # 只有真正下发后才开始计算执行超时；排队最多等 QUEUE_MAX_WAIT_MS。
+        try:
+            await asyncio.wait_for(job.started.wait(), timeout=QUEUE_MAX_WAIT_MS / 1000)
+        except asyncio.TimeoutError:
+            self._abort(job)
+            return ActionResult(status="timeout", detail="timeout")
+        except asyncio.CancelledError:
+            # 调用方（客户端断开/用户停止）取消：不要再让排队动作继续执行。
+            was_running = job.sent and self.current is job
+            self._abort(job)
+            if was_running:
+                await asyncio.shield(self._send_stop("server_cancel"))
+            raise
+
         try:
             return await asyncio.wait_for(asyncio.shield(job.future), timeout_ms / 1000)
         except asyncio.TimeoutError:
+            # 已下发且仍是当前任务才急停；纯排队超时不得打断别的动作。
+            was_running = job.sent and self.current is job
             self._abort(job)
-            # 设备没在预期时间内回执，主动急停，避免舵机继续跑一个
-            # 服务端已经放弃的动作。
-            await self._send_stop("server_cancel")
+            if was_running:
+                await self._send_stop("server_cancel")
             return ActionResult(status="timeout", detail="timeout")
+        except asyncio.CancelledError:
+            was_running = job.sent and self.current is job
+            self._abort(job)
+            if was_running:
+                await asyncio.shield(self._send_stop("server_cancel"))
+            raise
 
     async def enqueue(
-        self, command: dict[str, Any], *, timeout_ms: int, override: bool = False
+        self, command: dict[str, Any], *, override: bool = False
     ) -> ActionResult:
         """App 遥控用：入队后立刻返回 `queued`，结果走事件广播。
 
-        排队超过 `timeout_ms` 仍未下发的命令会被 worker 丢弃并标记
-        `failed(timeout)`，遥控方通过事件流观察最终结果。
+        排队超过 `QUEUE_MAX_WAIT_MS` 仍未下发的命令会被 worker 丢弃，并广播
+        `action.result(failed, detail="timeout")`；执行阶段的超时由 worker 的
+        `_command_timeout_ms` 负责。
         """
+        if len(self.queue) >= MAX_PENDING_COMMANDS:
+            return ActionResult(status="failed", detail="queue_full")
         if not self._allow_rate():
             return ActionResult(status="failed", detail="rate_limited")
         if override:
             self._drop_superseded(command.get("type"))
-        if len(self.queue) >= MAX_PENDING_COMMANDS:
-            return ActionResult(status="failed", detail="queue_full")
 
         job = _Job(
             command=command,
             future=asyncio.get_running_loop().create_future(),
-            deadline=time.monotonic() + timeout_ms / 1000,
+            deadline=time.monotonic() + QUEUE_MAX_WAIT_MS / 1000,
         )
         self.queue.append(job)
         self._ensure_worker()
@@ -160,6 +221,7 @@ class _DeviceScheduler:
     def _abort(self, job: _Job) -> None:
         if not job.future.done():
             job.future.set_result(ActionResult(status="timeout", detail="timeout"))
+        job.started.set()
         try:
             self.queue.remove(job)
         except ValueError:
@@ -170,11 +232,60 @@ class _DeviceScheduler:
         kept: deque[_Job] = deque()
         for job in self.queue:
             if job.command.get("type") == command_type:
-                if not job.future.done():
-                    job.future.set_result(ActionResult(status="failed", detail="superseded"))
+                self._terminate(job, "failed", "superseded")
             else:
                 kept.append(job)
         self.queue = kept
+
+    def _terminate(
+        self,
+        job: _Job,
+        status: str,
+        detail: str,
+        *,
+        emit: bool = True,
+    ) -> ActionResult:
+        result = ActionResult(status=status, detail=detail)
+        if not job.future.done():
+            job.future.set_result(result)
+        job.started.set()
+        if emit:
+            self._emit_terminal(job, status, detail)
+        return result
+
+    def _emit_terminal(self, job: _Job, status: str, detail: str) -> None:
+        """把服务端生成的终态广播给 App（设备自己上报的结果不重复发）。"""
+        if job.emitted:
+            return
+        job.emitted = True
+        command = job.command
+        if command.get("source") != "app":
+            return
+        action_id = command.get("action_id")
+        if not isinstance(action_id, str) or not action_id:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        event = {
+            "v": 2,
+            "type": "action.result",
+            "device_id": self.device_id,
+            "action_id": action_id,
+            "status": status,
+            "detail": detail,
+            "source": "app",
+            "ts": _now_ms(),
+        }
+        logger.info(
+            "action terminal device=%s action_id=%s status=%s detail=%s",
+            self.device_id,
+            action_id,
+            status,
+            detail,
+        )
+        loop.create_task(get_event_bus().publish(event))
 
     async def _send_stop(self, reason: str) -> ActionResult:
         command = {
@@ -184,17 +295,17 @@ class _DeviceScheduler:
             "ts": _now_ms(),
         }
         try:
-            return await self.link.send(command)
+            return await asyncio.wait_for(self.link.send(command), timeout=1.0)
+        except asyncio.TimeoutError:
+            return ActionResult(status="failed", detail="timeout")
         except Exception:
             return ActionResult(status="failed", detail="internal_error")
 
     async def stop(self, reason: str) -> ActionResult:
-        stopped = ActionResult(status="failed", detail="stopped")
-        if self.current is not None and not self.current.future.done():
-            self.current.future.set_result(stopped)
+        if self.current is not None:
+            self._terminate(self.current, "failed", "stopped")
         for job in self.queue:
-            if not job.future.done():
-                job.future.set_result(stopped)
+            self._terminate(job, "failed", "stopped")
         self.queue.clear()
         return await self._send_stop(reason)
 
@@ -202,16 +313,38 @@ class _DeviceScheduler:
 _SCHEDULERS: dict[str, _DeviceScheduler] = {}
 
 
+def _stop_scheduler(scheduler: _DeviceScheduler, detail: str, *, emit_current: bool = True) -> None:
+    scheduler._stopped = True
+    if scheduler.current is not None:
+        scheduler._terminate(
+            scheduler.current, "failed", detail, emit=emit_current
+        )
+    for job in scheduler.queue:
+        scheduler._terminate(job, "failed", detail)
+    scheduler.queue.clear()
+    if scheduler.worker and not scheduler.worker.done():
+        try:
+            scheduler.worker.cancel()
+        except RuntimeError:
+            # 事件循环已关闭（测试 teardown / 进程退出）时无需再取消。
+            pass
+
+
 def invalidate_device_scheduler(device_id: str) -> None:
+    """设备断开：终止所有排队/在途任务，且不再自动复活 worker。"""
     scheduler = _SCHEDULERS.pop(device_id, None)
-    if scheduler and scheduler.worker and not scheduler.worker.done():
-        scheduler.worker.cancel()
+    if scheduler is not None:
+        _stop_scheduler(scheduler, "device_offline")
 
 
 def get_device_scheduler(device_id: str, link: Any) -> _DeviceScheduler:
-    """按设备取唯一调度器；设备链路变化时自动重建，避免向旧连接发指令。"""
+    """按设备取唯一调度器；设备链路变化时先终止旧队列，避免向旧连接发指令。"""
     scheduler = _SCHEDULERS.get(device_id)
-    if scheduler is None or scheduler.link is not link:
+    if scheduler is not None and scheduler.link is not link:
+        _SCHEDULERS.pop(device_id, None)
+        _stop_scheduler(scheduler, "device_offline")
+        scheduler = None
+    if scheduler is None:
         scheduler = _DeviceScheduler(device_id, link)
         _SCHEDULERS[device_id] = scheduler
     return scheduler
@@ -220,15 +353,7 @@ def get_device_scheduler(device_id: str, link: Any) -> _DeviceScheduler:
 def reset_action_schedulers() -> None:
     """测试与设备重连用：丢弃队列、取消 worker。"""
     for scheduler in list(_SCHEDULERS.values()):
-        stopped = ActionResult(status="failed", detail="stopped")
-        if scheduler.current is not None and not scheduler.current.future.done():
-            scheduler.current.future.set_result(stopped)
-        for job in scheduler.queue:
-            if not job.future.done():
-                job.future.set_result(stopped)
-        scheduler.queue.clear()
-        if scheduler.worker and not scheduler.worker.done():
-            scheduler.worker.cancel()
+        _stop_scheduler(scheduler, "stopped", emit_current=False)
     _SCHEDULERS.clear()
 
 
@@ -314,27 +439,34 @@ class ActionOrchestrator:
 
         if name == "robot.get_status":
             try:
-                status = await link.get_status()
+                status = await asyncio.wait_for(link.get_status(), timeout=3.0)
+            except asyncio.TimeoutError:
+                return self._fail("timeout", "设备状态查询超时")
             except Exception:
                 return self._fail("internal_error")
             return {"ok": True, "device_id": device_id, "status": status}
 
-        if name in COUNTED_TOOLS and not turn.consume():
-            return self._fail(
-                "action_limit_exceeded", f"单轮最多 {turn.max_actions} 次动作工具调用"
-            )
-
         if name == "robot.action":
-            return await self._play(device_id, args)
+            return await self._play(device_id, args, turn)
         if name == "robot.move_head":
-            return await self._move_head(device_id, args)
+            return await self._move_head(device_id, args, turn)
         if name == "robot.set_volume":
-            return await self._set_volume(device_id, args)
+            return await self._set_volume(device_id, args, turn)
         if name == "robot.set_idle":
-            return await self._set_idle(device_id, args)
+            return await self._set_idle(device_id, args, turn)
         return self._fail("unknown_tool", name)
 
-    async def _play(self, device_id: str, args: dict[str, Any]) -> dict[str, Any]:
+    @staticmethod
+    def _consume_or_fail(turn: ActionTurnState) -> dict[str, Any] | None:
+        if turn.consume():
+            return None
+        return ActionOrchestrator._fail(
+            "action_limit_exceeded", f"单轮最多 {turn.max_actions} 次动作工具调用"
+        )
+
+    async def _play(
+        self, device_id: str, args: dict[str, Any], turn: ActionTurnState
+    ) -> dict[str, Any]:
         name = args.get("name")
         if not isinstance(name, str) or not name:
             return self._fail("invalid_arguments", "缺少动作名 name")
@@ -348,6 +480,10 @@ class ActionOrchestrator:
         except (CatalogError, TypeError, ValueError) as exc:
             return self._fail("invalid_arguments", str(exc))
 
+        limited = self._consume_or_fail(turn)
+        if limited is not None:
+            return limited
+
         action_id = str(uuid.uuid4())
         command = {
             "v": 2,
@@ -358,12 +494,15 @@ class ActionOrchestrator:
             "speed": params["speed"],
             "repeat": params["repeat"],
             "source": "llm",
+            "turn_id": turn.turn_id,
             "ts": _now_ms(),
         }
         timeout_ms = int(action["max_duration_ms"]) + settings.ACTION_RESULT_TIMEOUT_EXTRA_MS
         return await self._submit(device_id, command, timeout_ms=timeout_ms)
 
-    async def _move_head(self, device_id: str, args: dict[str, Any]) -> dict[str, Any]:
+    async def _move_head(
+        self, device_id: str, args: dict[str, Any], turn: ActionTurnState
+    ) -> dict[str, Any]:
         pan = args.get("pan")
         tilt = args.get("tilt")
         speed = args.get("speed", 500)
@@ -374,6 +513,10 @@ class ActionOrchestrator:
         if isinstance(speed, bool) or not isinstance(speed, int) or not (0 <= speed <= 1000):
             return self._fail("invalid_arguments", "speed 必须是 0-1000 的整数")
 
+        limited = self._consume_or_fail(turn)
+        if limited is not None:
+            return limited
+
         action_id = str(uuid.uuid4())
         command = {
             "v": 2,
@@ -383,12 +526,15 @@ class ActionOrchestrator:
             "tilt": float(tilt),
             "speed": speed,
             "source": "llm",
+            "turn_id": turn.turn_id,
             "ts": _now_ms(),
         }
         timeout_ms = max(DEFAULT_COMMAND_TIMEOUT_MS, speed + 1000)
         return await self._submit(device_id, command, timeout_ms=timeout_ms, override=True)
 
-    async def _set_volume(self, device_id: str, args: dict[str, Any]) -> dict[str, Any]:
+    async def _set_volume(
+        self, device_id: str, args: dict[str, Any], turn: ActionTurnState
+    ) -> dict[str, Any]:
         volume = args.get("volume")
         if isinstance(volume, bool) or not isinstance(volume, int) or not (0 <= volume <= 100):
             return self._fail("invalid_arguments", "volume 必须是 0-100 的整数")
@@ -400,13 +546,16 @@ class ActionOrchestrator:
             "action_id": action_id,
             "volume": volume,
             "source": "llm",
+            "turn_id": turn.turn_id,
             "ts": _now_ms(),
         }
         return await self._submit(
             device_id, command, timeout_ms=DEFAULT_COMMAND_TIMEOUT_MS, override=True
         )
 
-    async def _set_idle(self, device_id: str, args: dict[str, Any]) -> dict[str, Any]:
+    async def _set_idle(
+        self, device_id: str, args: dict[str, Any], turn: ActionTurnState
+    ) -> dict[str, Any]:
         enabled = args.get("enabled")
         if not isinstance(enabled, bool):
             return self._fail("invalid_arguments", "enabled 必须是布尔值")
@@ -418,6 +567,7 @@ class ActionOrchestrator:
             "action_id": action_id,
             "enabled": enabled,
             "source": "llm",
+            "turn_id": turn.turn_id,
             "ts": _now_ms(),
         }
         return await self._submit(device_id, command, timeout_ms=DEFAULT_COMMAND_TIMEOUT_MS)
@@ -429,7 +579,9 @@ class ActionOrchestrator:
         scheduler = self._scheduler(device_id, link)
         result = await scheduler.stop(reason)
         return {
-            "ok": result.status == "done",
+            # 协议 4.6：设备停成功时回 action.result(failed, stopped)。
+            "ok": result.status in ("done", "stopped")
+            and result.detail in ("", "stopped"),
             "status": result.status,
             **({"detail": result.detail} if result.detail else {}),
         }

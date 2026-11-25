@@ -8,6 +8,10 @@ from sqlalchemy import select
 from companion.server.app.database import AsyncSessionLocal
 from companion.server.app.config import settings
 from companion.server.app.models.device import DeviceModel
+from companion.server.app.services.device_registry import (
+    register_device_link,
+    reset_device_links,
+)
 
 
 async def _new_device(client, auth_headers, name="测试机器人"):
@@ -132,13 +136,33 @@ async def test_device_revoke_disables_it(client, auth_headers):
     _, pair = await _new_device(client, auth_headers)
     device_id = pair.json()["device_id"]
 
-    resp = await client.delete(f"/api/devices/{device_id}", headers=auth_headers)
-    assert resp.status_code == 200
-    assert resp.json()["status"] == "revoked"
+    class CloseRecorder:
+        def __init__(self):
+            self.closed = None
 
-    listing = await client.get("/api/devices", headers=auth_headers)
-    device = next(d for d in listing.json() if d["id"] == device_id)
-    assert device["is_active"] is False
+        async def send(self, command):
+            raise AssertionError("revoke must not send commands")
+
+        async def get_status(self):
+            return {}
+
+        async def close(self, code, reason):
+            self.closed = (code, reason)
+
+    link = CloseRecorder()
+    register_device_link(device_id, link)
+    try:
+        resp = await client.delete(f"/api/devices/{device_id}", headers=auth_headers)
+        assert resp.status_code == 200
+        assert resp.json()["status"] == "revoked"
+        # 已建立的 /device/ws 必须被立即断开，否则旧 Token 仍能控制设备。
+        assert link.closed == (4401, "device_revoked")
+
+        listing = await client.get("/api/devices", headers=auth_headers)
+        device = next(d for d in listing.json() if d["id"] == device_id)
+        assert device["is_active"] is False
+    finally:
+        reset_device_links()
 
 
 async def test_device_token_cannot_be_used_as_app_token(client, auth_headers):

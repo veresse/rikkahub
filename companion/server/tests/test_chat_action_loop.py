@@ -294,7 +294,8 @@ async def test_v1_device_gets_no_tools(session, monkeypatch):
     system_contents = [
         m["content"] for m in fake.calls[0]["messages"] if m.get("role") == "system"
     ]
-    assert any("离线" in text for text in system_contents)
+    assert any("固件" in text or "不支持" in text for text in system_contents)
+    assert all("当前离线" not in text for text in system_contents)
 
 
 async def test_fourth_action_call_is_blocked(session, monkeypatch):

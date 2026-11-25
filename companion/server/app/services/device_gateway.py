@@ -11,7 +11,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import uuid
+from collections.abc import Awaitable, Callable
 from typing import Any, Protocol
 
 from companion.server.app.config import settings
@@ -32,7 +34,14 @@ logger = logging.getLogger(__name__)
 
 SUPPORTED_CAPABILITIES = {"action", "volume", "expression"}
 VALID_STATES = {"idle", "listening", "thinking", "speaking", "error"}
+VALID_POWER = {"usb", "battery", "unknown"}
+PAN_LIMIT = 90.0
+TILT_MIN = -20.0
+TILT_MAX = 45.0
 OFFSET_LIMIT = 30.0
+VALID_CODECS = {"opus"}
+VALID_FRAME_MS = {20, 60}
+MAX_STATUS_TIMEOUT_SECONDS = 3.0
 
 DEFAULT_AUDIO = {
     "uplink": {"codec": "opus", "sample_rate": 16000, "channels": 1, "frame_ms": 60},
@@ -52,6 +61,15 @@ class WSChannel(Protocol):
 
 def _is_number(value: Any) -> bool:
     return not isinstance(value, bool) and isinstance(value, (int, float))
+
+
+def _finite(value: Any) -> float | None:
+    if not _is_number(value):
+        return None
+    number = float(value)
+    if not math.isfinite(number):
+        return None
+    return number
 
 
 def _clamp(value: float, low: float, high: float) -> float:
@@ -83,6 +101,12 @@ class DeviceSession:
         self._pending: dict[str, asyncio.Future[ActionResult]] = {}
         self._sources: dict[str, str] = {}
         self._send_lock = asyncio.Lock()
+        # 上报合并队列：设备高频上报时只保留最新一条，避免阻塞读循环。
+        self._report_queue: asyncio.Queue[dict[str, Any]] = asyncio.Queue(maxsize=1)
+        self._report_handler: (
+            Callable[[DeviceSession, dict[str, Any]], Awaitable[None]] | None
+        ) = None
+        self._writer: asyncio.Task | None = None
 
     @staticmethod
     def _initial_report(device: DeviceModel) -> dict[str, Any]:
@@ -108,6 +132,9 @@ class DeviceSession:
     async def send(self, command: dict[str, Any]) -> ActionResult:
         if self.closed:
             return ActionResult(status="failed", detail="device_offline")
+        if self.protocol_version < 2:
+            # v1 只走音频通道，不允许任何 v2 控制消息。
+            return ActionResult(status="failed", detail="unsupported_protocol")
 
         payload = dict(command)
         payload.setdefault("v", 2)
@@ -153,6 +180,56 @@ class DeviceSession:
             "online": not self.closed,
         }
 
+    def public_report(self) -> dict[str, Any]:
+        """协议 §5.2 形状；对外统一用 `idle` 而不是内部字段名。"""
+        report = self._report
+        return {
+            "volume": report["volume"],
+            "pan": report["pan"],
+            "tilt": report["tilt"],
+            "idle": bool(report["idle_enabled"]),
+            "power": report["power"],
+            "state": report["state"],
+            "pan_offset": report["pan_offset"],
+            "tilt_offset": report["tilt_offset"],
+            "ts": now_ms(),
+        }
+
+    # ---- 上报写出 ----
+
+    def start_writer(
+        self, handler: Callable[[DeviceSession, dict[str, Any]], Awaitable[None]]
+    ) -> None:
+        self._report_handler = handler
+        self._writer = asyncio.create_task(self._writer_loop())
+
+    def queue_report(self, report: dict[str, Any]) -> None:
+        try:
+            self._report_queue.put_nowait(report)
+        except asyncio.QueueFull:
+            try:
+                self._report_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                pass
+            try:
+                self._report_queue.put_nowait(report)
+            except asyncio.QueueFull:
+                pass
+
+    async def _writer_loop(self) -> None:
+        while not self.closed:
+            report = await self._report_queue.get()
+            if self._report_handler is None:
+                continue
+            try:
+                await self._report_handler(self, report)
+            except Exception:
+                logger.exception("device report handler failed: %s", self.device_id)
+
+    def _stop_writer(self) -> None:
+        if self._writer and not self._writer.done():
+            self._writer.cancel()
+
     # ---- 网关内部接口 ----
 
     async def _safe_send(self, payload: dict[str, Any]) -> bool:
@@ -181,9 +258,9 @@ class DeviceSession:
                 future.set_result(result)
 
     def apply_report(self, report: dict[str, Any]) -> dict[str, Any]:
-        volume = report.get("volume")
-        if _is_number(volume):
-            self._report["volume"] = int(_clamp(int(volume), 0, 100))
+        volume = _finite(report.get("volume"))
+        if volume is not None:
+            self._report["volume"] = int(_clamp(volume, 0, 100))
 
         idle = report.get("idle")
         if isinstance(idle, bool):
@@ -193,23 +270,26 @@ class DeviceSession:
         if isinstance(state, str) and state in VALID_STATES:
             self._report["state"] = state
 
-        for axis in ("pan", "tilt"):
-            value = report.get(axis)
-            if _is_number(value):
-                self._report[axis] = float(value)
+        pan = _finite(report.get("pan"))
+        if pan is not None:
+            self._report["pan"] = _clamp(pan, -PAN_LIMIT, PAN_LIMIT)
+        tilt = _finite(report.get("tilt"))
+        if tilt is not None:
+            self._report["tilt"] = _clamp(tilt, TILT_MIN, TILT_MAX)
 
-        for key, limit in (("pan_offset", OFFSET_LIMIT), ("tilt_offset", OFFSET_LIMIT)):
-            value = report.get(key)
-            if _is_number(value):
-                self._report[key] = _clamp(float(value), -limit, limit)
+        for key in ("pan_offset", "tilt_offset"):
+            value = _finite(report.get(key))
+            if value is not None:
+                self._report[key] = _clamp(value, -OFFSET_LIMIT, OFFSET_LIMIT)
 
         power = report.get("power")
-        if isinstance(power, str):
+        if isinstance(power, str) and power in VALID_POWER:
             self._report["power"] = power
         return dict(self._report)
 
     async def close(self, code: int = 1000, reason: str = "") -> None:
         self.closed = True
+        self._stop_writer()
         self._resolve_all(ActionResult(status="failed", detail="device_offline"))
         try:
             await self.channel.close(code, reason)
@@ -226,6 +306,7 @@ class DeviceGateway:
         self.bus = bus or get_event_bus()
         self._session_factory = session_factory
         self._sessions: set[DeviceSession] = set()
+        self._locks: dict[str, asyncio.Lock] = {}
 
     async def handle(self, device_id: str, channel: WSChannel) -> None:
         session: DeviceSession | None = None
@@ -273,7 +354,8 @@ class DeviceGateway:
         finally:
             if session is not None:
                 await self._teardown(session)
-            elif device_loaded:
+            elif device_loaded and get_device_link(device_id) is None:
+                # 失败握手不应把仍由旧连接托管的设备标记为离线。
                 await self._publish_status(device_id, online=False, reason="handshake_failed")
 
     # ---- 握手 ----
@@ -318,10 +400,11 @@ class DeviceGateway:
         ):
             warnings.append("action_catalog_mismatch")
 
-        audio = hello.get("audio")
-        if not isinstance(audio, dict):
-            audio = DEFAULT_AUDIO
+        audio, audio_ok = self._sanitize_audio(hello.get("audio"))
+        if not audio_ok:
+            warnings.append("audio_defaulted")
 
+        volume_limits = limits.get("volume", {})
         await session.channel.send_json(
             {
                 "v": 2,
@@ -341,38 +424,100 @@ class DeviceGateway:
                 "limits": {
                     "pan": [pan.get("min", -90.0), pan.get("max", 90.0)],
                     "tilt": [tilt.get("min", -20.0), tilt.get("max", 45.0)],
-                    "volume": [0, 100],
+                    "volume": [volume_limits.get("min", 0), volume_limits.get("max", 100)],
                     "default_max_duration_ms": limits.get("default_max_duration_ms", 3000),
                     "hard_max_duration_ms": limits.get("hard_max_duration_ms", 5000),
-                    "rate_limit_per_second": 10,
+                    "rate_limit_per_second": limits.get("rate_limit_per_second", 10),
                 },
                 "warnings": warnings,
             }
         )
 
+    @staticmethod
+    def _sanitize_audio(audio: Any) -> tuple[dict[str, Any], bool]:
+        """校验 `hello.audio`，非法字段回落默认值并让调用方产生 warning。"""
+        if not isinstance(audio, dict):
+            return {k: dict(v) for k, v in DEFAULT_AUDIO.items()}, False
+
+        sanitized: dict[str, Any] = {}
+        ok = True
+        for direction in ("uplink", "downlink"):
+            default = DEFAULT_AUDIO[direction]
+            provided = audio.get(direction)
+            if not isinstance(provided, dict):
+                ok = False
+                sanitized[direction] = dict(default)
+                continue
+            codec = provided.get("codec", default["codec"])
+            sample_rate = provided.get("sample_rate", default["sample_rate"])
+            channels = provided.get("channels", default["channels"])
+            frame_ms = provided.get("frame_ms", default["frame_ms"])
+            valid = (
+                isinstance(codec, str)
+                and codec in VALID_CODECS
+                and isinstance(sample_rate, int)
+                and not isinstance(sample_rate, bool)
+                and sample_rate > 0
+                and isinstance(channels, int)
+                and not isinstance(channels, bool)
+                and channels in (1, 2)
+                and isinstance(frame_ms, int)
+                and not isinstance(frame_ms, bool)
+                and frame_ms in VALID_FRAME_MS
+            )
+            if not valid:
+                ok = False
+                sanitized[direction] = dict(default)
+            else:
+                sanitized[direction] = {
+                    "codec": codec,
+                    "sample_rate": sample_rate,
+                    "channels": channels,
+                    "frame_ms": frame_ms,
+                }
+        return sanitized, ok
+
     # ---- 连接生命周期 ----
 
+    def _device_lock(self, device_id: str) -> asyncio.Lock:
+        lock = self._locks.get(device_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._locks[device_id] = lock
+        return lock
+
     async def _install(self, session: DeviceSession) -> None:
-        old = get_device_link(session.device_id)
-        register_device_link(session.device_id, session)
-        self._sessions.add(session)
-        if isinstance(old, DeviceSession) and old is not session:
-            await old.close(4409, "replaced")
-        await self._publish_status(session.device_id, online=True)
+        async with self._device_lock(session.device_id):
+            old = get_device_link(session.device_id)
+            register_device_link(session.device_id, session)
+            self._sessions.add(session)
+            session.start_writer(self._handle_report)
+            if isinstance(old, DeviceSession) and old is not session:
+                await old.close(4409, "replaced")
+            # 关闭旧连接期间可能有更新的连接插入；只在仍是当前 link 时广播上线。
+            if get_device_link(session.device_id) is session:
+                await self._publish_status(session.device_id, online=True)
 
     async def _teardown(self, session: DeviceSession) -> None:
-        self._sessions.discard(session)
-        if get_device_link(session.device_id) is session:
-            unregister_device_link(session.device_id, link=session)
-            invalidate_device_scheduler(session.device_id)
-            await self._publish_status(session.device_id, online=False)
-        if not session.closed:
-            await session.close(1000)
+        async with self._device_lock(session.device_id):
+            self._sessions.discard(session)
+            was_current = get_device_link(session.device_id) is session
+            if was_current:
+                unregister_device_link(session.device_id, link=session)
+                invalidate_device_scheduler(session.device_id)
+            if not session.closed:
+                await session.close(1000)
+            if was_current:
+                await self._publish_status(session.device_id, online=False)
 
     async def shutdown(self) -> None:
         """服务关闭时主动断开所有设备，避免连接悬挂。"""
         for session in list(self._sessions):
+            if get_device_link(session.device_id) is session:
+                unregister_device_link(session.device_id, link=session)
+                invalidate_device_scheduler(session.device_id)
             await session.close(1011, "server_shutdown")
+        self._sessions.clear()
 
     async def _read_loop(self, session: DeviceSession) -> None:
         while True:
@@ -389,6 +534,9 @@ class DeviceGateway:
                 logger.exception("device message handling failed: %s", session.device_id)
 
     async def _on_message(self, session: DeviceSession, message: Any) -> None:
+        # 已被替换/关闭的连接不再处理上报，避免旧连接覆盖新会话状态。
+        if session.closed:
+            return
         # 二进制音频帧属于后续音频 Block；这里只保证不阻塞控制消息。
         if isinstance(message, (bytes, bytearray)):
             return
@@ -418,11 +566,8 @@ class DeviceGateway:
             return
 
         if message_type == "device.report":
-            report = session.apply_report(message)
-            await self._persist_report(session.device_id, report)
-            await self.bus.publish(
-                {"v": 2, "type": "device.report", "device_id": session.device_id, **report}
-            )
+            # 高频上报只保留最新一条，落库与广播交给独立 writer，避免阻塞读循环。
+            session.queue_report(message)
             return
 
         if message_type == "voice.event":
@@ -440,6 +585,23 @@ class DeviceGateway:
             return
 
         logger.debug("ignore unknown device message: %s", message_type)
+
+    async def _handle_report(self, session: DeviceSession, report: dict[str, Any]) -> None:
+        """合并队列的消费者：应用上报、落库、广播协议 §5.2 形状。"""
+        if session.closed or get_device_link(session.device_id) is not session:
+            return
+        internal = session.apply_report(report)
+        await self._persist_report(session.device_id, internal)
+        if session.closed or get_device_link(session.device_id) is not session:
+            return
+        await self.bus.publish(
+            {
+                "v": 2,
+                "type": "device.report",
+                "device_id": session.device_id,
+                **session.public_report(),
+            }
+        )
 
     # ---- 持久化 ----
 

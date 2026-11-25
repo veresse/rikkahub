@@ -140,30 +140,59 @@ def build_robot_tools() -> list[dict[str, Any]]:
     ]
 
 
+def robot_tool_injection(
+    assistant: Any, device: Any, *, online: bool
+) -> tuple[bool, str]:
+    """返回是否注入 `robot.*` 工具，以及不可用的原因。"""
+    if assistant is None or not bool(_get(assistant, "enable_action_sync", False)):
+        return False, "disabled"
+    if device is None:
+        return False, "unbound"
+    if not bool(_get(device, "is_active", True)):
+        return False, "inactive"
+    if not online:
+        return False, "offline"
+    if int(_get(device, "protocol_version", 1) or 1) < 2:
+        return False, "unsupported_protocol"
+    capabilities = _get(device, "capabilities_json", None) or []
+    if "action" not in capabilities:
+        return False, "unsupported_capability"
+    return True, ""
+
+
 def should_inject_robot_tools(assistant: Any, device: Any, *, online: bool) -> bool:
     """只有「角色开启动作联动 + 设备在线 + v2 协议 + 支持动作能力」才注入。"""
-    if assistant is None or not bool(_get(assistant, "enable_action_sync", False)):
-        return False
-    if not online or device is None:
-        return False
-    if int(_get(device, "protocol_version", 1) or 1) < 2:
-        return False
-    capabilities = _get(device, "capabilities_json", None) or []
-    return "action" in capabilities
+    ok, _ = robot_tool_injection(assistant, device, online=online)
+    return ok
 
 
-def offline_note(bound: bool = True) -> str:
-    """设备不可用时注入的系统提示，避免模型声称自己做了动作。
-
-    `bound=True` 表示角色/会话绑定过设备但当前不在线；`bound=False` 表示
-    从未绑定设备。两种情况都不注入 `robot.*` 工具，只给一句轻量提示。
-    """
-    if bound:
-        return (
-            "【设备状态】当前实体机器人离线，无法执行动作、调节音量或读取机器人状态。"
-            "如果用户要求做动作，请礼貌说明设备当前离线；仍可正常进行文字对话。"
-        )
-    return (
+_OFFLINE_NOTES = {
+    "unbound": (
         "【设备状态】当前没有绑定实体机器人，无法执行任何实体动作、调节音量或读取机器人状态。"
         "如果用户要求做动作，请礼貌说明还没有绑定设备；仍可正常进行文字对话。"
-    )
+    ),
+    "inactive": (
+        "【设备状态】绑定的实体机器人已被撤销，无法执行动作、调节音量或读取机器人状态。"
+        "如果用户要求做动作，请礼貌说明需要重新配对设备；仍可正常进行文字对话。"
+    ),
+    "offline": (
+        "【设备状态】当前实体机器人离线，无法执行动作、调节音量或读取机器人状态。"
+        "如果用户要求做动作，请礼貌说明设备当前离线；仍可正常进行文字对话。"
+    ),
+    "unsupported_protocol": (
+        "【设备状态】当前实体机器人固件为 v1，不支持动作、音量与状态控制。"
+        "如果用户要求做动作，请礼貌说明需要升级固件；仍可正常进行文字对话。"
+    ),
+    "unsupported_capability": (
+        "【设备状态】当前实体机器人固件未声明动作能力，无法执行动作。"
+        "如果用户要求做动作，请礼貌说明设备暂不支持；仍可正常进行文字对话。"
+    ),
+}
+
+
+def offline_note(reason: str = "offline", *, bound: bool | None = None) -> str:
+    """设备不可用时注入的系统提示，避免模型声称自己做了动作。"""
+    if bound is not None:
+        # 兼容旧调用：只区分“绑定过/没绑定”。
+        reason = "offline" if bound else "unbound"
+    return _OFFLINE_NOTES.get(reason, _OFFLINE_NOTES["offline"])

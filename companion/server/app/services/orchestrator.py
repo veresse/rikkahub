@@ -15,7 +15,7 @@ from companion.server.app.services.action_orchestrator import ActionOrchestrator
 from companion.server.app.services.action_tools import (
     build_robot_tools,
     offline_note,
-    should_inject_robot_tools,
+    robot_tool_injection,
 )
 from companion.server.app.services.deepseek_client import DeepSeekClient
 from companion.server.app.services.device_registry import (
@@ -198,16 +198,15 @@ class ChatOrchestrator:
             # 解析本轮绑定的设备，决定是否注入 robot.* 工具
             device = await resolve_device_for_conversation(db, conversation_id)
             link = get_device_link(device.id) if device is not None else None
-            inject_tools = should_inject_robot_tools(
+            inject_tools, inject_reason = robot_tool_injection(
                 assistant, device, online=link is not None
             )
             robot_tools = build_robot_tools() if inject_tools else None
             if not inject_tools and bool(getattr(assistant, "enable_action_sync", False)):
-                # 设备离线或未绑定时不注入工具，只给模型一句状态提示。
-                messages.insert(
-                    -1,
-                    {"role": "system", "content": offline_note(bound=device is not None)},
-                )
+                # 设备离线/未绑定/固件不支持时不注入工具，只给模型一句状态提示。
+                message = offline_note(inject_reason)
+                if message:
+                    messages.insert(-1, {"role": "system", "content": message})
 
             turn = ActionTurnState(
                 turn_id=str(uuid.uuid4()),
@@ -245,7 +244,6 @@ class ChatOrchestrator:
                     elif chunk_type == "usage":
                         latest_usage = chunk["usage"]
                         yield chunk
-
                 calls = accumulator.build()
                 if not calls:
                     break
@@ -322,7 +320,8 @@ class ChatOrchestrator:
                 # 重新生成某一轮：将新回复追加为候选分支，更新 select_index
                 node = await db.get(MessageNodeModel, regenerate_node_id)
                 if node:
-                    node.messages.append(assistant_msg)
+                    # 普通 JSON 列的原地 append 不会被 SQLAlchemy 标记为脏数据。
+                    node.messages = [*node.messages, assistant_msg]
                     node.select_index = len(node.messages) - 1
             else:
                 # 新的一轮对话：创建用户节点与助手节点

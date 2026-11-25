@@ -417,3 +417,48 @@ async def test_unregister_with_other_link_keeps_current(seeded_device):
     unregister_device_link(DEVICE_ID, link=object())
     assert get_device_link(DEVICE_ID) is current
     await _stop(task, channel)
+
+
+async def test_device_report_event_uses_protocol_idle_field(seeded_device):
+    harness = Harness()
+    task, channel, _ = await harness.connected()
+
+    channel.push(
+        {
+            "v": 2,
+            "type": "device.report",
+            "volume": 41,
+            "pan": 200,
+            "tilt": -100,
+            "idle": False,
+            "state": "idle",
+            "ts": 1,
+        }
+    )
+
+    event = await wait_until(
+        lambda: next((e for e in harness.events if e["type"] == "device.report"), None)
+    )
+    # 对外用协议字段 `idle`，并且边界值必须被夹紧。
+    assert event["idle"] is False
+    assert "idle_enabled" not in event
+    assert event["pan"] == 90.0
+    assert event["tilt"] == -20.0
+    assert isinstance(event["ts"], int) and event["ts"] > 0
+
+    await _stop(task, channel)
+
+
+async def test_v1_session_rejects_v2_control_messages(seeded_device):
+    harness = Harness()
+    task, channel, _ = await harness.connected(v=1, capabilities=None)
+
+    link = get_device_link(DEVICE_ID)
+    result = await link.send(
+        {"v": 2, "type": "action.play", "action_id": "v1-act", "name": "nod"}
+    )
+    assert result.status == "failed"
+    assert result.detail == "unsupported_protocol"
+    assert not any(m.get("type") == "action.play" for m in channel.sent)
+
+    await _stop(task, channel)

@@ -11,15 +11,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import time
 import uuid
+from collections import deque
 from typing import Any, Protocol
 
-from companion.server.app.config import settings
-from companion.server.app.services.action_orchestrator import (
-    DEFAULT_COMMAND_TIMEOUT_MS,
-    get_device_scheduler,
-)
+from companion.server.app.services.action_orchestrator import get_device_scheduler
 from companion.server.app.services.clock import now_ms
 from companion.server.app.services.device_registry import ActionResult, get_device_link
 from companion.server.app.services.events import EventBus, get_event_bus
@@ -30,6 +29,19 @@ logger = logging.getLogger(__name__)
 CLOSE_TOKEN_REVOKED = 4401
 OFFSET_LIMIT = 30.0
 STOP_REASONS = {"user_stop", "barge_in", "server_cancel"}
+SEND_TIMEOUT_SECONDS = 2.0
+MAX_REMOTE_PER_SECOND = 10
+RATE_WINDOW_SECONDS = 1.0
+# 撤销与握手并发时，用短期记忆兜住“鉴权通过后才挂上”的连接。
+REVOKED_TTL_SECONDS = 3600.0
+
+BROADCAST_TYPES = {
+    "device.status",
+    "device.report",
+    "action.result",
+    "voice.event",
+    "conversation.turn_state",
+}
 
 REMOTE_TYPES = {
     "remote.action.play",
@@ -44,8 +56,6 @@ REMOTE_TYPES = {
 
 
 class WSChannel(Protocol):
-    """占位协议，具体实现由 `routers/ws.py` 的 `StarletteChannel` 提供。"""
-
     async def send_json(self, payload: dict[str, Any]) -> None: ...
 
     async def receive(self) -> dict[str, Any] | bytes | None: ...
@@ -58,19 +68,33 @@ def _is_number(value: Any) -> bool:
 
 
 class AppSession:
-    """一条 App 连接。"""
+    """一条 App 连接，带独立滑动窗口限速与发送超时。"""
 
     def __init__(self, token_id: str, channel: WSChannel, bus: EventBus) -> None:
         self.token_id = token_id
         self.channel = channel
         self.bus = bus
         self.closed = False
+        self._send_lock = asyncio.Lock()
+        self._events: deque[float] = deque()
+
+    def allow_rate(self) -> bool:
+        now = time.monotonic()
+        while self._events and now - self._events[0] > RATE_WINDOW_SECONDS:
+            self._events.popleft()
+        if len(self._events) >= MAX_REMOTE_PER_SECOND:
+            return False
+        self._events.append(now)
+        return True
 
     async def send_json(self, payload: dict[str, Any]) -> bool:
         if self.closed:
             return False
         try:
-            await self.channel.send_json(payload)
+            async with self._send_lock:
+                await asyncio.wait_for(
+                    self.channel.send_json(payload), timeout=SEND_TIMEOUT_SECONDS
+                )
             return True
         except Exception:
             logger.debug("app send failed: %s", self.token_id, exc_info=True)
@@ -85,7 +109,9 @@ class AppSession:
             logger.debug("app close failed: %s", self.token_id, exc_info=True)
 
 
-def _ack(request_id: str, ok: bool, error: str = "") -> dict[str, Any]:
+def _ack(
+    request_id: str, ok: bool, error: str = "", action_id: str | None = None
+) -> dict[str, Any]:
     payload: dict[str, Any] = {
         "v": 2,
         "type": "remote.ack",
@@ -94,6 +120,8 @@ def _ack(request_id: str, ok: bool, error: str = "") -> dict[str, Any]:
     }
     if error:
         payload["error"] = error
+    if action_id:
+        payload["action_id"] = action_id
     return payload
 
 
@@ -101,14 +129,24 @@ class AppGateway:
     def __init__(self, bus: EventBus | None = None) -> None:
         self.bus = bus or get_event_bus()
         self._sessions: dict[str, set[AppSession]] = {}
+        self._revoked: dict[str, float] = {}
         self._subscribed = False
 
     # ---- 连接生命周期 ----
 
     async def handle(self, token_id: str, channel: WSChannel) -> None:
+        self._prune_revoked()
         session = AppSession(token_id, channel, self.bus)
         self._sessions.setdefault(token_id, set()).add(session)
         self._ensure_subscribed()
+
+        # 撤销可能发生在“鉴权通过”与“挂载完成”之间；这里同步复核，
+        # 中间没有 await，撤销回调无法插入。
+        if token_id in self._revoked:
+            await session.close(CLOSE_TOKEN_REVOKED, "token_revoked")
+            self._detach(session)
+            return
+
         try:
             while True:
                 try:
@@ -140,28 +178,53 @@ class AppGateway:
 
     async def revoke(self, token_id: str) -> None:
         """Token 被撤销/过期时立即断开其全部 App 连接。"""
+        self._revoked[token_id] = time.monotonic()
         for session in list(self._sessions.get(token_id, ())):
             await session.close(CLOSE_TOKEN_REVOKED, "token_revoked")
+
+    def _prune_revoked(self) -> None:
+        cutoff = time.monotonic() - REVOKED_TTL_SECONDS
+        for token_id, stamp in list(self._revoked.items()):
+            if stamp < cutoff:
+                self._revoked.pop(token_id, None)
 
     async def shutdown(self) -> None:
         for sessions in list(self._sessions.values()):
             for session in list(sessions):
                 await session.close(1011, "server_shutdown")
+        self._sessions.clear()
+        if self._subscribed:
+            self.bus.unsubscribe(self._broadcast)
+            self._subscribed = False
 
     # ---- 事件广播 ----
 
     async def _broadcast(self, event: dict[str, Any]) -> None:
-        dead: list[AppSession] = []
-        for sessions in list(self._sessions.values()):
-            for session in list(sessions):
-                if not await session.send_json(event):
-                    dead.append(session)
-        for session in dead:
-            self._detach(session)
+        if event.get("type") not in BROADCAST_TYPES:
+            return
+        sessions = [s for group in list(self._sessions.values()) for s in list(group)]
+        if not sessions:
+            return
+        results = await asyncio.gather(
+            *(session.send_json(event) for session in sessions),
+            return_exceptions=True,
+        )
+        for session, result in zip(sessions, results):
+            if result is not True:
+                self._detach(session)
 
     # ---- 上行指令 ----
 
     async def _on_message(self, session: AppSession, message: Any) -> None:
+        try:
+            await self._handle_message(session, message)
+        except Exception:
+            logger.exception("app message handling failed: %s", session.token_id)
+            request_id = message.get("request_id") if isinstance(message, dict) else None
+            if isinstance(request_id, str) and request_id:
+                await session.send_json(_ack(request_id, False, "internal_error"))
+
+    async def _handle_message(self, session: AppSession, message: Any) -> None:
         if isinstance(message, (bytes, bytearray)):
             return
         if not isinstance(message, dict):
@@ -172,7 +235,6 @@ class AppGateway:
             return
 
         request_id = message.get("request_id")
-        device_id = message.get("device_id")
         if not isinstance(request_id, str) or not request_id:
             await session.send_json(
                 {
@@ -183,6 +245,17 @@ class AppGateway:
                 }
             )
             return
+
+        if message_type not in REMOTE_TYPES:
+            await session.send_json(_ack(request_id, False, "unknown_command"))
+            return
+
+        # 所有 remote.*（含急停/校准/状态查询）都受每连接限速约束。
+        if not session.allow_rate():
+            await session.send_json(_ack(request_id, False, "rate_limited"))
+            return
+
+        device_id = message.get("device_id")
         if not isinstance(device_id, str) or not device_id:
             await session.send_json(
                 {
@@ -200,15 +273,23 @@ class AppGateway:
             await session.send_json(_ack(request_id, False, "device_offline"))
             return
 
-        ok, error = await self._dispatch(device_id, link, message_type, message)
-        await session.send_json(_ack(request_id, ok, error))
+        if int(getattr(link, "protocol_version", 2)) < 2:
+            await session.send_json(_ack(request_id, False, "unsupported_protocol"))
+            return
+
+        ok, error, action_id = await self._dispatch(
+            session, device_id, link, message_type, message
+        )
+        await session.send_json(_ack(request_id, ok, error, action_id))
 
     async def _dispatch(
-        self, device_id: str, link: Any, message_type: str, message: dict[str, Any]
-    ) -> tuple[bool, str]:
-        if message_type not in REMOTE_TYPES:
-            return False, "unknown_command"
-
+        self,
+        session: AppSession,
+        device_id: str,
+        link: Any,
+        message_type: str,
+        message: dict[str, Any],
+    ) -> tuple[bool, str, str | None]:
         scheduler = get_device_scheduler(device_id, link)
 
         if message_type == "remote.action.play":
@@ -225,42 +306,49 @@ class AppGateway:
             return await self._calibrate_preview(link, message)
         if message_type == "remote.calibrate.save":
             return await self._calibrate_save(scheduler, message)
-        if message_type == "remote.get_status":
-            return await self._get_status(device_id, link)
 
-        return False, "unknown_command"
+        return await self._get_status(session, device_id, link)
 
-    async def _get_status(self, device_id: str, link: Any) -> tuple[bool, str]:
+    async def _get_status(
+        self, session: AppSession, device_id: str, link: Any
+    ) -> tuple[bool, str, None]:
         try:
             status = await link.get_status()
         except Exception:
-            return False, "internal_error"
+            return False, "internal_error", None
+        if not isinstance(status, dict):
+            return False, "internal_error", None
+        # 优先使用协议的对外形状（idle/ts），避免把内部字段 idle_enabled 泄漏给 App。
+        public = getattr(link, "public_report", None)
+        fields = public() if callable(public) else status
         report = {
             "v": 2,
             "type": "device.report",
             "device_id": device_id,
+            "source": "server",
             "ts": now_ms(),
         }
-        report.update({k: v for k, v in status.items() if k != "device_id"})
-        await self.bus.publish(report)
-        return True, ""
+        report.update({k: v for k, v in fields.items() if k != "device_id"})
+        await session.send_json(report)
+        return True, "", None
 
-    async def _play(self, scheduler: Any, message: dict[str, Any]) -> tuple[bool, str]:
+    async def _play(self, scheduler: Any, message: dict[str, Any]) -> tuple[bool, str, str | None]:
         name = message.get("name")
         if not isinstance(name, str) or not name:
-            return False, "invalid_arguments"
+            return False, "invalid_arguments", None
         try:
             action = get_action(name)
             params = resolve_params(action, message)
         except KeyError:
-            return False, "unknown_action"
+            return False, "unknown_action", None
         except (CatalogError, TypeError, ValueError):
-            return False, "invalid_arguments"
+            return False, "invalid_arguments", None
 
+        action_id = str(uuid.uuid4())
         command = {
             "v": 2,
             "type": "action.play",
-            "action_id": str(uuid.uuid4()),
+            "action_id": action_id,
             "name": action["name"],
             "intensity": params["intensity"],
             "speed": params["speed"],
@@ -268,81 +356,89 @@ class AppGateway:
             "source": "app",
             "ts": now_ms(),
         }
-        timeout_ms = int(action["max_duration_ms"]) + settings.ACTION_RESULT_TIMEOUT_EXTRA_MS
-        return self._from_result(await scheduler.enqueue(command, timeout_ms=timeout_ms))
+        ok, error, _ = self._from_result(await scheduler.enqueue(command))
+        return ok, error, action_id if ok else None
 
-    async def _move_head(self, scheduler: Any, message: dict[str, Any]) -> tuple[bool, str]:
+    async def _move_head(
+        self, scheduler: Any, message: dict[str, Any]
+    ) -> tuple[bool, str, str | None]:
         pan = message.get("pan")
         tilt = message.get("tilt")
         speed = message.get("speed", 500)
         if not _is_number(pan) or not _is_number(tilt):
-            return False, "invalid_arguments"
+            return False, "invalid_arguments", None
         if not (-90.0 <= float(pan) <= 90.0) or not (-20.0 <= float(tilt) <= 45.0):
-            return False, "angle_out_of_range"
+            return False, "angle_out_of_range", None
         if isinstance(speed, bool) or not isinstance(speed, int) or not (0 <= speed <= 1000):
-            return False, "invalid_arguments"
+            return False, "invalid_arguments", None
 
+        action_id = str(uuid.uuid4())
         command = {
             "v": 2,
             "type": "servo.move",
-            "action_id": str(uuid.uuid4()),
+            "action_id": action_id,
             "pan": float(pan),
             "tilt": float(tilt),
             "speed": speed,
             "source": "app",
             "ts": now_ms(),
         }
-        timeout_ms = max(DEFAULT_COMMAND_TIMEOUT_MS, speed + 1000)
-        return self._from_result(
-            await scheduler.enqueue(command, timeout_ms=timeout_ms, override=True)
+        ok, error, _ = self._from_result(
+            await scheduler.enqueue(command, override=True)
         )
+        return ok, error, action_id if ok else None
 
-    async def _set_volume(self, scheduler: Any, message: dict[str, Any]) -> tuple[bool, str]:
+    async def _set_volume(
+        self, scheduler: Any, message: dict[str, Any]
+    ) -> tuple[bool, str, str | None]:
         volume = message.get("volume")
         if isinstance(volume, bool) or not isinstance(volume, int) or not (0 <= volume <= 100):
-            return False, "invalid_arguments"
+            return False, "invalid_arguments", None
 
+        action_id = str(uuid.uuid4())
         command = {
             "v": 2,
             "type": "volume.set",
-            "action_id": str(uuid.uuid4()),
+            "action_id": action_id,
             "volume": volume,
             "source": "app",
             "ts": now_ms(),
         }
-        return self._from_result(
-            await scheduler.enqueue(
-                command, timeout_ms=DEFAULT_COMMAND_TIMEOUT_MS, override=True
-            )
+        ok, error, _ = self._from_result(
+            await scheduler.enqueue(command, override=True)
         )
+        return ok, error, action_id if ok else None
 
-    async def _set_idle(self, scheduler: Any, message: dict[str, Any]) -> tuple[bool, str]:
+    async def _set_idle(
+        self, scheduler: Any, message: dict[str, Any]
+    ) -> tuple[bool, str, str | None]:
         enabled = message.get("enabled")
         if not isinstance(enabled, bool):
-            return False, "invalid_arguments"
+            return False, "invalid_arguments", None
 
+        action_id = str(uuid.uuid4())
         command = {
             "v": 2,
             "type": "idle.set",
-            "action_id": str(uuid.uuid4()),
+            "action_id": action_id,
             "enabled": enabled,
             "source": "app",
             "ts": now_ms(),
         }
-        return self._from_result(
-            await scheduler.enqueue(command, timeout_ms=DEFAULT_COMMAND_TIMEOUT_MS)
-        )
+        ok, error, _ = self._from_result(await scheduler.enqueue(command))
+        return ok, error, action_id if ok else None
 
-    async def _stop(self, scheduler: Any, message: dict[str, Any]) -> tuple[bool, str]:
+    async def _stop(self, scheduler: Any, message: dict[str, Any]) -> tuple[bool, str, None]:
         reason = message.get("reason", "user_stop")
         if reason not in STOP_REASONS:
-            return False, "invalid_arguments"
-        return self._from_result(await scheduler.stop(reason))
+            return False, "invalid_arguments", None
+        ok, error, _ = self._from_result(await scheduler.stop(reason))
+        return ok, error, None
 
-    async def _calibrate_preview(self, link: Any, message: dict[str, Any]) -> tuple[bool, str]:
+    async def _calibrate_preview(self, link: Any, message: dict[str, Any]) -> tuple[bool, str, None]:
         offsets = self._offsets(message)
         if offsets is None:
-            return False, "invalid_arguments"
+            return False, "invalid_arguments", None
         pan_offset, tilt_offset = offsets
         try:
             result = await link.send(
@@ -356,26 +452,29 @@ class AppGateway:
                 }
             )
         except Exception:
-            return False, "internal_error"
-        return self._from_result(result)
+            return False, "internal_error", None
+        ok, error, _ = self._from_result(result)
+        return ok, error, None
 
-    async def _calibrate_save(self, scheduler: Any, message: dict[str, Any]) -> tuple[bool, str]:
+    async def _calibrate_save(
+        self, scheduler: Any, message: dict[str, Any]
+    ) -> tuple[bool, str, str | None]:
         offsets = self._offsets(message)
         if offsets is None:
-            return False, "invalid_arguments"
+            return False, "invalid_arguments", None
         pan_offset, tilt_offset = offsets
+        action_id = str(uuid.uuid4())
         command = {
             "v": 2,
             "type": "servo.calibrate_save",
-            "action_id": str(uuid.uuid4()),
+            "action_id": action_id,
             "pan_offset": pan_offset,
             "tilt_offset": tilt_offset,
             "source": "app",
             "ts": now_ms(),
         }
-        return self._from_result(
-            await scheduler.enqueue(command, timeout_ms=DEFAULT_COMMAND_TIMEOUT_MS)
-        )
+        ok, error, _ = self._from_result(await scheduler.enqueue(command))
+        return ok, error, action_id if ok else None
 
     @staticmethod
     def _offsets(message: dict[str, Any]) -> tuple[float, float] | None:
@@ -390,7 +489,7 @@ class AppGateway:
         return float(pan), float(tilt)
 
     @staticmethod
-    def _from_result(result: ActionResult) -> tuple[bool, str]:
+    def _from_result(result: ActionResult) -> tuple[bool, str, None]:
         if result.status in ("queued", "done"):
-            return True, ""
-        return False, result.detail or result.status
+            return True, "", None
+        return False, result.detail or result.status, None

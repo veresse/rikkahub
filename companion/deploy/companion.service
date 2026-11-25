@@ -11,7 +11,7 @@ Environment="PYTHONUNBUFFERED=1"
 Environment="PYTHONPATH=/opt/rikkahub"
 Environment="AUTO_MIGRATE=true"
 EnvironmentFile=/etc/rikkahub/companion.env
-ExecStart=/opt/rikkahub/companion/server/.venv/bin/uvicorn companion.server.app.main:app --host 127.0.0.1 --port 8000 --workers 1
+ExecStart=/opt/rikkahub/companion/server/.venv/bin/uvicorn companion.server.app.main:app --host 127.0.0.1 --port 8000 --workers 1 --ws-ping-interval 25 --ws-ping-timeout 10 --ws-max-size 1048576
 
 # 安全限制与自愈
 Restart=always

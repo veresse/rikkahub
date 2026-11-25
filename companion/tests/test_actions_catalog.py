@@ -127,8 +127,13 @@ def test_resolve_params_defaults_and_ranges():
         resolve_params(nod, {"speed": 0})
     with pytest.raises(CatalogError):
         resolve_params(nod, {"repeat": 6})
-    with pytest.raises(CatalogError):
-        resolve_params(get_action("home"), {"intensity": 3})
+    # 协议 §4.1：动作不支持的参数直接忽略并回落默认值；显式 None 视为缺省。
+    assert resolve_params(get_action("home"), {"intensity": 3})["intensity"] == 2
+    assert resolve_params(nod, {"intensity": None}) == {
+        "intensity": 2,
+        "speed": 2,
+        "repeat": 1,
+    }
 
 
 def test_resolve_params_rejects_unknown_action_inputs():

@@ -24,6 +24,7 @@ from companion.server.app.models.pairing_code import PairingCodeModel
 from companion.server.app.security.dependencies import AuthContext, require_app_token
 from companion.server.app.security.rate_limit import clear, is_limited, record
 from companion.server.app.security.tokens import generate_token, hash_token
+from companion.server.app.services.device_registry import get_device_link
 from companion.shared.catalog import get_catalog
 
 router = APIRouter(prefix="/devices", tags=["devices"])
@@ -217,4 +218,13 @@ async def revoke_device(
         # 换成一个不可能再被使用的随机哈希，旧 Token 立即失效。
         device.token_hash = hash_token(generate_token())
         device.state = "revoked"
+
+    # 已建立的 `/device/ws` 连接不会周期性复验 Token，撤销时必须主动断开。
+    link = get_device_link(device_id)
+    close = getattr(link, "close", None)
+    if close is not None:
+        try:
+            await close(4401, "device_revoked")
+        except Exception:
+            pass
     return {"status": "revoked"}
