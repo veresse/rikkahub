@@ -22,3 +22,4 @@
 | :--- | :--- | :--- | :--- |
 | 01 | Phase 0：仓库基线审计与分支隔离 | ✅ 已完成（待负责人确认范围） | 分支 `feature/companion-robot-v2`；审计报告 + pytest/Android 构建基线 |
 | 02 | Block A（Phase 1）：动作库与 protocol v2 定稿 | ✅ 已完成 | `actions.json` / JSON Schema / 校验器 / `protocol_v2.md`；38 passed |
+| 03 | Block B（Phase 2 基础）：鉴权 + Alembic + 删除网页端 | ✅ 已完成 | Bearer Token/配对码/设备 Token 哈希/可逆迁移；64 passed |

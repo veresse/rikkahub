@@ -9,3 +9,5 @@ import os
 import tempfile
 
 os.environ.setdefault("DATA_DIR", tempfile.mkdtemp(prefix="rikkahub_pytest_data_"))
+os.environ.setdefault("ADMIN_PASSWORD", "test-admin-password")
+os.environ.setdefault("AUTO_MIGRATE", "true")

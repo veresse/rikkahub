@@ -4,10 +4,13 @@ After=network.target
 
 [Service]
 Type=simple
-User=root
+User=rikkahub
+Group=rikkahub
 WorkingDirectory=/opt/rikkahub
 Environment="PYTHONUNBUFFERED=1"
 Environment="PYTHONPATH=/opt/rikkahub"
+Environment="AUTO_MIGRATE=true"
+EnvironmentFile=/etc/rikkahub/companion.env
 ExecStart=/opt/rikkahub/companion/server/.venv/bin/uvicorn companion.server.app.main:app --host 127.0.0.1 --port 8000 --workers 1
 
 # 安全限制与自愈
@@ -15,6 +18,9 @@ Restart=always
 RestartSec=3s
 LimitNOFILE=65536
 MemoryMax=800M
+UMask=0077
+NoNewPrivileges=true
+PrivateTmp=true
 
 [Install]
 WantedBy=multi-user.target

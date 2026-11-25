@@ -206,3 +206,26 @@ Android 根工程基线：`gradlew --version` 通过（Gradle 9.6.0 / JDK 17）�
 - **Block G（可选，Phase 2.5）**：音频链路（ASR/TTS/Opus/状态机）——如果要求真机语音对话。
 - **Block H（独立立项）**：`companion/app` Android App。
 - **Block I（独立立项）**：`companion/firmware` ESP32 固件。
+
+---
+
+## 8. 执行状态更新（2026-11-25）
+
+本节是 Phase 0 审计之后的实际执行结果，用于避免与上方“审计快照”混淆。
+
+负责人已确认：
+
+1. 本轮只做**服务端**，Android App 与 ESP32 固件暂不做。
+2. 先做**控制面**，音频链路后续单独 Block。
+3. **删除 `companion/web`**，App 后续再考虑。
+4. 鉴权直接覆盖现有 REST，不留匿名过渡期。
+
+已落地：
+
+- Block A：`companion/shared/actions.json`、JSON Schema、校验器、`companion/docs/protocol_v2.md`。
+- Block B：App Bearer Token、设备 Token 哈希、配对码落库、Alembic 可逆迁移、删除 `companion/web`、
+  Nginx/systemd/部署脚本改为非 root 且只反代 REST/WS。
+- 当前测试：`64 passed`（明细见 `docs/语音机器人需求文档/v2_migration_log/03_phase2_auth_alembic_web_removal.md`）。
+
+仍未实现：`/device/ws`、`/app/ws`、动作编排、DeepSeek 工具循环、音频链路、App、固件。
+

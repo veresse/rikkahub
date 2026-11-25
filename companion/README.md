@@ -1,14 +1,25 @@
-# RikkaHub Companion Server (伴侣服务端)
+# RikkaHub Companion Server（伴侣服务端 v2）
 
-为 RikkaHub 打造的独立轻量化 Linux 服务端与 Web 管理系统，作为角色、记忆与会话的唯一权威数据源，同时为实体语音挂件提供核心编排支持。
+RikkaHub 的独立轻量化 Linux 服务端，作为角色、记忆、会话与设备状态的唯一权威数据源。
+
+当前仓库只交付**服务端**；Android App 与 ESP32 固件不在本仓库内（后续独立立项）。原 `companion/web`
+管理端已移除，所有管理/遥控能力由 App 通过 REST + WebSocket 使用。
 
 ## 架构特性
-- **数据无损导入**：完整解析手机端 RikkaHub 备份 ZIP 包（`settings.json` 与 `rikka_hub.db`），还原角色人设、多分支对话树（`MessageNode`）与长期记忆。
-- **轻量稳定**：基于 Python FastAPI + SQLite 异步 WAL 模式，单进程写入与繁忙锁保护，完美适配 2核 2G 腾讯云轻量服务器。
-- **对话与思考链**：深度接入 DeepSeek 流式 API，支持 `<think>` 思考过程折叠、自动联网搜索及 SSRF 安全防护。
-- **分支切换**：完整保留原版手机 App 的分支选择机制，用户可随意在多个候选生成版本之间切换。
 
-## 启动与运行 (Linux/Debian)
+- **数据无损导入**：解析手机端 RikkaHub 备份 ZIP（`settings.json` 与 `rikka_hub.db`），还原角色人设、
+  多分支对话树（`MessageNode`）与长期记忆。
+- **轻量稳定**：FastAPI + SQLite 异步 WAL、单进程写入、繁忙锁保护，适配 2 核 2G 轻量服务器。
+- **对话与思考链**：DeepSeek 流式 API，支持 ` thinking` 思考过程折叠、自动联网搜索及 SSRF 防护。
+- **统一鉴权**：管理员登录签发 App Bearer Token（只存 SHA-256 哈希），除 `/api/health`、
+  `/api/auth/login`、`/api/devices/pair` 外全部接口需要鉴权。
+- **设备配对**：一次性 6 位配对码（限时、限次、限速），设备用配对码换取独立设备 Token；
+  设备 Token 与 App Token 分表存储，互不通用。
+- **动作契约**：`companion/shared/actions.json` 是 Server / App / 固件共享的 18 动作单一事实源，
+  通过 `GET /api/actions/catalog` 下发。
+- **可逆迁移**：Alembic 管理数据库结构，v1 存量库可平滑升级（设备明文 Token 会转为哈希）。
+
+## 启动与运行
 
 ```bash
 cd companion/server
@@ -16,13 +27,83 @@ python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 
-# 启动服务 (默认监听 127.0.0.1:8000)
-python3 -m companion.server.app.main
+export ADMIN_PASSWORD='请替换为强口令'
+export DEEPSEEK_API_KEY='...'
+PYTHONPATH=../.. python3 -m companion.server.app.main
 ```
+
+默认监听 `127.0.0.1:8000`。启动时会自动执行 `alembic upgrade head`（`AUTO_MIGRATE=false` 可关闭）。
+
+健康检查：`GET /api/health`（公开）。
+
+## 鉴权流程
+
+```bash
+# 1. 登录换取 App Token（仅此一次返回明文）
+curl -X POST http://127.0.0.1:8000/api/auth/login \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"admin","password":"你的口令","device_name":"pixel"}'
+
+# 2. 携带 Token 访问业务接口
+curl http://127.0.0.1:8000/api/devices \
+  -H "Authorization: Bearer <token>"
+```
+
+口令可用明文 `ADMIN_PASSWORD`（首次引导）或 `ADMIN_PASSWORD_HASH`（推荐）：
+
+```bash
+python -c "from companion.server.app.security.password import hash_password; print(hash_password('你的口令'))"
+```
+
+## 主要接口
+
+| 方法 | 路径 | 鉴权 | 说明 |
+| :--- | :--- | :--- | :--- |
+| GET | `/api/health` | 公开 | 健康检查 |
+| POST | `/api/auth/login` | 公开 | 管理员登录签发 Token |
+| POST | `/api/auth/logout` | App | 撤销当前 Token |
+| GET | `/api/auth/tokens` | App | Token 列表（不含明文/哈希） |
+| POST | `/api/auth/tokens/{id}/revoke` | App | 撤销指定 Token |
+| POST | `/api/backup/preview` / `confirm` | App | 备份导入 |
+| GET | `/api/backup/export` | App | 导出 RikkaHub 兼容 ZIP |
+| GET/POST/PUT/DELETE | `/api/assistants`、`/api/conversations`、`/api/memories` | App | 角色/会话/记忆 |
+| POST | `/api/chat/completions` | App | SSE 流式对话 |
+| GET | `/api/actions/catalog` | App | 动作库 |
+| POST | `/api/devices/pair-code` | App | 生成一次性配对码 |
+| POST | `/api/devices/pair` | 公开（凭配对码） | 设备换取设备 Token |
+| GET | `/api/devices` | App | 设备列表/状态 |
+| PUT | `/api/devices/{id}`、`PUT /api/devices/bind` | App | 重命名/绑定 |
+| DELETE | `/api/devices/{id}` | App | 撤销设备（软删除，旧 Token 立即失效） |
+
+设备/App WebSocket（`/device/ws`、`/app/ws`）与动作编排、音频链路属于后续 Block，协议已定稿于
+`companion/docs/protocol_v2.md`。
+
+## 数据库迁移
+
+```bash
+cd companion/server
+PYTHONPATH=../.. .venv/bin/alembic -c alembic.ini upgrade head
+PYTHONPATH=../.. .venv/bin/alembic -c alembic.ini downgrade -1   # 回退一步
+```
+
+注意：`0002` 把设备明文 Token 哈希化，downgrade 不可还原明文，回退后设备需重新配对。
 
 ## 测试
 
 ```bash
-# 运行离线导入与解析验证
-python3 companion/server/tests/verify_standalone.py
+# 在仓库根目录执行
+python -m pytest -q
+python -m companion.shared.validate_actions
 ```
+
+## 部署
+
+见 `deploy/README`（如无则直接阅读脚本）：
+
+```bash
+sudo bash companion/deploy/deploy.sh
+```
+
+- `deploy/nginx.conf`：只反代 `/api/`、`/device/ws`、`/app/ws`，其余路径 404。
+- `deploy/companion.service`：以非 root 用户 `rikkahub` 运行，单 worker。
+- `deploy/companion.env.example`：环境变量模板（不要提交真实密钥）。

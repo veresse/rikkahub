@@ -105,21 +105,25 @@ def mock_backup_zip(tmp_path: Path) -> Path:
 async def test_full_service_pipeline(mock_backup_zip: Path):
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
-        # 1. 验证健康检查
+        # 1. 验证健康检查（公开）
         resp = await client.get("/api/health")
         assert resp.status_code == 200
         assert resp.json()["status"] == "healthy"
 
-        # 2. 验证前端静态页面托管
-        web_resp = await client.get("/")
-        assert web_resp.status_code == 200
-        assert "RikkaHub 伴侣" in web_resp.text or "<!doctype html>" in web_resp.text
+        # 2. 管理员登录，后续管理接口统一携带 Bearer Token
+        login_resp = await client.post(
+            "/api/auth/login",
+            json={"username": "admin", "password": "test-admin-password", "device_name": "pytest"},
+        )
+        assert login_resp.status_code == 200
+        headers = {"Authorization": f"Bearer {login_resp.json()['token']}"}
 
         # 3. 验证备份上传与预览
         with open(mock_backup_zip, "rb") as f:
             preview_resp = await client.post(
                 "/api/backup/preview",
-                files={"file": ("backup.zip", f, "application/zip")}
+                files={"file": ("backup.zip", f, "application/zip")},
+                headers=headers,
             )
         assert preview_resp.status_code == 200
         preview_data = preview_resp.json()
@@ -131,25 +135,26 @@ async def test_full_service_pipeline(mock_backup_zip: Path):
         # 4. 验证确认入库
         confirm_resp = await client.post(
             "/api/backup/confirm",
-            json={"preview_id": preview_id}
+            json={"preview_id": preview_id},
+            headers=headers,
         )
         assert confirm_resp.status_code == 200
         assert confirm_resp.json()["status"] == "success"
 
         # 5. 验证角色查询
-        ast_resp = await client.get("/api/assistants")
+        ast_resp = await client.get("/api/assistants", headers=headers)
         assert ast_resp.status_code == 200
         assistants = ast_resp.json()
         assert any(a["name"] == "夏以昼" for a in assistants)
 
         # 6. 验证会话与多候选分支树获取
-        conv_resp = await client.get("/api/conversations")
+        conv_resp = await client.get("/api/conversations", headers=headers)
         assert conv_resp.status_code == 200
         convs = conv_resp.json()
         assert len(convs) >= 1
         conv_id = convs[0]["id"]
 
-        detail_resp = await client.get(f"/api/conversations/{conv_id}")
+        detail_resp = await client.get(f"/api/conversations/{conv_id}", headers=headers)
         assert detail_resp.status_code == 200
         detail = detail_resp.json()
         assert len(detail["nodes"]) >= 1
@@ -158,13 +163,14 @@ async def test_full_service_pipeline(mock_backup_zip: Path):
 
         # 7. 验证切换分支版本
         select_resp = await client.post(
-            f"/api/conversations/{conv_id}/nodes/{detail['nodes'][0]['id']}/select?index=0"
+            f"/api/conversations/{conv_id}/nodes/{detail['nodes'][0]['id']}/select?index=0",
+            headers=headers,
         )
         assert select_resp.status_code == 200
         assert select_resp.json()["select_index"] == 0
 
         # 8. 验证长期记忆查询与新增
-        mem_resp = await client.get("/api/memories")
+        mem_resp = await client.get("/api/memories", headers=headers)
         assert mem_resp.status_code == 200
         memories = mem_resp.json()
         assert len(memories) >= 1
@@ -172,20 +178,21 @@ async def test_full_service_pipeline(mock_backup_zip: Path):
 
         add_mem_resp = await client.post(
             "/api/memories",
-            json={"assistant_id": "c1f7b022-7711-47fb-94f4-5f5c86c12345", "content": "平时喜欢摄影"}
+            json={"assistant_id": "c1f7b022-7711-47fb-94f4-5f5c86c12345", "content": "平时喜欢摄影"},
+            headers=headers,
         )
         assert add_mem_resp.status_code == 200
         assert add_mem_resp.json()["status"] == "created"
 
         # 9. 验证实体挂件配对码生成
-        code_resp = await client.post("/api/devices/pair-code", json={})
+        code_resp = await client.post("/api/devices/pair-code", json={}, headers=headers)
         assert code_resp.status_code == 200
         code_data = code_resp.json()
         assert len(code_data["code"]) == 6
         assert code_data["expires_in"] == 300
 
         # 10. 验证全量数据导出为标准 RikkaHub ZIP
-        export_resp = await client.get("/api/backup/export")
+        export_resp = await client.get("/api/backup/export", headers=headers)
         if export_resp.status_code != 200:
             print("EXPORT FAILED DETAIL:", export_resp.text)
         assert export_resp.status_code == 200
