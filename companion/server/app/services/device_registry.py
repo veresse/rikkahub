@@ -35,7 +35,14 @@ def register_device_link(device_id: str, link: DeviceLink) -> None:
     _LINKS[device_id] = link
 
 
-def unregister_device_link(device_id: str) -> None:
+def unregister_device_link(device_id: str, link: DeviceLink | None = None) -> None:
+    """注销设备链路。
+
+    `link` 非空时必须与当前链路是同一对象才注销，避免旧连接在新连接替换后
+    把新会话误删。
+    """
+    if link is not None and _LINKS.get(device_id) is not link:
+        return
     _LINKS.pop(device_id, None)
 
 

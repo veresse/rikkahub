@@ -80,6 +80,10 @@ class Settings(BaseSettings):
     MAX_ACTIONS_PER_TURN: int = 3
     ACTION_RESULT_TIMEOUT_EXTRA_MS: int = 1500
 
+    # WebSocket 网关
+    DEVICE_HELLO_TIMEOUT_SECONDS: float = 5.0
+    WS_MAX_MESSAGE_BYTES: int = 64 * 1024
+
     # 限制与配额 (防 Zip 炸弹和滥用)
     MAX_UPLOAD_SIZE_BYTES: int = 100 * 1024 * 1024  # 100 MB
     MAX_ZIP_EXTRACTED_BYTES: int = 500 * 1024 * 1024  # 500 MB

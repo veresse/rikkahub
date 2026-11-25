@@ -15,6 +15,7 @@ from companion.server.app.routers import (
     import_export,
     memories,
     app_update,
+    ws,
 )
 from companion.server.app.security.dependencies import require_app_token
 
@@ -24,6 +25,7 @@ async def lifespan(app: FastAPI):
     # 服务启动时执行 Alembic 迁移到 head
     await init_db()
     yield
+    await ws.device_gateway.shutdown()
 
 
 app = FastAPI(
@@ -56,6 +58,9 @@ app.include_router(actions.router, prefix=api_prefix, dependencies=app_protected
 app.include_router(app_update.router, prefix=api_prefix, dependencies=app_protected)
 # devices 内部混有公开配对端点，鉴权按端点声明
 app.include_router(devices.router, prefix=api_prefix)
+
+# WebSocket：/device/ws、/app/ws（握手阶段自行鉴权，不使用 HTTP 依赖）
+app.include_router(ws.router)
 
 
 @app.get("/api/health")
