@@ -300,3 +300,23 @@ MUTATIONS THAT STAYED GREEN: none
    `force_exit` 轮询、`timeout_graceful_shutdown` 与 lifespan 的交互、新 e2e 的
    隔离性、mutation 脚本的还原）。
 3. 审查通过后进入音频 Block。
+
+## 10. 勘误（日志 22 修订）
+
+- **§2.5 的「被上层总时限取消时对当前会话 `self._sessions.add(session)`，兜底还能
+  再试一次」只对“关闭”成立，对“广播”不成立。** 取消若落在
+  `unregister_device_link()` 之后（例如 `channel.close()` 卡住），重试时
+  `was_current` 已为 False、注册表也没有链路，offline 会被永久跳过。日志 22 改为
+  在会话上记录 `pending_offline_reason`，并让 `_teardown()` 的取消路径共用同一机制。
+  真实探针：修复前 `after retry: offline_events=[]`，修复后
+  `after retry: offline_events=['server_shutdown']`。
+- **§2.5 / §7 的「最多丢失正在广播的那一条」需要补充限定**：这里指同一次
+  `shutdown()` 调用中已经被取消的那一条；跨重试不丢（at-least-once），但广播若在
+  总线已投递后才被取消，接收方可能看到重复的 `online=false`。
+- **§7 的「兜底可能重复处理（`close()` 幂等）」低估了广播的重复风险。** 首次实现
+  “广播后再清空待发原因”会让并发的 `_teardown()` 重复发一次 offline，真实 e2e
+  变成 `[True, False, False]`；日志 22 改为 `await` 前清空、取消时写回，并加了
+  并发用例。
+- **§4 的 `test_lifespan_shutdown_is_bounded` 会把 `ws.app_gateway` 留在停机态**
+  （审查 M-1）：新增用例已补 `try/finally` 复位；该用例同时加了 3s `wait_for`，
+  避免兜底被改成无界时挂住整个测试会话（审查 M-2）。

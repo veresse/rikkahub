@@ -824,6 +824,50 @@ async def test_shutdown_broadcasts_offline_once(seeded_device):
     assert [e.get("reason") for e in offline] == ["server_shutdown"], harness.events
 
 
+async def test_pending_offline_not_republished_by_concurrent_teardown(
+    seeded_device, monkeypatch
+):
+    """广播进行中 handle 的 `_teardown()` 同时收尾：offline 只能发一次。
+
+    `shutdown()` 在 unregister 后广播 offline，此时读循环可能因链路关闭而退出，
+    `_teardown()` 会并发跑一遍。待发原因必须在 `await` 之前清空，否则两边都看到
+    同一条原因，App 会收到两条 `online=false`（真实 e2e 曾因此变成 [True, False,
+    False]）。
+    """
+    harness = Harness()
+    task, channel, _ = await harness.connected()
+    session = get_device_link(DEVICE_ID)
+    assert session is not None
+
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    count = 0
+    real_publish = harness.gateway._publish_status
+
+    async def gated_publish(device_id: str, *, online: bool, reason: str = "") -> None:
+        nonlocal count
+        if not online:
+            count += 1
+            entered.set()
+            await release.wait()
+        await real_publish(device_id, online=online, reason=reason)
+
+    monkeypatch.setattr(harness.gateway, "_publish_status", gated_publish)
+
+    shutdown_task = asyncio.create_task(harness.gateway.shutdown())
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=3.0)
+        # 链路已关闭：读循环退出、`_teardown()` 在广播进行中收尾。
+        await asyncio.wait_for(task, timeout=3.0)
+        release.set()
+        await asyncio.wait_for(shutdown_task, timeout=3.0)
+        assert count == 1, f"offline 被重复广播：{count}"
+    finally:
+        release.set()
+        shutdown_task.cancel()
+        await asyncio.gather(shutdown_task, return_exceptions=True)
+
+
 async def test_shutdown_after_failed_send_reports_offline_once(seeded_device):
     """写失败只置 closing（未 closed）后停机：仍要发出一条 server_shutdown。
 
@@ -920,6 +964,101 @@ async def test_shutdown_cancelled_midway_keeps_session_for_retry(
     monkeypatch.setattr(session, "stop_writer", original_stop_writer)
     task.cancel()
     await asyncio.gather(task, return_exceptions=True)
+
+
+async def test_shutdown_cancelled_after_unregister_still_publishes_offline(
+    seeded_device, monkeypatch
+):
+    """取消落在 unregister 之后：重试的 `was_current` 已为 False，仍要补发 offline。
+
+    慢 `channel.close()` 正是停机预算要兜的场景，而它发生在链路已注销、`closed`
+    已置位之后。只把会话放回集合不够：重试时没有任何“当前链路”可查，App 会永远
+    收不到该设备的 `server_shutdown`。
+    """
+    harness = Harness()
+    task, channel, _ = await harness.connected()
+    session = get_device_link(DEVICE_ID)
+    assert session is not None
+
+    entered = asyncio.Event()
+    original_close = channel.close
+
+    async def hanging_close(code: int = 1000, reason: str = "") -> None:
+        entered.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(channel, "close", hanging_close)
+
+    shutdown_task = asyncio.create_task(harness.gateway.shutdown())
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=3.0)
+        # 取消点已经越过 unregister：注册表里已没有这条链路。
+        assert get_device_link(DEVICE_ID) is None
+
+        shutdown_task.cancel()
+        await asyncio.gather(shutdown_task, return_exceptions=True)
+
+        assert session in harness.gateway._sessions
+        assert session.pending_offline_reason == "server_shutdown"
+
+        # 恢复真实 close 再跑一次兜底。若只靠 `was_current` 决定广播，这里仍会是
+        # 零条 offline——这正是本条回归要锁死的缺陷。
+        monkeypatch.setattr(channel, "close", original_close)
+        await harness.gateway.shutdown()
+
+        offline = [
+            e
+            for e in harness.events
+            if e.get("type") == "device.status" and e.get("online") is False
+        ]
+        assert [e.get("reason") for e in offline] == ["server_shutdown"], harness.events
+        assert session.pending_offline_reason is None
+    finally:
+        monkeypatch.setattr(channel, "close", original_close)
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+async def test_teardown_cancelled_after_unregister_keeps_offline_pending(
+    seeded_device, monkeypatch
+):
+    """uvicorn drain 超时取消连接任务：已注销但未广播的 offline 必须能补发。"""
+    harness = Harness()
+    task, channel, _ = await harness.connected()
+    session = get_device_link(DEVICE_ID)
+    assert session is not None
+
+    entered = asyncio.Event()
+    original_close = channel.close
+
+    async def hanging_close(code: int = 1000, reason: str = "") -> None:
+        entered.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(channel, "close", hanging_close)
+
+    # 第一次取消：读循环退出，`_teardown()` 走到 `channel.close()` 并卡住。
+    task.cancel()
+    await asyncio.wait_for(entered.wait(), timeout=3.0)
+    assert get_device_link(DEVICE_ID) is None
+    assert session.closed is True
+
+    # 第二次取消模拟 uvicorn 的 drain 超时强行结束连接任务。
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+    assert session in harness.gateway._sessions, "取消后会话从集合里消失了"
+    assert session.pending_offline_reason == ""
+
+    monkeypatch.setattr(channel, "close", original_close)
+    await harness.gateway.shutdown()
+
+    offline = [
+        e
+        for e in harness.events
+        if e.get("type") == "device.status" and e.get("online") is False
+    ]
+    assert [e.get("reason") for e in offline] == [""], harness.events
 
 
 async def test_shutdown_reports_reason_of_already_closed_link(seeded_device, monkeypatch):

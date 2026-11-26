@@ -120,6 +120,10 @@ class DeviceSession:
         # 关闭原因，供 `_teardown()` 广播 offline 时复用（撤销应显示
         # device_revoked，而不是和其它断线一样的空原因）。
         self.close_reason = ""
+        # 已从注册表注销、但 offline 还没成功广播：停机/连接任务被取消时记下
+        # 原因，重试的 `was_current` 已是 False，只能靠这个字段补发（否则 App
+        # 永远收不到该设备的下线事件）。成功广播后清回 None。
+        self.pending_offline_reason: str | None = None
 
         self._report = self._initial_report(device)
         self._pending: dict[str, asyncio.Future[ActionResult]] = {}
@@ -727,20 +731,30 @@ class DeviceGateway:
             await self._publish_status(session.device_id, online=True)
 
     async def _teardown(self, session: DeviceSession) -> None:
-        async with device_lifecycle_lock(session.device_id):
-            self._sessions.discard(session)
-            was_current = get_device_link(session.device_id) is session
-            if was_current:
-                # 下线前把最后一条上报落库，避免重连后快照回退。
-                await session.stop_writer()
-                unregister_device_link(session.device_id, link=session)
-                invalidate_device_scheduler(session.device_id)
-            if not session.closed:
-                await session.close(1000)
-            if was_current:
-                await self._publish_status(
-                    session.device_id, online=False, reason=session.close_reason
-                )
+        was_current = False
+        try:
+            async with device_lifecycle_lock(session.device_id):
+                self._sessions.discard(session)
+                was_current = get_device_link(session.device_id) is session
+                if was_current:
+                    # 下线前把最后一条上报落库，避免重连后快照回退。
+                    await session.stop_writer()
+                    unregister_device_link(session.device_id, link=session)
+                    invalidate_device_scheduler(session.device_id)
+                if not session.closed:
+                    await session.close(1000)
+                if was_current:
+                    session.pending_offline_reason = session.close_reason
+        except BaseException:
+            # uvicorn 在 drain 超时后会取消连接任务：此时链路可能已注销，若只是
+            # 让取消穿过去，它既不在注册表也不在集合里，offline 就永久丢失。
+            # 把未完成的关闭/广播放回集合，交给停机兜底重试（幂等）。
+            if was_current and session.pending_offline_reason is None:
+                session.pending_offline_reason = session.close_reason
+            if session.pending_offline_reason is not None or not session.closed:
+                self._sessions.add(session)
+            raise
+        await self._publish_pending_offline(session)
 
     async def shutdown(self) -> None:
         """服务关闭时主动断开所有设备，避免连接悬挂。
@@ -750,18 +764,22 @@ class DeviceGateway:
 
         置 `_shutting_down` 后不再注册新链路；逐个从 `_sessions` 取出处理（而不是
         先拍快照再 `clear()`），这样「`_install()` 在快照之后才完成」的会话也会被
-        关闭。每条设备的 offline 在释放生命周期锁后**立即**广播：被上层总时限取消
-        时最多丢失「正在广播的那一条」，已经关闭的设备不会因为后面还有慢设备而漏发。
+        关闭。每条设备的 offline 在释放生命周期锁后**立即**广播，已经关闭的设备
+        不会因为后面还有慢设备而漏发。
 
-        被取消（上层总时限/`force_exit`）时把当前会话放回集合，lifespan 的兜底
-        还能再试一次；否则这条链路会既没 close 也没广播，凭空消失。
+        被取消（上层总时限/`force_exit`）时把当前会话放回集合，并把待发原因记在
+        会话上：取消若落在 unregister 之后，重试的 `was_current` 已为 False，只有
+        `pending_offline_reason` 能让 lifespan 兜底补发这条 offline。取消发生在
+        广播本身时同样写回原因重试，因此 offline 是 at-least-once（可能重复，
+        不会丢失）。
         """
         self._shutting_down = True
         while self._sessions:
             session = self._sessions.pop()
-            # 与 `_teardown` 串行，避免一方在另一方 flush 期间 unregister 导致
-            # 最后一条上报被 `_handle_report` 的链路检查丢弃。
+            was_current = False
             try:
+                # 与 `_teardown` 串行，避免一方在另一方 flush 期间 unregister 导致
+                # 最后一条上报被 `_handle_report` 的链路检查丢弃。
                 async with device_lifecycle_lock(session.device_id):
                     await session.stop_writer()
                     was_current = get_device_link(session.device_id) is session
@@ -769,16 +787,20 @@ class DeviceGateway:
                         unregister_device_link(session.device_id, link=session)
                         invalidate_device_scheduler(session.device_id)
                     await session.close(1011, "server_shutdown")
-                    # 链路若已被撤销/异常路径关闭，`close()` 是空操作，
-                    # `close_reason` 保留先到的原因；否则就是 server_shutdown。
-                    reason = session.close_reason or "server_shutdown"
+                    if was_current:
+                        # 链路若已被撤销/异常路径关闭，`close()` 是空操作，
+                        # `close_reason` 保留先到的原因；否则就是 server_shutdown。
+                        session.pending_offline_reason = (
+                            session.close_reason or "server_shutdown"
+                        )
             except BaseException:
+                if was_current and session.pending_offline_reason is None:
+                    session.pending_offline_reason = (
+                        session.close_reason or "server_shutdown"
+                    )
                 self._sessions.add(session)
                 raise
-            if was_current:
-                await self._publish_status(
-                    session.device_id, online=False, reason=reason
-                )
+            await self._publish_pending_offline(session)
 
     async def _read_loop(self, session: DeviceSession) -> None:
         while True:
@@ -965,6 +987,34 @@ class DeviceGateway:
             logger.exception("persist report failed: %s", device_id)
             # 落库失败不代表设备离线，保持原有广播行为。
             return True
+
+    async def _publish_pending_offline(self, session: DeviceSession) -> None:
+        """发出 `pending_offline_reason`；广播被取消时把会话放回集合重试。
+
+        offline 在 unregister 之后才广播，取消可能落在两者之间。此时重试的
+        `was_current` 已是 False、注册表里也没有链路，只有会话上的待发原因能
+        让兜底把这条事件发出去。
+
+        先清空再 `await`：`_teardown()` 或另一次 `shutdown()` 可能与本条广播并发，
+        若等广播返回后才清空，它们会看到同一个待发原因并重复发 offline。广播被
+        取消时再把原因写回并放回集合，宁可重试也不丢；取消发生在总线已投递之后
+        时，接收方可能看到重复的 `online=false`（at-least-once）。
+
+        若期间已有新链路接管（停机标志解除后重新连接），上线事件由新链路负责，
+        这条过期的 offline 直接丢弃，避免把在线设备标成离线。
+        """
+        reason = session.pending_offline_reason
+        if reason is None:
+            return
+        session.pending_offline_reason = None
+        if get_device_link(session.device_id) is not None:
+            return
+        try:
+            await self._publish_status(session.device_id, online=False, reason=reason)
+        except BaseException:
+            session.pending_offline_reason = reason
+            self._sessions.add(session)
+            raise
 
     async def _publish_status(self, device_id: str, *, online: bool, reason: str = "") -> None:
         await self.bus.publish(

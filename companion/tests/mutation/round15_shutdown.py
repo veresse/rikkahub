@@ -80,12 +80,34 @@ CASES = [
     (
         "cancelled device session is not put back",
         DEV,
-        [("            except BaseException:\n"
-          "                self._sessions.add(session)\n"
+        [("                self._sessions.add(session)\n"
           "                raise\n",
-          "            except BaseException:\n"
           "                raise\n")],
         f"{T_DEV}::test_shutdown_cancelled_midway_keeps_session_for_retry",
+    ),
+    (
+        "cancelled shutdown forgets the pending offline reason",
+        DEV,
+        [("                if was_current and session.pending_offline_reason is None:\n"
+          "                    session.pending_offline_reason = (\n"
+          '                        session.close_reason or "server_shutdown"\n'
+          "                    )\n", "")],
+        f"{T_DEV}::test_shutdown_cancelled_after_unregister_still_publishes_offline",
+    ),
+    (
+        "teardown cancellation drops the session",
+        DEV,
+        [("            if session.pending_offline_reason is not None or not session.closed:\n"
+          "                self._sessions.add(session)\n", "")],
+        f"{T_DEV}::test_teardown_cancelled_after_unregister_keeps_offline_pending",
+    ),
+    (
+        "pending offline is never cleared",
+        DEV,
+        [("        session.pending_offline_reason = None\n"
+          "        if get_device_link(session.device_id) is not None:\n",
+          "        if get_device_link(session.device_id) is not None:\n")],
+        f"{T_DEV}::test_pending_offline_not_republished_by_concurrent_teardown",
     ),
     (
         "app gateway deadline ignores its timeout",
@@ -121,6 +143,7 @@ def apply(text: str, replacements) -> str:
 
 def main() -> int:
     failures = []
+    hangs = []
     for name, path, replacements, target in CASES:
         original = path.read_text(encoding="utf-8")
         mutated = apply(original, replacements)
@@ -136,7 +159,10 @@ def main() -> int:
                     timeout=180,
                 )
             except subprocess.TimeoutExpired:
-                print(f"[{name}] TIMEOUT -> RED")
+                # 挂起不是干净的 RED：说明用例失去了快速失败保护，
+                # 单独计数并以非零退出，避免掩盖“测试根本没跑完”。
+                print(f"[{name}] TIMEOUT -> HARNESS FAILURE")
+                hangs.append(name)
                 continue
             tail = [line for line in proc.stdout.strip().splitlines() if line.strip()]
             print(f"[{name}] exit={proc.returncode}")
@@ -151,7 +177,8 @@ def main() -> int:
             print(f"[{name}] restored")
 
     print("MUTATIONS THAT STAYED GREEN:", failures or "none")
-    return 1 if failures else 0
+    print("MUTATIONS THAT HUNG:", hangs or "none")
+    return 1 if failures or hangs else 0
 
 
 if __name__ == "__main__":

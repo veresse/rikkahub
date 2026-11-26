@@ -228,8 +228,18 @@ async def test_lifespan_shutdown_is_bounded(monkeypatch):
     monkeypatch.setattr(main_module, "LIFESPAN_SHUTDOWN_TIMEOUT_SECONDS", 0.1)
 
     started = time.monotonic()
-    async with main_module.app.router.lifespan_context(main_module.app):
-        pass
+
+    async def run_lifespan() -> None:
+        async with main_module.app.router.lifespan_context(main_module.app):
+            pass
+
+    try:
+        # 兜底若被删成无界，这里 3s 失败而不是让整个会话挂住。
+        await asyncio.wait_for(run_lifespan(), timeout=3.0)
+    finally:
+        # lifespan 退出会置位两个网关的停机标志；不复位会污染后续用例。
+        ws.device_gateway.open_for_connections()
+        ws.app_gateway.open_for_connections()
     elapsed = time.monotonic() - started
 
     assert elapsed < 2.0, f"lifespan 兜底未在预算内收尾：{elapsed:.2f}s"

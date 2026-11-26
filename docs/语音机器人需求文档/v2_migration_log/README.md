@@ -41,3 +41,4 @@
 | 19 | Phase 3 停机链路 | ✅ 已完成 | `CompanionServer` 在 uvicorn 关连接前下线、停机标志拒绝并发注册、offline 原因保留先到者、异常路径进锁、真 uvicorn 停机 e2e；211 passed |
 | 20 | Phase 3 停机收尾 | ✅ 已完成 | `run()` 恢复 reload 分支并拒绝多 worker、应用层停机 10s 总时限与 `force_exit`、App 侧停机门控、强化 M-1 用例；220 passed |
 | 21 | Phase 3 停机总预算 | ✅ 已完成 | 10s + 2s + 2s + 20s 四层预算、lifespan 有界兜底、中窗 `force_exit` 轮询、取消可重试与逐台 offline、真实 TCP 1011 e2e、mutation 入库；228 passed |
+| 22 | Phase 3 停机（三）：offline 补偿 | ✅ 已完成 | 取消越过 unregister 后靠 `pending_offline_reason` 补发、`_teardown()` 取消回填、offline at-least-once、测试隔离与 mutation 超时区分；231 passed |
