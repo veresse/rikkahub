@@ -77,7 +77,9 @@ if get_device_link(session.device_id) is not None:
 try:
     await self._publish_status(..., online=False, reason=reason)
 except BaseException:
-    session.pending_offline_reason = reason    # 取消：写回 + 放回集合重试
+    # 第二轮审查后加了 `is None` 守卫：不覆盖期间写入的更新原因。
+    if session.pending_offline_reason is None:
+        session.pending_offline_reason = reason  # 取消：写回 + 放回集合重试
     self._sessions.add(session)
     raise
 ```
@@ -143,7 +145,7 @@ Left contains one more item: False
 | 先清空待发原因再广播 | 防止并发 `_teardown()` 重复广播；这是 e2e 实测出来的 | 若在总线上已投递后被取消，重试会再发一次 |
 | 重试不再调用 `channel.close()` | `DeviceSession.close()` 在挂起的 `channel.close()` 前已置 `closed=True`，重试是空操作；强行重开会让 `close()` 的幂等语义失效 | 该设备看到 1012 而不是 1011（uvicorn 强制断开） |
 | `_teardown()` 取消也回填 `_sessions` | 否则 drain 超时取消会同时从集合和注册表里丢掉设备 | 兜底可能多处理一条已关闭会话（`close()` 幂等） |
-| 有待发原因但已有新链路时丢弃 | 停机标志解除后设备重连，上线事件由新链路负责 | 极端时序下可能少一条过期 offline（本来就该丢） |
+| 有待发原因但已有新链路时丢弃 | 停机标志解除后设备重连，上线事件由新链路负责 | best-effort：检查与投递之间仍可能插入新链路，旧 offline 可能晚于 online 送达 |
 | mutation 的 TIMEOUT 计为 harness failure | 挂起说明测试失去快速失败保护，不是干净的 RED | 脚本在本机无 pytest-timeout 时也能区分两类失败 |
 
 ### 接受的风险（不修）
@@ -233,9 +235,14 @@ app gateway accepts connections during shutdown
 | M-1 | 并发用例的 `gated_publish()` 只拦第一条 offline；第二条直接落库，使 “pending offline is never cleared” 变体命中 `assert count == 1` 而不是 3s 超时。`finally` 同时取消未完成的 handle task。 |
 | M-2 | 取消后的中间断言（会话在集合里、原因为 `server_shutdown`）已删除：它们取决于取消的 handle 是否已被调度，不属于契约；只保留最终态（offline 恰好一条、`pending is None`）。 |
 | M-3 | `_publish_pending_offline()` 的注释改为 best-effort，承认“检查与逐订阅者投递之间仍可能插入新链路”；取消写回改为 `if ... is None` 的防御写法。 |
-| M-4 | 日志 21 §10 补一条：§8/§9 的“最多丢失”仅指预算耗尽后的 1012 收尾，重试路径已是 at-least-once。 |
+| M-4 | 日志 21 §10 补一条：§7（及 §2.5）的“最多丢失”仅指预算耗尽后的 1012 收尾，重试路径已是 at-least-once。 |
 
 同时修正 §5 的表述：3 个新用例在旧树上是 **2 红 1 绿**，第三条锁的是本轮第一版
 实现的重复缺陷，而不是 `9ca1bdfe` 的回归（旧树实测输出见审查记录）。
 
 本轮不新增用例，数量仍为 231；`round15_shutdown.py` 仍为 14 个变体。
+
+**增量复审（`300792c3`）**：结论 Yes，仅 3 条文档/注释措辞——把 §10 里错误的
+“§8/§9”引用改为 §7（及 §2.5）；把“窗口在引入待发原因之前就存在”改为“把广播移出
+生命周期锁后才出现”；同步 §2.2 代码片段的 `is None` 守卫与 §6 的 best-effort
+限定。无代码行为变化。

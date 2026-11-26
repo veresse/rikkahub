@@ -1003,8 +1003,9 @@ class DeviceGateway:
         若期间已有新链路接管（停机标志解除后重新连接），上线事件由新链路负责，
         这条过期的 offline 应被丢弃，避免把在线设备标成离线。注意这是 best-effort：
         检查与 `bus.publish()` 的逐订阅者 `await` 之间仍可能插入新链路的
-        `_install()/_mark_ready()`，旧 offline 可能晚于 online 送达；该窗口在引入
-        待发原因之前就存在，要彻底消除需把检查与投递放进同一把生命周期锁。
+        `_install()/_mark_ready()`，旧 offline 可能晚于 online 送达。该窗口在把广播
+        移出生命周期锁后才出现（原 `_teardown()` 是锁内检查 + 锁内广播）；要彻底
+        消除需把检查与投递放进同一把生命周期锁。
         """
         reason = session.pending_offline_reason
         if reason is None:
