@@ -250,3 +250,22 @@ $ & "...\companion-venv\Scripts\python.exe" C:\Users\ctr\AppData\Local\Temp\open
 1. 提交本轮修复并推送。
 2. 派独立子智能体审查 `9f662552..HEAD`。
 3. 审查通过后进入音频 Block。
+
+## 勘误（第九轮审查后补充，详见日志 15）
+
+1. **§3.2「现在 ack 意味着链路已可用」不成立。** `_install()` 先注册、`_send_hello_ack()` 后发，
+   两者之间有 await；注册时还广播了 `online=true`。App/LLM 可以在这段窗口下发指令，而协议 §2
+   的 `session_id` 尚未到设备手里；自带模拟器会把 ack 之前的控制帧当作握手失败。日志 15 增加
+   `DeviceSession.ready` 门控，并把上线广播移到 ack 成功之后。
+2. **§3.3 的 `closing` 只改了 `send()`/`get_status()`/App 网关。** `orchestrator`、`action_tools`
+   仍用 `link is not None` 判断在线，`_handle_report()` 也仍会广播 `device.report`。日志 15 统一为
+   `device_link_is_online()`，并让 `closing` 期间只落库、不广播运行态。
+3. **§6 表格「`_install()` 先注册再回 ack」的代价被低估。** 原文写「固件需容忍」；实际模拟器不容忍，
+   属于真实回归，日志 15 已修。
+4. **`_persist_hello()` 当时仍是读-改-写**，撤销与 hello 落库交错时仍会刷新已撤销设备的
+   `last_seen_at`/固件信息。日志 15 改为条件 UPDATE，并补回归。
+5. **§3.4 / §4 的「已撤销设备不再广播运行态」应限定为「落库时已撤销的上报」。**
+   若条件 UPDATE 先提交（当时仍 active）、撤销随后提交，事件仍可能先发 `device.report` 再发
+   offline；日志 15 未强制广播前二次查库，保留该边界说明。
+6. **`reset_device_links()` 当时会清空生命周期锁**，任务运行中调用会生成「同一设备第二把锁」。
+   日志 15 改为按事件循环分表 + 弱引用回收，不再清锁。

@@ -15,6 +15,7 @@ from companion.server.app.database import AsyncSessionLocal
 from companion.server.app.models.device import DeviceModel
 from companion.server.app.services.device_gateway import DeviceGateway
 from companion.server.app.services.device_registry import (
+    device_link_is_online,
     get_device_link,
     reset_device_links,
     unregister_device_link,
@@ -101,15 +102,19 @@ class PausingSessionFactory:
     """把「上报读到 active=True」与「真正写库」之间拉开的测试钩子。
 
     - `get()` 返回后暂停（旧实现的读-改-写窗口）；
-    - `execute()` 前暂停（新实现的条件 UPDATE 之前）。
+    - `execute()` 前暂停（新实现的条件 UPDATE 之前）；
+    - `pause_on_get=N` 只在第 N 次 `get()` 返回后暂停，用于卡在
+      「`handle()` 预检之后、`_install()` 复核之前」。
 
     暂停期间真实 `DELETE /api/devices/{id}` 会提交撤销；放行后无论走哪条路径，
     都不允许把 `state` 写回 `speaking`。
     """
 
-    def __init__(self, inner=AsyncSessionLocal):
+    def __init__(self, inner=AsyncSessionLocal, pause_on_get: int | None = None):
         self._inner = inner
         self.pause_enabled = False
+        self.pause_on_get = pause_on_get
+        self.get_count = 0
         self.paused = False
         self.entered = asyncio.Event()
         self.resume = asyncio.Event()
@@ -117,8 +122,10 @@ class PausingSessionFactory:
     def __call__(self):
         return _PausingSessionCtx(self)
 
-    async def pause(self) -> None:
-        if not self.pause_enabled or self.paused:
+    async def pause(self, force: bool = False) -> None:
+        if self.paused:
+            return
+        if not force and not self.pause_enabled:
             return
         self.paused = True
         self.entered.set()
@@ -149,7 +156,11 @@ class _PausingSession:
 
     async def get(self, *args, **kwargs):
         device = await self._session.get(*args, **kwargs)
-        await self._factory.pause()
+        self._factory.get_count += 1
+        if self._factory.pause_on_get == self._factory.get_count:
+            await self._factory.pause(force=True)
+        else:
+            await self._factory.pause()
         return device
 
     async def execute(self, *args, **kwargs):
@@ -243,6 +254,25 @@ async def _stop(task: asyncio.Task, channel: FakeChannel) -> None:
     await asyncio.wait_for(task, timeout=2.0)
 
 
+def test_device_link_is_online_requires_ready_and_not_closing():
+    """LLM/事件/App 共用同一个在线判定：握手完成且未进入收尾。"""
+
+    class Link:
+        pass
+
+    link = Link()
+    assert device_link_is_online(None) is False
+    assert device_link_is_online(link) is True
+    link.ready = False
+    assert device_link_is_online(link) is False
+    link.ready = True
+    link.closing = True
+    assert device_link_is_online(link) is False
+    link.closing = False
+    link.closed = True
+    assert device_link_is_online(link) is False
+
+
 async def test_hello_v2_registers_link_and_ack_contains_server_state(seeded_device):
     harness = Harness()
     task, channel, ack = await harness.connected()
@@ -332,6 +362,56 @@ async def test_first_message_not_hello_closes_4408(seeded_device):
 
     await asyncio.wait_for(task, timeout=2.0)
     assert channel.closed == (4408, "invalid_hello")
+
+
+class SlowAckChannel(FakeChannel):
+    """hello_ack 的发送被阻塞，制造「链路已注册、ack 尚未发出」的窗口。"""
+
+    def __init__(self):
+        super().__init__()
+        self.ack_started = asyncio.Event()
+        self.ack_release = asyncio.Event()
+
+    async def send_json(self, payload: dict) -> None:
+        if payload.get("type") == "hello_ack":
+            self.ack_started.set()
+            await self.ack_release.wait()
+        await super().send_json(payload)
+
+
+async def test_link_is_not_controllable_before_hello_ack(seeded_device):
+    """ack 之前链路虽已注册，但既不能下发也不能对外显示在线。
+
+    协议 §2 的 session_id 在 hello_ack 里，设备（含自带模拟器）会把 ack 之前的
+    控制帧当成握手失败；因此注册必须早于 ack（撤销路由才查得到链路），但
+    `ready=False` 期间一律拒绝下发，上线事件也只在 ack 之后广播。
+    """
+    harness = Harness()
+    channel = SlowAckChannel()
+    task = await harness.start(channel)
+    channel.push(hello())
+    await asyncio.wait_for(channel.ack_started.wait(), timeout=3.0)
+
+    link = get_device_link(DEVICE_ID)
+    assert link is not None
+    assert link.ready is False
+    assert (await link.get_status())["online"] is False
+    rejected = await link.send({"type": "idle.set", "enabled": False})
+    assert (rejected.status, rejected.detail) == ("failed", "device_offline")
+    assert not [m for m in channel.sent if m.get("type") == "idle.set"]
+    assert not [e for e in harness.events if e.get("type") == "device.status"]
+
+    channel.ack_release.set()
+    await channel.wait_sent(lambda m: m.get("type") == "hello_ack")
+    await wait_until(lambda: getattr(link, "ready", False))
+    assert (await link.get_status())["online"] is True
+    await wait_until(
+        lambda: any(
+            e.get("type") == "device.status" and e.get("online") is True
+            for e in harness.events
+        )
+    )
+    await _stop(task, channel)
 
 
 async def test_action_result_resolves_pending_command(seeded_device):
@@ -774,6 +854,84 @@ async def test_revoke_during_hello_wait_blocks_late_registration(
     ), harness.events
 
 
+async def test_revoke_after_precheck_is_caught_by_install_lock(
+    seeded_device, client, auth_headers
+):
+    """撤销发生在 `handle()` 预检之后：权威判定在 `_install()` 锁内，仍须拒绝。
+
+    `test_revoke_during_hello_wait...` 的时序是撤销先完成、hello 后到，预检
+    本身就能拦住，覆盖不到锁内复核。这里用 `pause_on_get=2` 卡在预检的
+    `get()` 返回之后（此时设备仍是 active 快照），再提交真实撤销：预检读取的是
+    撤销前的旧对象而放行，只有 `_install()` 在生命周期锁内重新查库才能挡住。
+    """
+
+    factory = PausingSessionFactory(pause_on_get=2)
+    harness = Harness(session_factory=factory)
+    channel = FakeChannel()
+    task = await harness.start(channel)
+    channel.push(hello())
+
+    await asyncio.wait_for(factory.entered.wait(), timeout=3.0)
+    # 预检已经取到 active=True 的快照但还没判断；撤销在此提交。
+    resp = await client.delete(f"/api/devices/{DEVICE_ID}", headers=auth_headers)
+    assert resp.status_code == 200, resp.text
+    assert get_device_link(DEVICE_ID) is None
+    factory.resume.set()
+
+    await wait_until(
+        lambda: task.done()
+        or channel.closed is not None
+        or get_device_link(DEVICE_ID) is not None
+    )
+    assert get_device_link(DEVICE_ID) is None, "锁内复核必须阻止撤销后的注册"
+    assert channel.closed == (4401, "device_revoked")
+    assert not [m for m in channel.sent if m.get("type") == "hello_ack"]
+    await asyncio.wait_for(task, timeout=2.0)
+    assert any(
+        event.get("type") == "device.status"
+        and event.get("online") is False
+        and event.get("reason") == "device_revoked"
+        for event in harness.events
+    ), harness.events
+
+
+async def test_persist_hello_does_not_refresh_revoked_device(seeded_device):
+    """hello 落库与撤销交错时，不得把固件/最后在线时间写到已撤销设备。
+
+    旧实现「读 ORM → 判断 is_active → commit」在读取之后、提交之前被撤销插入时，
+    读到的仍是 `is_active=True`，于是已撤销设备的元数据被刷新。改成带
+    `is_active` 条件的 UPDATE 后由数据库判定。
+    """
+    factory = PausingSessionFactory()
+    gateway = DeviceGateway(EventBus(), session_factory=factory)
+    factory.pause_enabled = True
+    task = asyncio.create_task(
+        gateway._persist_hello(
+            DEVICE_ID,
+            {"firmware_version": "9.9.9"},
+            protocol_version=2,
+            capabilities=["action", "volume"],
+        )
+    )
+    await asyncio.wait_for(factory.entered.wait(), timeout=3.0)
+
+    async with AsyncSessionLocal() as db:
+        device = await db.get(DeviceModel, DEVICE_ID)
+        device.is_active = False
+        device.state = "revoked"
+        await db.commit()
+
+    factory.resume.set()
+    await asyncio.wait_for(task, timeout=3.0)
+
+    async with AsyncSessionLocal() as db:
+        device = await db.get(DeviceModel, DEVICE_ID)
+        assert device.firmware_version == ""
+        assert device.capabilities_json == ["action"]
+        assert device.last_seen_at is None
+        assert device.state == "revoked"
+
+
 async def test_send_failure_keeps_flushing_later_reports(seeded_device):
     """传输层写失败只停止下发，不能让随后 flush 的上报被丢弃。"""
     harness = Harness()
@@ -795,12 +953,13 @@ async def test_send_failure_keeps_flushing_later_reports(seeded_device):
 
     channel.fail = False
     channel.push({"v": 2, "type": "device.report", "volume": 43})
-    await wait_until(
-        lambda: any(
-            e.get("type") == "device.report" and e.get("volume") == 43
-            for e in harness.events
-        )
-    )
+
+    async def persisted() -> bool:
+        async with AsyncSessionLocal() as db:
+            device = await db.get(DeviceModel, DEVICE_ID)
+            return device is not None and device.volume == 43
+
+    await wait_until_async(persisted)
 
     await _stop(task, channel)
 
@@ -808,6 +967,9 @@ async def test_send_failure_keeps_flushing_later_reports(seeded_device):
         device = await db.get(DeviceModel, DEVICE_ID)
         assert device.volume == 43
         assert device.last_report_json["volume"] == 43
+    # closing 期间对外按离线处理：上报照常落库，但不再广播运行态，
+    # 否则事件流会和 get_status/remote 的 device_offline 矛盾。
+    assert not [e for e in harness.events if e.get("type") == "device.report"]
 
 
 class SlowStopChannel(FakeChannel):

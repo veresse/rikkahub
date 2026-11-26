@@ -191,4 +191,3 @@ RESTORED
    `HUNG: pytest did not finish in 8s`）。日志 14 已改成有上界的 `wait_until()`。
 4. **§3.2 的复现输出在修复后仍会出现 `ack ok=true`**，只是不再有 `action.play` 帧；要让 App
    在撤销窗口直接拿到 `device_offline`，还需要 App 网关检查 `closing`（日志 14 §3.3）。
-

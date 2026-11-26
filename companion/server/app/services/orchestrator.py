@@ -19,6 +19,7 @@ from companion.server.app.services.action_tools import (
 )
 from companion.server.app.services.deepseek_client import DeepSeekClient
 from companion.server.app.services.device_registry import (
+    device_link_is_online,
     get_device_link,
     resolve_device_for_conversation,
 )
@@ -199,7 +200,7 @@ class ChatOrchestrator:
             device = await resolve_device_for_conversation(db, conversation_id)
             link = get_device_link(device.id) if device is not None else None
             inject_tools, inject_reason = robot_tool_injection(
-                assistant, device, online=link is not None
+                assistant, device, online=device_link_is_online(link)
             )
             robot_tools = build_robot_tools() if inject_tools else None
             if not inject_tools and bool(getattr(assistant, "enable_action_sync", False)):

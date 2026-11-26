@@ -276,8 +276,15 @@ class AppGateway:
 
         # closing 期间链路已在冲刷最后一条上报（撤销 / 替换 / 写失败），
         # 指令不会再被下发；直接回 device_offline，避免 App 拿到 ok=true
-        # 之后再收到 failed/device_offline 的终态。
+        # 之后再收到 failed/device_offline 的终态。急停例外：仍要让调度器
+        # 终止本地在途/排队动作，否则任务要等超时才结算。
         if getattr(link, "closing", False):
+            if message_type == "remote.action.stop":
+                try:
+                    scheduler = get_device_scheduler(device_id, link)
+                    await scheduler.stop(message.get("reason", "user_stop"))
+                except Exception:
+                    logger.exception("closing stop failed: %s", device_id)
             await session.send_json(_ack(request_id, False, "device_offline"))
             return
 

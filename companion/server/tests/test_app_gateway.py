@@ -485,6 +485,39 @@ async def test_closing_link_is_offline_without_dispatching_commands():
     await _stop(task, channel)
 
 
+async def test_closing_link_still_settles_local_stop(monkeypatch):
+    """closing 拒绝下发，但急停仍要让调度器终止本地的在途/排队动作。"""
+
+    class ClosingLink(FakeLink):
+        closing = True
+
+    link = ClosingLink()
+    register_device_link(DEVICE_ID, link)
+    calls: list[str] = []
+
+    class FakeScheduler:
+        async def stop(self, reason):
+            calls.append(reason)
+            return ActionResult(status="failed", detail="device_offline")
+
+    monkeypatch.setattr(
+        "companion.server.app.services.app_gateway.get_device_scheduler",
+        lambda device_id, link: FakeScheduler(),
+    )
+    harness = Harness()
+    task, channel = await harness.connect()
+
+    ack = await harness.remote(
+        channel, {"type": "remote.action.stop", "reason": "user_stop"}
+    )
+    assert ack["ok"] is False
+    assert ack["error"] == "device_offline"
+    assert calls == ["user_stop"]
+    assert link.commands == []
+
+    await _stop(task, channel)
+
+
 async def test_connection_attaching_after_revoke_is_closed():
     harness = Harness()
     await harness.gateway.revoke(TOKEN_ID)

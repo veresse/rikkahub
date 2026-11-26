@@ -7,6 +7,7 @@ Block C 只定义协议与内存实现；Block D 的 `DeviceGateway` 在设备�
 from __future__ import annotations
 
 import asyncio
+import weakref
 from dataclasses import dataclass
 from typing import Any, Protocol
 
@@ -34,14 +35,25 @@ _LINKS: dict[str, DeviceLink] = {}
 # 撤销路由（查链路 + 关闭）必须互斥。否则撤销恰好发生在「已鉴权、还没 hello」
 # 的窗口时，路由查不到链路就直接返回，随后该连接在撤销后重新注册并可控。
 # 锁放在注册表而不是网关实例上，保证同进程内多个网关/路由看到同一把锁。
-_LIFECYCLE_LOCKS: dict[str, asyncio.Lock] = {}
+#
+# 按事件循环分表：锁只在同一条循环内的任务之间互斥，而测试（以及将来的多循环
+# 场景）会在不同循环里复用同一批 device_id。`asyncio.Lock` 被竞争后会绑定到
+# 首次使用的循环，跨循环复用会抛 RuntimeError；用弱引用键让循环结束后整表回收。
+_LIFECYCLE_LOCKS: "weakref.WeakKeyDictionary[Any, dict[str, asyncio.Lock]]" = (
+    weakref.WeakKeyDictionary()
+)
 
 
 def device_lifecycle_lock(device_id: str) -> asyncio.Lock:
-    lock = _LIFECYCLE_LOCKS.get(device_id)
+    loop = asyncio.get_running_loop()
+    locks = _LIFECYCLE_LOCKS.get(loop)
+    if locks is None:
+        locks = {}
+        _LIFECYCLE_LOCKS[loop] = locks
+    lock = locks.get(device_id)
     if lock is None:
         lock = asyncio.Lock()
-        _LIFECYCLE_LOCKS[device_id] = lock
+        locks[device_id] = lock
     return lock
 
 
@@ -65,12 +77,29 @@ def get_device_link(device_id: str) -> DeviceLink | None:
 
 
 def is_device_online(device_id: str) -> bool:
-    return device_id in _LINKS
+    return device_link_is_online(get_device_link(device_id))
+
+
+def device_link_is_online(link: DeviceLink | None) -> bool:
+    """链路是否可下发。
+
+    与 `DeviceSession.send()` 保持一致：必须存在、已完成握手（`ready`）且
+    没有在收尾（`closing`/`closed`）。旧实现只看「注册表里有这个 id」，
+    于是 hello_ack 之前、以及写失败后的收尾阶段都会被当成「在线但不可控」：
+    LLM 仍会注入 `robot.*` 工具，每次调用都返回 `device_offline`。
+    """
+    return (
+        link is not None
+        and getattr(link, "ready", True)
+        and not getattr(link, "closing", False)
+        and not getattr(link, "closed", False)
+    )
 
 
 def reset_device_links() -> None:
+    # 只清链路；生命周期锁按循环分表并由弱引用回收，不能在任务仍持有旧锁时丢弃，
+    # 否则会为同一设备生成第二把锁、破坏撤销与安装的互斥。
     _LINKS.clear()
-    _LIFECYCLE_LOCKS.clear()
 
 
 async def resolve_device_for_conversation(db: AsyncSession, conversation_id: str):

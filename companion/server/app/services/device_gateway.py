@@ -112,6 +112,10 @@ class DeviceSession:
         # closing 表示「已开始冲刷最后一条上报」（撤销 / 替换 / 下线）：
         # 链路不再接受新指令，但仍允许上报落库；closed 表示冲刷已完成。
         self.closing = False
+        # ready 表示 hello_ack 已发出。链路会比 ack 更早进入注册表，但协议 §2
+        # 的 session_id 就在 ack 里，设备（含自带模拟器）会把 ack 之前的控制帧
+        # 当成握手失败；因此 ack 之前一律拒绝下发。
+        self.ready = False
 
         self._report = self._initial_report(device)
         self._pending: dict[str, asyncio.Future[ActionResult]] = {}
@@ -156,7 +160,8 @@ class DeviceSession:
     async def send(self, command: dict[str, Any]) -> ActionResult:
         # closing 期间会话仍是 current link（正在冲刷最后一条上报），但不能再
         # 下发指令：撤销窗口内让命令命中已撤销设备是协议外的行为。
-        if self.closing or self.closed:
+        # ready 之前（hello_ack 未发出）同理：设备还没拿到 session_id。
+        if not self.ready or self.closing or self.closed:
             return ActionResult(status="failed", detail="device_offline")
         if self.protocol_version < 2:
             # v1 只走音频通道，不允许任何 v2 控制消息。
@@ -204,8 +209,8 @@ class DeviceSession:
             **self._report,
             "device_id": self.device_id,
             # closing 表示链路已不可写（撤销/替换/写失败）：对 App 与 LLM 都
-            # 按离线处理，避免「显示在线但所有指令都失败」。
-            "online": not (self.closed or self.closing),
+            # 按离线处理，避免「显示在线但所有指令都失败」。ready 之前同理。
+            "online": self.ready and not (self.closed or self.closing),
         }
 
     def public_report(self) -> dict[str, Any]:
@@ -482,11 +487,12 @@ class DeviceGateway:
                 capabilities=capabilities,
             )
             await self._persist_hello(device_id, hello, protocol_version, capabilities)
-            # 先注册再回 hello_ack：ack 是对设备的「可以开始工作」承诺，
-            # App 收到上线事件后可能立刻发指令，此时链路必须已经可用。
             if not await self._install(session):
                 return
+            # 注册早于 ack，但 ack 之前链路一律不可下发（见 DeviceSession.ready）；
+            # 只有 ack 真正发出后才广播上线并允许控制。
             await self._send_hello_ack(session, hello)
+            await self._mark_ready(session)
             await self._read_loop(session)
         except asyncio.CancelledError:
             raise
@@ -650,6 +656,11 @@ class DeviceGateway:
             # 连接重新注册并可控。
             if not await self._device_is_active(session.device_id):
                 await session.close(4401, "device_revoked")
+                # 与 `handle()` 预检路径保持一致：撤销导致的握手失败同样广播
+                # offline（reason 不是 handshake_failed），失败后不会重复发。
+                await self._publish_status(
+                    session.device_id, online=False, reason="device_revoked"
+                )
                 return False
             old = get_device_link(session.device_id)
             # 替换前先在旧链路仍是 current 时冲刷上报 writer：
@@ -662,10 +673,16 @@ class DeviceGateway:
             session.start_writer(self._handle_report)
             if isinstance(old, DeviceSession) and old is not session:
                 await old.close(4409, "replaced")
-            # 关闭旧连接期间可能有更新的连接插入；只在仍是当前 link 时广播上线。
-            if get_device_link(session.device_id) is session:
-                await self._publish_status(session.device_id, online=True)
             return True
+
+    async def _mark_ready(self, session: DeviceSession) -> None:
+        """hello_ack 发出后把会话标记为可下发，并在仍是当前链路时广播上线。"""
+        async with device_lifecycle_lock(session.device_id):
+            if get_device_link(session.device_id) is not session:
+                # 期间被更新的连接替换：上线事件由新连接负责，避免认领错链路。
+                return
+            session.ready = True
+            await self._publish_status(session.device_id, online=True)
 
     async def _teardown(self, session: DeviceSession) -> None:
         async with device_lifecycle_lock(session.device_id):
@@ -778,6 +795,7 @@ class DeviceGateway:
 
     async def _handle_report(self, session: DeviceSession, report: dict[str, Any]) -> None:
         """合并队列的消费者：应用上报、落库、广播协议 §5.2 形状。"""
+        # 落库不能因 closing 跳过：close() 正靠这条路径冲刷最后一条上报。
         if session.closed or get_device_link(session.device_id) is not session:
             return
         internal = session.apply_report(report)
@@ -786,7 +804,12 @@ class DeviceGateway:
             # 已撤销设备不再广播运行态：否则 App 会先收到 state=speaking，
             # 再收到 device.status online=false，短暂把 revoked 显示为在线。
             return
-        if session.closed or get_device_link(session.device_id) is not session:
+        # closing 时只落库不广播：链路正在下线/替换，事件流不应再把它展示成在线。
+        if (
+            session.closed
+            or session.closing
+            or get_device_link(session.device_id) is not session
+        ):
             return
         await self.bus.publish(
             {
@@ -810,18 +833,29 @@ class DeviceGateway:
         protocol_version: int,
         capabilities: list[str],
     ) -> None:
+        """记录固件信息与最后在线时间。
+
+        与上报一样用带 `is_active` 条件的 UPDATE：读-改-写会把撤销提交前读到
+        的旧 `is_active=True` 当作依据，随后仍刷新已撤销设备的固件/`last_seen_at`。
+        """
+        values: dict[str, Any] = {
+            "protocol_version": protocol_version,
+            "capabilities_json": capabilities,
+            "last_seen_at": now_ms(),
+        }
+        firmware = hello.get("firmware_version")
+        if isinstance(firmware, str):
+            values["firmware_version"] = firmware[:32]
         try:
             async with self._session_factory() as db:
-                device = await db.get(DeviceModel, device_id)
-                if device is None or not device.is_active:
-                    # 已撤销设备不再刷新固件/最后在线时间；连接马上会被 4401 关闭。
-                    return
-                firmware = hello.get("firmware_version")
-                if isinstance(firmware, str):
-                    device.firmware_version = firmware[:32]
-                device.protocol_version = protocol_version
-                device.capabilities_json = capabilities
-                device.last_seen_at = now_ms()
+                await db.execute(
+                    update(DeviceModel)
+                    .where(
+                        DeviceModel.id == device_id,
+                        DeviceModel.is_active.is_(True),
+                    )
+                    .values(**values)
+                )
                 await db.commit()
         except Exception:
             logger.exception("persist hello failed: %s", device_id)

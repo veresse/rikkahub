@@ -258,7 +258,10 @@
 ```
 
 - `reason` ∈ `{"user_stop","barge_in","server_cancel"}`。
-- **最高优先级**：清空该设备待执行动作队列；10ms 内打断当前插值；平滑回中；停 PWM；回 `action.result(status="failed", detail="stopped")`（若当时有动作）。
+- **最高优先级**：清空该设备待执行动作队列；10ms 内打断当前插值；平滑回中；停 PWM。
+- `action.stop` 自身**不带 `action_id`**：服务端不等待它的回执，发出后立即把本地该设备的
+  在途动作结算为 `failed/stopped`。设备若按被打断动作的**原 `action_id`** 回
+  `action.result(status="failed", detail="stopped")` 也合法，但服务端已结算，迟到回执会被丢弃。
 
 ### 4.7 校准消息
 
