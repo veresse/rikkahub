@@ -462,6 +462,29 @@ async def test_v1_link_rejects_remote_control():
     await _stop(task, channel)
 
 
+async def test_closing_link_is_offline_without_dispatching_commands():
+    """closing（撤销/替换/写失败）期间链路仍在注册表，但不能再下发指令。"""
+
+    class ClosingLink(FakeLink):
+        closing = True
+
+    link = ClosingLink()
+    register_device_link(DEVICE_ID, link)
+    harness = Harness()
+    task, channel = await harness.connect()
+
+    for payload in (
+        {"type": "remote.action.play", "name": "nod"},
+        {"type": "remote.get_status"},
+    ):
+        ack = await harness.remote(channel, dict(payload))
+        assert ack["ok"] is False
+        assert ack["error"] == "device_offline"
+    assert link.commands == []
+
+    await _stop(task, channel)
+
+
 async def test_connection_attaching_after_revoke_is_closed():
     harness = Harness()
     await harness.gateway.revoke(TOKEN_ID)

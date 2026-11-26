@@ -653,8 +653,8 @@ async def test_device_simulator_cli_stays_connected(e2e):
         text=True,
     )
     try:
-        # 超过旧实现的 5s 默认超时；仍在运行说明 CLI 没有自行退出。
-        await asyncio.sleep(6.0)
+        # 旧实现默认 5s 后自行退出；留 2s 余量，避免慢 CI 上假绿。
+        await asyncio.sleep(7.0)
         assert proc.poll() is None, proc.stderr.read() if proc.stderr else ""
 
         # 不仅活着，还必须真的握上手、能接收指令。
@@ -824,7 +824,7 @@ async def test_logs_do_not_leak_tokens_or_passwords(e2e, caplog, monkeypatch):
 
     # 第三方库在 DEBUG 会打印自己收发的请求头（含 Authorization），属于
     # 库日志而非本项目日志；用 monkeypatch 改级别（用例结束后自动恢复），
-    # 不按 logger 名前缀过滤 record，避免顺带放过本项目的服务端日志。
+    # 下面的断言仍按 logger 名过滤掉这些库记录。
     for library in ("httpx", "httpcore", "websockets"):
         monkeypatch.setattr(
             logging.getLogger(library), "level", logging.WARNING

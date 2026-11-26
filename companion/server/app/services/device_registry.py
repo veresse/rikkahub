@@ -6,6 +6,7 @@ Block C 只定义协议与内存实现；Block D 的 `DeviceGateway` 在设备�
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass
 from typing import Any, Protocol
 
@@ -29,6 +30,19 @@ class DeviceLink(Protocol):
 
 
 _LINKS: dict[str, DeviceLink] = {}
+# 每设备生命周期锁：`DeviceGateway._install()`（复核活跃状态 + 注册链路）与
+# 撤销路由（查链路 + 关闭）必须互斥。否则撤销恰好发生在「已鉴权、还没 hello」
+# 的窗口时，路由查不到链路就直接返回，随后该连接在撤销后重新注册并可控。
+# 锁放在注册表而不是网关实例上，保证同进程内多个网关/路由看到同一把锁。
+_LIFECYCLE_LOCKS: dict[str, asyncio.Lock] = {}
+
+
+def device_lifecycle_lock(device_id: str) -> asyncio.Lock:
+    lock = _LIFECYCLE_LOCKS.get(device_id)
+    if lock is None:
+        lock = asyncio.Lock()
+        _LIFECYCLE_LOCKS[device_id] = lock
+    return lock
 
 
 def register_device_link(device_id: str, link: DeviceLink) -> None:
@@ -56,6 +70,7 @@ def is_device_online(device_id: str) -> bool:
 
 def reset_device_links() -> None:
     _LINKS.clear()
+    _LIFECYCLE_LOCKS.clear()
 
 
 async def resolve_device_for_conversation(db: AsyncSession, conversation_id: str):

@@ -87,6 +87,76 @@ async def wait_until(predicate, timeout: float = 2.0):
     return await asyncio.wait_for(_poll(), timeout)
 
 
+async def wait_until_async(predicate, timeout: float = 5.0):
+    async def _poll():
+        while True:
+            if await predicate():
+                return True
+            await asyncio.sleep(0.01)
+
+    return await asyncio.wait_for(_poll(), timeout)
+
+
+class PausingSessionFactory:
+    """把「上报读到 active=True」与「真正写库」之间拉开的测试钩子。
+
+    - `get()` 返回后暂停（旧实现的读-改-写窗口）；
+    - `execute()` 前暂停（新实现的条件 UPDATE 之前）。
+
+    暂停期间真实 `DELETE /api/devices/{id}` 会提交撤销；放行后无论走哪条路径，
+    都不允许把 `state` 写回 `speaking`。
+    """
+
+    def __init__(self, inner=AsyncSessionLocal):
+        self._inner = inner
+        self.pause_enabled = False
+        self.paused = False
+        self.entered = asyncio.Event()
+        self.resume = asyncio.Event()
+
+    def __call__(self):
+        return _PausingSessionCtx(self)
+
+    async def pause(self) -> None:
+        if not self.pause_enabled or self.paused:
+            return
+        self.paused = True
+        self.entered.set()
+        await self.resume.wait()
+
+
+class _PausingSessionCtx:
+    def __init__(self, factory: PausingSessionFactory):
+        self._factory = factory
+        self._session = None
+
+    async def __aenter__(self):
+        self._session = self._factory._inner()
+        await self._session.__aenter__()
+        return _PausingSession(self._factory, self._session)
+
+    async def __aexit__(self, *exc_info):
+        return await self._session.__aexit__(*exc_info)
+
+
+class _PausingSession:
+    def __init__(self, factory: PausingSessionFactory, session):
+        self._factory = factory
+        self._session = session
+
+    def __getattr__(self, name):
+        return getattr(self._session, name)
+
+    async def get(self, *args, **kwargs):
+        device = await self._session.get(*args, **kwargs)
+        await self._factory.pause()
+        return device
+
+    async def execute(self, *args, **kwargs):
+        await self._factory.pause()
+        return await self._session.execute(*args, **kwargs)
+
+
 async def wait_status(link, key: str, value, timeout: float = 2.0) -> dict:
     async def _poll():
         while True:
@@ -147,7 +217,7 @@ def _clean_registry():
 
 
 class Harness:
-    def __init__(self):
+    def __init__(self, session_factory=AsyncSessionLocal):
         self.bus = EventBus()
         self.events: list[dict] = []
 
@@ -155,7 +225,7 @@ class Harness:
             self.events.append(event)
 
         self.bus.subscribe(collect)
-        self.gateway = DeviceGateway(self.bus)
+        self.gateway = DeviceGateway(self.bus, session_factory=session_factory)
 
     async def start(self, channel: FakeChannel) -> asyncio.Task:
         return asyncio.create_task(self.gateway.handle(DEVICE_ID, channel))
@@ -571,19 +641,22 @@ async def test_close_rejects_commands_while_flushing(seeded_device):
 
     close_task = asyncio.create_task(session.close(4401, "device_revoked"))
     try:
-        # 等 close() 真正进入 flush；旧实现没有 closing 标记且会直接返回，
-        # 用 `getattr` + `close_task.done()` 让它在旧代码上快速失败而不是挂起。
-        while not close_task.done() and not getattr(session, "closing", False):
-            await asyncio.sleep(0.01)
+        # 旧实现没有 closing 标记、close() 可能在冲刷完成前直接返回；用有上界
+        # 的等待把回归暴露成失败而不是让 pytest 挂死。
+        await wait_until(
+            lambda: getattr(session, "closing", False) or close_task.done()
+        )
         assert not close_task.done(), "close() 不得在冲刷完成前返回"
 
-        # 冲刷期间会话仍是 current link，但指令必须被拒绝（有上界，避免回归时挂死）。
+        # 冲刷期间会话仍是 current link，但指令必须被拒绝。
         result = await asyncio.wait_for(
             session.send({"type": "idle.set", "enabled": False}), timeout=2.0
         )
         assert result.status == "failed"
         assert result.detail == "device_offline"
         assert not [m for m in channel.sent if m.get("type") == "idle.set"]
+        # closing 期间对外一律视为离线，避免「在线但指令全失败」。
+        assert (await session.get_status())["online"] is False
     finally:
         release.set()
         await asyncio.wait_for(close_task, timeout=5.0)
@@ -625,6 +698,82 @@ async def test_revoke_keeps_revoked_state_and_persists_last_report(
         assert device.volume == 65
 
 
+async def test_revoke_while_report_write_in_flight_keeps_revoked_state(
+    seeded_device, client, auth_headers
+):
+    """撤销与上报落库交错时，条件更新不得把 state 写回 speaking。
+
+    旧实现「读 ORM → 改字段 → commit」在读取与提交之间被撤销插入时，会把
+    `state="revoked"` 覆盖成上报里的 speaking；`close()` 等待冲刷也救不了，
+    因为冲刷本身就在撤销提交之后写库。
+    """
+    factory = PausingSessionFactory()
+    harness = Harness(session_factory=factory)
+    task, channel, _ = await harness.connected()
+    session = get_device_link(DEVICE_ID)
+    assert session is not None
+
+    factory.pause_enabled = True
+    channel.push({"v": 2, "type": "device.report", "volume": 77, "state": "speaking"})
+    await asyncio.wait_for(factory.entered.wait(), timeout=3.0)
+
+    # 撤销路由会等冲刷完成才返回，所以放后台；这里只等撤销事务真正提交
+    # （直接读库），制造「写库晚于撤销提交」的真实交错。
+    revoke_task = asyncio.create_task(
+        client.delete(f"/api/devices/{DEVICE_ID}", headers=auth_headers)
+    )
+
+    async def revoked() -> bool:
+        async with AsyncSessionLocal() as db:
+            device = await db.get(DeviceModel, DEVICE_ID)
+            return device is not None and device.is_active is False
+
+    await wait_until_async(revoked)
+    factory.resume.set()
+
+    resp = await asyncio.wait_for(revoke_task, timeout=5.0)
+    assert resp.status_code == 200, resp.text
+    await asyncio.wait_for(task, timeout=2.0)
+
+    async with AsyncSessionLocal() as db:
+        device = await db.get(DeviceModel, DEVICE_ID)
+        assert device.is_active is False
+        assert device.state == "revoked"
+        assert device.volume == 65
+        # 上报内容仍以快照形式保留，说明它确实写到了库。
+        assert device.last_report_json["volume"] == 77
+
+
+async def test_revoke_during_hello_wait_blocks_late_registration(
+    seeded_device, client, auth_headers
+):
+    """鉴权通过但还没 hello 时被撤销：连接不得在撤销后重新上线。"""
+    harness = Harness()
+    channel = FakeChannel()
+    # `ws_auth` 已在真实路由里完成，此处只模拟「已鉴权、还没发 hello」。
+    task = await harness.start(channel)
+
+    resp = await client.delete(f"/api/devices/{DEVICE_ID}", headers=auth_headers)
+    assert resp.status_code == 200, resp.text
+    assert get_device_link(DEVICE_ID) is None
+
+    channel.push(hello())
+    await wait_until(
+        lambda: channel.closed is not None or get_device_link(DEVICE_ID) is not None
+    )
+
+    assert get_device_link(DEVICE_ID) is None, "撤销后不得重新注册链路"
+    assert channel.closed == (4401, "device_revoked")
+    assert not [m for m in channel.sent if m.get("type") == "hello_ack"]
+    await asyncio.wait_for(task, timeout=2.0)
+    assert any(
+        event.get("type") == "device.status"
+        and event.get("online") is False
+        and event.get("reason") == "device_revoked"
+        for event in harness.events
+    ), harness.events
+
+
 async def test_send_failure_keeps_flushing_later_reports(seeded_device):
     """传输层写失败只停止下发，不能让随后 flush 的上报被丢弃。"""
     harness = Harness()
@@ -641,6 +790,8 @@ async def test_send_failure_keeps_flushing_later_reports(seeded_device):
     assert result.detail == "device_offline"
     assert session.closing is True
     assert session.closed is False
+    # 写失败后链路不可控：对外视为离线，但仍允许已入队上报冲刷。
+    assert (await session.get_status())["online"] is False
 
     channel.fail = False
     channel.push({"v": 2, "type": "device.report", "volume": 43})

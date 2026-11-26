@@ -24,7 +24,10 @@ from companion.server.app.models.pairing_code import PairingCodeModel
 from companion.server.app.security.dependencies import AuthContext, require_app_token
 from companion.server.app.security.rate_limit import clear, is_limited, record
 from companion.server.app.security.tokens import generate_token, hash_token
-from companion.server.app.services.device_registry import get_device_link
+from companion.server.app.services.device_registry import (
+    device_lifecycle_lock,
+    get_device_link,
+)
 from companion.shared.catalog import get_catalog
 
 router = APIRouter(prefix="/devices", tags=["devices"])
@@ -220,11 +223,15 @@ async def revoke_device(
         device.state = "revoked"
 
     # 已建立的 `/device/ws` 连接不会周期性复验 Token，撤销时必须主动断开。
-    link = get_device_link(device_id)
-    close = getattr(link, "close", None)
-    if close is not None:
-        try:
-            await close(4401, "device_revoked")
-        except Exception:
-            pass
+    # 「查链路 + 关闭」与 `DeviceGateway._install()` 的「复核活跃 + 注册」共用
+    # 每设备生命周期锁：撤销可能恰好落在「已鉴权、还在等 hello」的窗口，
+    # 此时查不到链路；不加锁的话该连接会在撤销后重新注册并仍可被控制。
+    async with device_lifecycle_lock(device_id):
+        link = get_device_link(device_id)
+        close = getattr(link, "close", None)
+        if close is not None:
+            try:
+                await close(4401, "device_revoked")
+            except Exception:
+                pass
     return {"status": "revoked"}

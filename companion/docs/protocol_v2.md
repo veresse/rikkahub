@@ -164,7 +164,8 @@
 ## 4. 下行控制消息（服务端 → 设备）
 
 所有控制消息都带 `action_id`（服务端生成的 UUID）用于 `action.result` 关联；例外是
-§4.4 `expression.set` 与 §4.7 `servo.calibrate_preview`（fire-and-forget，各自章节有说明）。
+§4.4 `expression.set`、§4.7 `servo.calibrate_preview`（fire-and-forget，各自章节有说明）
+与 §4.6 `action.stop`（最高优先级、不带 `action_id`、不等待回执）。
 
 ### 4.1 `action.play`
 

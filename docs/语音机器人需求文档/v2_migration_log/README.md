@@ -33,3 +33,4 @@
 | 11 | Phase 3：双模拟器与真实 WebSocket 端到端验收 | ✅ 已完成 | `device_simulator` / `app_simulator`、13 例真实 uvicorn/WS 矩阵、修复新建会话嵌套事务；181 passed |
 | 12 | Phase 3 审查修复 | ✅ 已完成 | 撤销/替换前冲刷上报、`stop_writer()` 串行化、模拟器 CLI 常驻与真机断连语义、LWW/限速/日志用例改成有效断言；186 passed |
 | 13 | Phase 3 二次审查修复 | ✅ 已完成 | 撤销窗口 `closing` 门控、已停用设备不回写运行态、写失败不再毒化冲刷、CLI 失败退出码、文档矛盾；190 passed |
+| 14 | Phase 3 三次审查修复 | ✅ 已完成 | 撤销与在途落库/迟到 hello 的竞态、`closing` 对外视为离线、已撤销设备不再广播运行态、回归用例有界失败；193 passed |

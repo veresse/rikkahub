@@ -274,6 +274,13 @@ class AppGateway:
             await session.send_json(_ack(request_id, False, "device_offline"))
             return
 
+        # closing 期间链路已在冲刷最后一条上报（撤销 / 替换 / 写失败），
+        # 指令不会再被下发；直接回 device_offline，避免 App 拿到 ok=true
+        # 之后再收到 failed/device_offline 的终态。
+        if getattr(link, "closing", False):
+            await session.send_json(_ack(request_id, False, "device_offline"))
+            return
+
         if int(getattr(link, "protocol_version", 2)) < 2:
             await session.send_json(_ack(request_id, False, "unsupported_protocol"))
             return

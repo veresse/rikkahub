@@ -16,6 +16,8 @@ import uuid
 from collections.abc import Awaitable, Callable
 from typing import Any, Protocol
 
+from sqlalchemy import update
+
 from companion.server.app.config import settings
 from companion.server.app.database import AsyncSessionLocal
 from companion.server.app.models.device import DeviceModel
@@ -26,6 +28,7 @@ from companion.server.app.services.action_orchestrator import (
 from companion.server.app.services.clock import now_ms
 from companion.server.app.services.device_registry import (
     ActionResult,
+    device_lifecycle_lock,
     get_device_link,
     register_device_link,
     unregister_device_link,
@@ -200,7 +203,9 @@ class DeviceSession:
         return {
             **self._report,
             "device_id": self.device_id,
-            "online": not self.closed,
+            # closing 表示链路已不可写（撤销/替换/写失败）：对 App 与 LLM 都
+            # 按离线处理，避免「显示在线但所有指令都失败」。
+            "online": not (self.closed or self.closing),
         }
 
     def public_report(self) -> dict[str, Any]:
@@ -433,11 +438,13 @@ class DeviceGateway:
         self.bus = bus or get_event_bus()
         self._session_factory = session_factory
         self._sessions: set[DeviceSession] = set()
-        self._locks: dict[str, asyncio.Lock] = {}
 
     async def handle(self, device_id: str, channel: WSChannel) -> None:
         session: DeviceSession | None = None
         device_loaded = False
+        # 握手阶段就失败时广播的 offline 原因；撤销不是握手错误，单独区分，
+        # 否则 App 会在刚撤销设备后收到 reason=handshake_failed 的误导事件。
+        handshake_reason = "handshake_failed"
         try:
             device = await self._load_device(device_id)
             if device is None:
@@ -451,6 +458,14 @@ class DeviceGateway:
 
             if hello.get("device_id") != device_id:
                 await self._close(channel, 4403, "device_mismatch")
+                return
+
+            # 鉴权在 hello 之前完成；撤销可能正好落在「等待 hello」的窗口里，
+            # 此时注册表里还没有链路，撤销路由关不掉它。这里先复核一次，
+            # `_install()` 会在每设备生命周期锁内再复核（权威判定）。
+            if not await self._device_is_active(device_id):
+                handshake_reason = "device_revoked"
+                await self._close(channel, 4401, "device_revoked")
                 return
 
             protocol_version, capabilities = self._negotiate(hello)
@@ -467,8 +482,11 @@ class DeviceGateway:
                 capabilities=capabilities,
             )
             await self._persist_hello(device_id, hello, protocol_version, capabilities)
+            # 先注册再回 hello_ack：ack 是对设备的「可以开始工作」承诺，
+            # App 收到上线事件后可能立刻发指令，此时链路必须已经可用。
+            if not await self._install(session):
+                return
             await self._send_hello_ack(session, hello)
-            await self._install(session)
             await self._read_loop(session)
         except asyncio.CancelledError:
             raise
@@ -485,7 +503,9 @@ class DeviceGateway:
                 await self._teardown(session)
             elif device_loaded and get_device_link(device_id) is None:
                 # 失败握手不应把仍由旧连接托管的设备标记为离线。
-                await self._publish_status(device_id, online=False, reason="handshake_failed")
+                await self._publish_status(
+                    device_id, online=False, reason=handshake_reason
+                )
 
     # ---- 握手 ----
 
@@ -608,15 +628,29 @@ class DeviceGateway:
 
     # ---- 连接生命周期 ----
 
-    def _device_lock(self, device_id: str) -> asyncio.Lock:
-        lock = self._locks.get(device_id)
-        if lock is None:
-            lock = asyncio.Lock()
-            self._locks[device_id] = lock
-        return lock
+    async def _device_is_active(self, device_id: str) -> bool:
+        """复核设备未被撤销。
 
-    async def _install(self, session: DeviceSession) -> None:
-        async with self._device_lock(session.device_id):
+        读取失败时按「仍活跃」处理：此时 `_load_device()` 也已失败，连接会走
+        错误路径；这里只做撤销窗口的补充检查，不宜因 DB 抖动拒绝正常设备。
+        """
+        try:
+            async with self._session_factory() as db:
+                device = await db.get(DeviceModel, device_id)
+        except Exception:
+            logger.exception("load device active failed: %s", device_id)
+            return True
+        return device is not None and bool(device.is_active)
+
+    async def _install(self, session: DeviceSession) -> bool:
+        """注册链路；设备已撤销时拒绝并关闭，返回是否注册成功。"""
+        async with device_lifecycle_lock(session.device_id):
+            # 撤销路由在同一把锁里「查链路 + close(4401)」。锁内复核 is_active
+            # 才能堵住：鉴权通过 → 撤销提交（此时还没有链路）→ hello 到达 →
+            # 连接重新注册并可控。
+            if not await self._device_is_active(session.device_id):
+                await session.close(4401, "device_revoked")
+                return False
             old = get_device_link(session.device_id)
             # 替换前先在旧链路仍是 current 时冲刷上报 writer：
             # `_handle_report()` 会丢弃「已不是当前链路」的上报，先注册新链路
@@ -631,9 +665,10 @@ class DeviceGateway:
             # 关闭旧连接期间可能有更新的连接插入；只在仍是当前 link 时广播上线。
             if get_device_link(session.device_id) is session:
                 await self._publish_status(session.device_id, online=True)
+            return True
 
     async def _teardown(self, session: DeviceSession) -> None:
-        async with self._device_lock(session.device_id):
+        async with device_lifecycle_lock(session.device_id):
             self._sessions.discard(session)
             was_current = get_device_link(session.device_id) is session
             if was_current:
@@ -655,7 +690,7 @@ class DeviceGateway:
         for session in list(self._sessions):
             # 与 `_teardown` 串行，避免一方在另一方 flush 期间 unregister 导致
             # 最后一条上报被 `_handle_report` 的链路检查丢弃。
-            async with self._device_lock(session.device_id):
+            async with device_lifecycle_lock(session.device_id):
                 await session.stop_writer()
                 if get_device_link(session.device_id) is session:
                     unregister_device_link(session.device_id, link=session)
@@ -746,7 +781,11 @@ class DeviceGateway:
         if session.closed or get_device_link(session.device_id) is not session:
             return
         internal = session.apply_report(report)
-        await self._persist_report(session.device_id, internal)
+        active = await self._persist_report(session.device_id, internal)
+        if not active:
+            # 已撤销设备不再广播运行态：否则 App 会先收到 state=speaking，
+            # 再收到 device.status online=false，短暂把 revoked 显示为在线。
+            return
         if session.closed or get_device_link(session.device_id) is not session:
             return
         await self.bus.publish(
@@ -774,7 +813,8 @@ class DeviceGateway:
         try:
             async with self._session_factory() as db:
                 device = await db.get(DeviceModel, device_id)
-                if device is None:
+                if device is None or not device.is_active:
+                    # 已撤销设备不再刷新固件/最后在线时间；连接马上会被 4401 关闭。
                     return
                 firmware = hello.get("firmware_version")
                 if isinstance(firmware, str):
@@ -786,29 +826,46 @@ class DeviceGateway:
         except Exception:
             logger.exception("persist hello failed: %s", device_id)
 
-    async def _persist_report(self, device_id: str, report: dict[str, Any]) -> None:
+    async def _persist_report(self, device_id: str, report: dict[str, Any]) -> bool:
+        """落库上报，返回设备是否仍是活动设备（决定能否广播运行态）。
+
+        运行态字段用「带 `is_active` 条件的 UPDATE」写入，而不是先读 ORM 再改：
+        撤销路由可能在读取与提交之间提交 `is_active=False`，读-改-写会把
+        `state="revoked"` 覆盖回 `speaking`（窗口大小随调度变化，只能靠条件
+        更新消除，不能靠 `close()` 的冲刷顺序）。
+        """
         try:
             async with self._session_factory() as db:
-                device = await db.get(DeviceModel, device_id)
-                if device is None:
-                    return
-                if not device.is_active:
-                    # 已撤销/停用的设备不再回写运行态：撤销路由写入的
-                    # state="revoked" 不能被最后一条上报覆盖成 speaking。
-                    # 只保留快照，便于事后排查。
-                    device.last_report_json = report
-                    await db.commit()
-                    return
-                device.volume = int(report["volume"])
-                device.idle_enabled = bool(report["idle_enabled"])
-                device.state = str(report["state"])
-                device.pan_offset = float(report["pan_offset"])
-                device.tilt_offset = float(report["tilt_offset"])
-                device.last_report_json = report
-                device.last_seen_at = now_ms()
+                result = await db.execute(
+                    update(DeviceModel)
+                    .where(
+                        DeviceModel.id == device_id,
+                        DeviceModel.is_active.is_(True),
+                    )
+                    .values(
+                        volume=int(report["volume"]),
+                        idle_enabled=bool(report["idle_enabled"]),
+                        state=str(report["state"]),
+                        pan_offset=float(report["pan_offset"]),
+                        tilt_offset=float(report["tilt_offset"]),
+                        last_report_json=report,
+                        last_seen_at=now_ms(),
+                    )
+                )
+                active = bool(result.rowcount)
+                if not active:
+                    # 已撤销/停用：只保留快照，运行态（含 state="revoked"）不动。
+                    await db.execute(
+                        update(DeviceModel)
+                        .where(DeviceModel.id == device_id)
+                        .values(last_report_json=report)
+                    )
                 await db.commit()
+                return active
         except Exception:
             logger.exception("persist report failed: %s", device_id)
+            # 落库失败不代表设备离线，保持原有广播行为。
+            return True
 
     async def _publish_status(self, device_id: str, *, online: bool, reason: str = "") -> None:
         await self.bus.publish(

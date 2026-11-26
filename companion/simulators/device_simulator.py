@@ -116,12 +116,19 @@ class SimulatedDevice:
     # ---- 生命周期 ----
 
     async def connect(self) -> "SimulatedDevice":
-        self.ws = await websockets.connect(
-            _ws_url(self.base_url, "/device/ws"),
-            additional_headers={"Authorization": f"Bearer {self.token}"},
-            max_size=None,
-            ping_interval=None,
-        )
+        try:
+            self.ws = await websockets.connect(
+                _ws_url(self.base_url, "/device/ws"),
+                additional_headers={"Authorization": f"Bearer {self.token}"},
+                max_size=None,
+                ping_interval=None,
+            )
+        except Exception as exc:
+            # HTTP 升级阶段被拒（如 403/404）不会建立 WS，也没有 close frame；
+            # 统一折算成「握手失败」，让调用方按 hello_ack=None 处理。
+            self.close_reason = f"connect_failed: {exc}"
+            self._closed.set()
+            return self
         await self._send(
             {
                 "v": self.protocol_version,
