@@ -115,7 +115,7 @@ class SimulatedApp:
         # 取消并清空等待者，避免重连后旧 listener 被新连接的事件唤醒。
         for _, future in list(self._listeners):
             if not future.done():
-                future.cancel()
+                future.set_exception(ConnectionError("websocket closed"))
         self._listeners.clear()
         self._closed.set()
 

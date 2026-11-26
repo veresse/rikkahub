@@ -106,6 +106,9 @@ class DeviceSession:
         self.protocol_version = protocol_version
         self.capabilities = capabilities
         self.closed = False
+        # closing 表示「已开始冲刷最后一条上报」（撤销 / 替换 / 下线）：
+        # 链路不再接受新指令，但仍允许上报落库；closed 表示冲刷已完成。
+        self.closing = False
 
         self._report = self._initial_report(device)
         self._pending: dict[str, asyncio.Future[ActionResult]] = {}
@@ -121,6 +124,8 @@ class DeviceSession:
         # 串行化 stop_writer()：teardown/shutdown/handle 异常路径可能并发调用，
         # 两个 _flush_reports() 同时取走 in-flight 与队列会导致 FIFO 反转。
         self._writer_stop_lock = asyncio.Lock()
+        # 串行化 close()：撤销与替换可能并发，重复 close 只应生效一次。
+        self._close_lock = asyncio.Lock()
         # writer 已取出、正在 await handler 的上报；超时取消后用于补写。
         self._inflight: dict[str, Any] | None = None
 
@@ -146,7 +151,9 @@ class DeviceSession:
     # ---- DeviceLink 接口 ----
 
     async def send(self, command: dict[str, Any]) -> ActionResult:
-        if self.closed:
+        # closing 期间会话仍是 current link（正在冲刷最后一条上报），但不能再
+        # 下发指令：撤销窗口内让命令命中已撤销设备是协议外的行为。
+        if self.closing or self.closed:
             return ActionResult(status="failed", detail="device_offline")
         if self.protocol_version < 2:
             # v1 只走音频通道，不允许任何 v2 控制消息。
@@ -332,7 +339,9 @@ class DeviceSession:
             return True
         except Exception:
             logger.debug("device send failed: %s", self.device_id, exc_info=True)
-            self.closed = True
+            # 只标记「不再下发」，不能置 closed：close()/teardown 的冲刷依赖
+            # closed=False 才能把最后一条上报落库。
+            self.closing = True
             return False
 
     def resolve_result(self, action_id: str, status: str, detail: str) -> str | None:
@@ -396,16 +405,23 @@ class DeviceSession:
         return dict(self._report)
 
     async def close(self, code: int = 1000, reason: str = "") -> None:
-        # 必须先冲刷再标记 closed：`_handle_report()` 会丢弃 closed 会话的上报，
-        # 撤销设备、会话替换等直接调用 close() 的路径否则会丢最后一条状态。
-        await self.stop_writer()
-        self.closed = True
-        self._stop_writer()
-        self._resolve_all(ActionResult(status="failed", detail="device_offline"))
-        try:
-            await self.channel.close(code, reason)
-        except Exception:
-            logger.debug("device close failed: %s", self.device_id, exc_info=True)
+        async with self._close_lock:
+            if self.closed:
+                return
+            # 在第一个 await 之前同步置 closing：flush 期间会话仍是 current
+            # link，`send()` 必须拒绝新指令，否则撤销窗口内命令仍会下发到
+            # 已撤销设备；而 `_handle_report()` 只看 closed，flush 照常落库。
+            self.closing = True
+            # 必须先冲刷再标记 closed：`_handle_report()` 会丢弃 closed 会话的
+            # 上报，撤销设备、会话替换等直接调用 close() 的路径否则会丢最后一条。
+            await self.stop_writer()
+            self.closed = True
+            self._stop_writer()
+            self._resolve_all(ActionResult(status="failed", detail="device_offline"))
+            try:
+                await self.channel.close(code, reason)
+            except Exception:
+                logger.debug("device close failed: %s", self.device_id, exc_info=True)
 
 
 class DeviceGateway:
@@ -775,6 +791,13 @@ class DeviceGateway:
             async with self._session_factory() as db:
                 device = await db.get(DeviceModel, device_id)
                 if device is None:
+                    return
+                if not device.is_active:
+                    # 已撤销/停用的设备不再回写运行态：撤销路由写入的
+                    # state="revoked" 不能被最后一条上报覆盖成 speaking。
+                    # 只保留快照，便于事后排查。
+                    device.last_report_json = report
+                    await db.commit()
                     return
                 device.volume = int(report["volume"])
                 device.idle_enabled = bool(report["idle_enabled"])

@@ -163,7 +163,8 @@
 
 ## 4. 下行控制消息（服务端 → 设备）
 
-所有控制消息都带 `action_id`（服务端生成的 UUID）用于 `action.result` 关联。
+所有控制消息都带 `action_id`（服务端生成的 UUID）用于 `action.result` 关联；例外是
+§4.4 `expression.set` 与 §4.7 `servo.calibrate_preview`（fire-and-forget，各自章节有说明）。
 
 ### 4.1 `action.play`
 
@@ -237,10 +238,17 @@
 ### 4.5 `idle.set`
 
 ```json
-{"v": 2, "type": "idle.set", "enabled": true, "ts": 1764000000000}
+{
+  "v": 2,
+  "type": "idle.set",
+  "action_id": "uuid",
+  "enabled": true,
+  "ts": 1764000000000
+}
 ```
 
 - 仅在设备状态为 `IDLE` 时生效；进入 `LISTENING/THINKING/SPEAKING/ERROR` 自动暂停并归位。
+- 设备必须按 `action_id` 回 `action.result`。
 
 ### 4.6 `action.stop`
 

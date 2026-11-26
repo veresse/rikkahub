@@ -19,6 +19,7 @@ import argparse
 import asyncio
 import json
 import os
+import sys
 import time
 from typing import Any
 
@@ -110,6 +111,7 @@ class SimulatedDevice:
         self._send_lock = asyncio.Lock()
         self._closed = asyncio.Event()
         self._release = asyncio.Event()
+        self._closing = False
 
     # ---- 生命周期 ----
 
@@ -162,11 +164,12 @@ class SimulatedDevice:
         # 先断链再取消动作，模拟真机掉电/断网：在途动作没有机会补发
         # `action.result`，服务端应走 device_offline 路径。需要「优雅停止」
         # 语义的测试请显式发送 `action.stop`。
+        self._closing = True
         ws = self.ws
         self.ws = None
         if ws is not None:
             try:
-                await ws.close()
+                await asyncio.wait_for(ws.close(), timeout=2.0)
             except Exception:
                 pass
         for task in list(self._actions.values()):
@@ -290,6 +293,9 @@ class SimulatedDevice:
 
     async def _dispatch(self, message: dict[str, Any]) -> None:
         message_type = message.get("type")
+        if self._closing:
+            # 已开始关闭：不再派发新命令，避免在取消动作之后又拉起孤儿任务。
+            return
 
         if message_type == "action.stop":
             await self._handle_stop(message)
@@ -472,7 +478,7 @@ def main() -> None:
     if not args.token:
         parser.error("必须提供 --token 或 DEVICE_TOKEN 环境变量")
 
-    async def run() -> None:
+    async def run() -> int:
         device = SimulatedDevice(
             args.base_url,
             device_id=args.device_id,
@@ -482,14 +488,25 @@ def main() -> None:
             report_interval=args.report_interval,
         )
         await device.connect()
-        print(f"device ws connected, hello_ack={json.dumps(device.hello_ack, ensure_ascii=False)}")
+        if device.hello_ack is None:
+            print(
+                "device handshake failed: "
+                f"close_code={device.close_code} reason={device.close_reason}",
+                file=sys.stderr,
+            )
+            return 1
+        print(
+            "device ws connected, "
+            f"hello_ack={json.dumps(device.hello_ack, ensure_ascii=False)}"
+        )
         try:
             await device.wait_closed(timeout=None)
         finally:
             await device.close()
+        return 0
 
     try:
-        asyncio.run(run())
+        raise SystemExit(asyncio.run(run()))
     except KeyboardInterrupt:
         pass
 

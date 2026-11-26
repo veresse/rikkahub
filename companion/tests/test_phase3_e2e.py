@@ -678,6 +678,33 @@ async def test_device_simulator_cli_stays_connected(e2e):
             await asyncio.to_thread(proc.wait, 5)
 
 
+async def test_device_simulator_cli_fails_on_bad_token(e2e):
+    """握手失败必须用非零退出码暴露，否则脚本/CI 会把联调失败当成功。"""
+    repo_root = Path(__file__).resolve().parents[2]
+    proc = await asyncio.to_thread(
+        subprocess.run,
+        [
+            sys.executable,
+            "-m",
+            "companion.simulators.device_simulator",
+            "--base-url",
+            e2e.app.base_url,
+            "--device-id",
+            "cli-bad-token",
+            "--token",
+            "definitely-not-a-valid-device-token",
+            "--report-interval",
+            "0",
+        ],
+        cwd=str(repo_root),
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    assert proc.returncode != 0, proc.stdout
+    assert "handshake failed" in proc.stderr
+
+
 async def test_app_token_revocation_closes_ws(e2e):
     other = await e2e.login_other_app()
     await e2e.connect_app(other)
@@ -773,10 +800,11 @@ async def test_chat_tool_loop_drives_real_device(e2e, monkeypatch):
 
 
 async def test_app_remote_rate_limit(e2e, monkeypatch):
-    # 固定窗口为 3 条/秒，避免依赖「15 次串行 RTT 必须挤进 1 秒」的时序。
+    # 固定窗口：3 条 / 60 秒，彻底去掉「6 次串行 RTT 必须挤进 1 秒」的时序依赖。
     from companion.server.app.services import app_gateway as app_gateway_module
 
     monkeypatch.setattr(app_gateway_module, "MAX_REMOTE_PER_SECOND", 3)
+    monkeypatch.setattr(app_gateway_module, "RATE_WINDOW_SECONDS", 60.0)
 
     device = await e2e.new_device(name="E2E 限速")
     # 这里只需要 ack（会话已注册），不需要广播就绪同步，避免探针占用窗口。
@@ -791,14 +819,16 @@ async def test_app_remote_rate_limit(e2e, monkeypatch):
     assert all(a["ok"] is True for a in acks if a not in limited)
 
 
-async def test_logs_do_not_leak_tokens_or_passwords(e2e, caplog):
+async def test_logs_do_not_leak_tokens_or_passwords(e2e, caplog, monkeypatch):
     import logging
 
     # 第三方库在 DEBUG 会打印自己收发的请求头（含 Authorization），属于
-    # 库日志而非本项目日志；这里把它们的级别压回 WARNING，只断言本项目
-    # 与服务端框架的 logger。
+    # 库日志而非本项目日志；用 monkeypatch 改级别（用例结束后自动恢复），
+    # 不按 logger 名前缀过滤 record，避免顺带放过本项目的服务端日志。
     for library in ("httpx", "httpcore", "websockets"):
-        logging.getLogger(library).setLevel(logging.WARNING)
+        monkeypatch.setattr(
+            logging.getLogger(library), "level", logging.WARNING
+        )
     caplog.set_level(logging.DEBUG)
 
     # 登录必须发生在 call 阶段：caplog 在用例开始时才安装，setup 阶段的

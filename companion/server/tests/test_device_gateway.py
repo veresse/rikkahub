@@ -63,6 +63,19 @@ class FakeChannel:
         return await asyncio.wait_for(_poll(), timeout)
 
 
+class FlakyChannel(FakeChannel):
+    """握手后可以让 `send_json` 失败，模拟传输层写错误。"""
+
+    def __init__(self):
+        super().__init__()
+        self.fail = False
+
+    async def send_json(self, payload: dict) -> None:
+        if self.fail and payload.get("type") != "hello_ack":
+            raise ConnectionError("write failed")
+        await super().send_json(payload)
+
+
 async def wait_until(predicate, timeout: float = 2.0):
     async def _poll():
         while True:
@@ -534,6 +547,116 @@ async def test_concurrent_stop_writer_preserves_fifo(seeded_device, monkeypatch)
 
     assert order == [1, 2]
     await _stop(task, channel)
+
+
+async def test_close_rejects_commands_while_flushing(seeded_device):
+    """冲刷期间会话仍是 current link，但不得再把指令下发到已撤销设备。"""
+    harness = Harness()
+    task, channel, _ = await harness.connected()
+    session = get_device_link(DEVICE_ID)
+    assert session is not None
+
+    original = harness.gateway._handle_report
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def slow_handler(sess, report: dict) -> None:
+        started.set()
+        await release.wait()
+        await original(sess, report)
+
+    session._report_handler = slow_handler
+    session.queue_report({"volume": 12})
+    await asyncio.wait_for(started.wait(), timeout=2.0)
+
+    close_task = asyncio.create_task(session.close(4401, "device_revoked"))
+    try:
+        # 等 close() 真正进入 flush；旧实现没有 closing 标记且会直接返回，
+        # 用 `getattr` + `close_task.done()` 让它在旧代码上快速失败而不是挂起。
+        while not close_task.done() and not getattr(session, "closing", False):
+            await asyncio.sleep(0.01)
+        assert not close_task.done(), "close() 不得在冲刷完成前返回"
+
+        # 冲刷期间会话仍是 current link，但指令必须被拒绝（有上界，避免回归时挂死）。
+        result = await asyncio.wait_for(
+            session.send({"type": "idle.set", "enabled": False}), timeout=2.0
+        )
+        assert result.status == "failed"
+        assert result.detail == "device_offline"
+        assert not [m for m in channel.sent if m.get("type") == "idle.set"]
+    finally:
+        release.set()
+        await asyncio.wait_for(close_task, timeout=5.0)
+
+    await asyncio.wait_for(task, timeout=2.0)
+    assert channel.closed == (4401, "device_revoked")
+
+    # 重复 close（例如替换路径）不得改写关闭码。
+    await session.close(4409, "replaced")
+    assert channel.closed == (4401, "device_revoked")
+
+
+async def test_revoke_keeps_revoked_state_and_persists_last_report(
+    seeded_device, client, auth_headers
+):
+    """撤销时冲刷的最后一条上报只能留快照，不能把 state 改回 speaking。"""
+    harness = Harness()
+    task, channel, _ = await harness.connected()
+    session = get_device_link(DEVICE_ID)
+    assert session is not None
+
+    # 制造「上报已入队、writer 尚未消费」后走真实撤销路由。
+    session._writer.cancel()
+    await asyncio.gather(session._writer, return_exceptions=True)
+    channel.push({"v": 2, "type": "device.report", "volume": 88, "state": "speaking"})
+    await wait_until(lambda: not session._report_queue.empty())
+
+    resp = await client.delete(f"/api/devices/{DEVICE_ID}", headers=auth_headers)
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["status"] == "revoked"
+    await asyncio.wait_for(task, timeout=2.0)
+
+    async with AsyncSessionLocal() as db:
+        device = await db.get(DeviceModel, DEVICE_ID)
+        assert device.is_active is False
+        assert device.state == "revoked"
+        # 快照保留（证明确实冲刷过），运行态字段不回写。
+        assert device.last_report_json["volume"] == 88
+        assert device.volume == 65
+
+
+async def test_send_failure_keeps_flushing_later_reports(seeded_device):
+    """传输层写失败只停止下发，不能让随后 flush 的上报被丢弃。"""
+    harness = Harness()
+    channel = FlakyChannel()
+    task = asyncio.create_task(harness.gateway.handle(DEVICE_ID, channel))
+    channel.push(hello())
+    await channel.wait_sent(lambda m: m.get("type") == "hello_ack")
+    session = get_device_link(DEVICE_ID)
+    assert session is not None
+
+    channel.fail = True
+    result = await session.send({"type": "idle.set", "enabled": False})
+    assert result.status == "failed"
+    assert result.detail == "device_offline"
+    assert session.closing is True
+    assert session.closed is False
+
+    channel.fail = False
+    channel.push({"v": 2, "type": "device.report", "volume": 43})
+    await wait_until(
+        lambda: any(
+            e.get("type") == "device.report" and e.get("volume") == 43
+            for e in harness.events
+        )
+    )
+
+    await _stop(task, channel)
+
+    async with AsyncSessionLocal() as db:
+        device = await db.get(DeviceModel, DEVICE_ID)
+        assert device.volume == 43
+        assert device.last_report_json["volume"] == 43
 
 
 class SlowStopChannel(FakeChannel):
