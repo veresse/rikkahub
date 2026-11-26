@@ -734,10 +734,20 @@ class DeviceGateway:
             # 最后一条上报被 `_handle_report` 的链路检查丢弃。
             async with device_lifecycle_lock(session.device_id):
                 await session.stop_writer()
-                if get_device_link(session.device_id) is session:
+                was_current = get_device_link(session.device_id) is session
+                # 若链路已被撤销/写失败关闭，offline 由那边的 `_teardown()` 发；
+                # 这里再发会得到两条原因不同的事件。
+                needs_offline = was_current and not session.closed
+                if was_current:
                     unregister_device_link(session.device_id, link=session)
                     invalidate_device_scheduler(session.device_id)
                 await session.close(1011, "server_shutdown")
+                # `_teardown()` 稍后运行时链路已不是 current，不会补发；停机事件
+                # 必须在这里发，否则 App 只会看到上线、看不到下线。
+                if needs_offline:
+                    await self._publish_status(
+                        session.device_id, online=False, reason="server_shutdown"
+                    )
         self._sessions.clear()
 
     async def _read_loop(self, session: DeviceSession) -> None:

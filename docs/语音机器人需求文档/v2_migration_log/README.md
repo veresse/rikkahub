@@ -37,3 +37,4 @@
 | 15 | Phase 3 四次审查修复 | ✅ 已完成 | `hello_ack` 前 `ready` 门控与上线广播后移、统一在线判定（LLM/事件/App）、`_install()` 锁内复核回归、hello 落库条件更新、`closing` 急停结算本地动作；198 passed |
 | 16 | Phase 3 五次审查修复 | ✅ 已完成 | ack 阻塞期间撤销不再广播上线、App 网关同时拦未 ready、orchestrator 在线判定回归、争锁死锁有界失败、移除重复在线函数；201 passed |
 | 17 | Phase 3 六次审查修复 | ✅ 已完成 | 撤销提交与关闭串行化、`ready` 后移到复核之后、offline reason 统一、三道守卫独立回归；204 passed |
+| 18 | Phase 3 六次审查收尾 | ✅ 已完成 | 停机补发 `server_shutdown` 下线事件、新用例按握手阶段定位并提供诊断、删除弱断言与旧注释；205 passed |

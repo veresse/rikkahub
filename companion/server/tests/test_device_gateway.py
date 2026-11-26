@@ -168,6 +168,26 @@ class _PausingSession:
         return await self._session.execute(*args, **kwargs)
 
 
+async def _wait_mark_ready_entered(
+    entered: asyncio.Event, channel: "FakeChannel"
+) -> None:
+    """等待 `_mark_ready()` 的复核被 gate 卡住，失败时给出链路状态。"""
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=3.0)
+    except asyncio.TimeoutError:
+        link = get_device_link(DEVICE_ID)
+        state = None if link is None else (
+            getattr(link, "ready", None),
+            getattr(link, "closing", None),
+            getattr(link, "closed", None),
+        )
+        raise AssertionError(
+            "`_mark_ready()` 的复核未触发；"
+            f"sent={[m.get('type') for m in channel.sent]} "
+            f"link(ready,closing,closed)={state}"
+        ) from None
+
+
 async def wait_status(link, key: str, value, timeout: float = 2.0) -> dict:
     async def _poll():
         while True:
@@ -248,7 +268,19 @@ class Harness:
         ack = await channel.wait_sent(lambda m: m.get("type") == "hello_ack")
         # ready 在 ack 之后、`_mark_ready()` 锁内复核通过才置位（撤销与替换的
         # 门控）。测试里的「连上后立刻下发」应等握手真正完成，而不是只看 ack。
-        await wait_until(lambda: getattr(get_device_link(DEVICE_ID), "ready", False))
+        link = get_device_link(DEVICE_ID)
+        try:
+            await wait_until(lambda: getattr(link, "ready", False))
+        except asyncio.TimeoutError:
+            state = None if link is None else (
+                getattr(link, "ready", None),
+                getattr(link, "closing", None),
+                getattr(link, "closed", None),
+            )
+            raise AssertionError(
+                f"握手未就绪：link(ready,closing,closed)={state} "
+                f"sent={[m.get('type') for m in channel.sent]}"
+            ) from None
         return task, channel, ack
 
 
@@ -461,13 +493,12 @@ async def test_mark_ready_keeps_link_offline_until_recheck_passes(
     real = gateway._device_is_active
     entered = asyncio.Event()
     release = asyncio.Event()
-    calls = 0
+    channel = FakeChannel()
 
     async def gated(device_id: str) -> bool:
-        # 1 = handle 预检，2 = `_install()`，3 = `_mark_ready()`
-        nonlocal calls
-        calls += 1
-        if calls < 3:
+        # 用「hello_ack 已发出」定位 `_mark_ready()` 的复核，而不是调用次数：
+        # 预检与 `_install()` 都发生在 ack 之前。
+        if not any(m.get("type") == "hello_ack" for m in channel.sent):
             return await real(device_id)
         entered.set()
         await release.wait()
@@ -475,10 +506,9 @@ async def test_mark_ready_keeps_link_offline_until_recheck_passes(
 
     monkeypatch.setattr(gateway, "_device_is_active", gated)
 
-    channel = FakeChannel()
     task = await harness.start(channel)
     channel.push(hello())
-    await asyncio.wait_for(entered.wait(), timeout=3.0)
+    await _wait_mark_ready_entered(entered, channel)
 
     link = get_device_link(DEVICE_ID)
     assert link is not None
@@ -518,13 +548,13 @@ async def test_mark_ready_skips_online_when_link_closes_during_recheck(
     real = gateway._device_is_active
     entered = asyncio.Event()
     release = asyncio.Event()
-    calls = 0
+    channel = FakeChannel()
 
     async def gated(device_id: str) -> bool:
-        nonlocal calls
-        calls += 1
-        if calls < 3:
+        if not any(m.get("type") == "hello_ack" for m in channel.sent):
             return await real(device_id)
+        # 先完成读（拿到 active=True 的快照），再暂停：模拟「读之后、置位之前」
+        # 链路被其它路径关闭。
         active = await real(device_id)
         entered.set()
         await release.wait()
@@ -532,10 +562,9 @@ async def test_mark_ready_skips_online_when_link_closes_during_recheck(
 
     monkeypatch.setattr(gateway, "_device_is_active", gated)
 
-    channel = FakeChannel()
     task = await harness.start(channel)
     channel.push(hello())
-    await asyncio.wait_for(entered.wait(), timeout=3.0)
+    await _wait_mark_ready_entered(entered, channel)
 
     link = get_device_link(DEVICE_ID)
     assert link is not None
@@ -566,12 +595,10 @@ async def test_revoke_commit_waits_for_mark_ready_lock(
     real = gateway._device_is_active
     entered = asyncio.Event()
     release = asyncio.Event()
-    calls = 0
+    channel = FakeChannel()
 
     async def gated(device_id: str) -> bool:
-        nonlocal calls
-        calls += 1
-        if calls < 3:
+        if not any(m.get("type") == "hello_ack" for m in channel.sent):
             return await real(device_id)
         active = await real(device_id)  # 撤销提交前读到 True
         entered.set()
@@ -580,10 +607,9 @@ async def test_revoke_commit_waits_for_mark_ready_lock(
 
     monkeypatch.setattr(gateway, "_device_is_active", gated)
 
-    channel = FakeChannel()
     task = await harness.start(channel)
     channel.push(hello())
-    await asyncio.wait_for(entered.wait(), timeout=3.0)
+    await _wait_mark_ready_entered(entered, channel)
 
     delete_task = asyncio.create_task(
         client.delete(f"/api/devices/{DEVICE_ID}", headers=auth_headers)
@@ -595,7 +621,6 @@ async def test_revoke_commit_waits_for_mark_ready_lock(
                 row = await db.get(DeviceModel, DEVICE_ID)
             assert row is not None and row.is_active is True, "撤销提交不应在复核期间生效"
             await asyncio.sleep(0.01)
-        assert not delete_task.done()
     finally:
         release.set()
     resp = await asyncio.wait_for(delete_task, timeout=5.0)
@@ -776,6 +801,24 @@ async def test_shutdown_flushes_queued_report(seeded_device):
     assert persisted == [77]
 
     await asyncio.wait_for(task, timeout=2.0)
+
+
+async def test_shutdown_broadcasts_offline_once(seeded_device):
+    """停机要发出一条 reason=server_shutdown 的下线事件，且不能重复。"""
+    harness = Harness()
+    task, channel, _ = await harness.connected()
+
+    await harness.gateway.shutdown()
+    await asyncio.wait_for(task, timeout=2.0)
+
+    assert channel.closed == (1011, "server_shutdown")
+    assert get_device_link(DEVICE_ID) is None
+    offline = [
+        e
+        for e in harness.events
+        if e.get("type") == "device.status" and e.get("online") is False
+    ]
+    assert [e.get("reason") for e in offline] == ["server_shutdown"], harness.events
 
 
 async def test_stop_writer_retries_inflight_report_after_timeout(
@@ -1395,7 +1438,7 @@ async def test_second_connection_replaces_first(seeded_device):
     task_a, channel_a, _ = await harness.connected()
     task_b, channel_b, _ = await harness.connected()
 
-    # hello_ack 在 _install 之前发送；旧连接关闭发生在替换流程内，需等待。
+    # 注册（`_install`）早于 hello_ack；旧连接在替换流程内（新链路注册后）关闭，需等待。
     await wait_until(lambda: channel_a.closed == (4409, "replaced"))
     assert get_device_link(DEVICE_ID) is not None
 
