@@ -70,3 +70,15 @@ def publish_async(bus: EventBus, event: dict) -> asyncio.Task | None:
 
     task.add_done_callback(_done)
     return task
+
+
+async def drain_background_tasks(timeout: float = 1.0) -> None:
+    """等待后台广播任务完成；超时后取消，避免进程关闭时丢失终态事件。"""
+    tasks = [task for task in _background_tasks if not task.done()]
+    if not tasks:
+        return
+    _, pending = await asyncio.wait(tasks, timeout=timeout)
+    for task in pending:
+        task.cancel()
+    if pending:
+        await asyncio.gather(*pending, return_exceptions=True)

@@ -319,6 +319,51 @@ async def test_revoked_device_gets_inactive_note(session, monkeypatch):
     assert all("没有绑定" not in text for text in system_contents)
 
 
+async def test_revoked_conversation_device_falls_back_to_active_assistant_device(
+    session, monkeypatch
+):
+    """会话设备被撤销后，角色级仍有在线设备时应继续注入工具（不得被遮蔽）。"""
+    await seed(session, is_active=False)
+    active_id = "dev-action-loop-active"
+    session.add(
+        DeviceModel(
+            id=active_id,
+            name="角色级在线机器人",
+            token_hash="c" * 64,
+            protocol_version=2,
+            capabilities_json=["action"],
+            bound_assistant_id=ASSISTANT_ID,
+            bound_conversation_id=None,
+            last_seen_at=2,
+            is_active=True,
+        )
+    )
+    await session.commit()
+
+    link = FakeLink()
+    register_device_link(active_id, link)
+    fake = ScriptedDeepSeek(
+        [
+            [tool_call(0, "c1", "robot.action", '{"name": "nod"}')],
+            [content("好，点点头。")],
+        ]
+    )
+    _install(monkeypatch, fake)
+    try:
+        _ = [
+            e
+            async for e in ChatOrchestrator.stream_chat(
+                session, CONVERSATION_ID, "点点头"
+            )
+        ]
+
+        assert fake.calls[0]["tools"] is not None
+        assert any(c.get("type") == "action.play" for c in link.commands)
+    finally:
+        await session.execute(delete(DeviceModel).where(DeviceModel.id == active_id))
+        await session.commit()
+
+
 class HangingActionLink(FakeLink):
     """动作永不回执，用于验证聊天取消时的定向急停。"""
 

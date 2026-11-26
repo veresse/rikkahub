@@ -460,6 +460,11 @@ App 携带 `Authorization: Bearer <app_token>` 发起请求，响应为 `text/ev
 - 每条命令只广播一次终态：服务端已结算（执行超时、急停、断连）后，设备针对同一 `action_id`
   的迟到/重复 `action.result` 会被丢弃；不在本会话 `_pending` 中的 `action_id` 也不会广播，
   因此 `action.result.source` 恒为 `llm` 或 `app`。
+- 反向窗口同样去重：设备先回报结果、服务端随后才执行急停/断连时，网关会在解析 future 的同一
+  事件循环 tick 内把该 `action_id` 标记为「已回报」，调度器不再补发 `failed/stopped`
+  或 `failed/device_offline`。
+- `device.report` 由每设备单一 writer 按 FIFO 串行落库与广播；正常下线与服务关闭都会先投递
+  停止哨兵、等 writer 写完最后一条再关闭链路，避免旧上报晚于新上报提交而覆盖最新状态。
 - 聊天 SSE 被客户端断开/停止时，只中止**本轮**在途的 `robot.*` 命令并下发
   `action.stop(server_cancel)`；不会清空共享队列或打断 App 同时进行的遥控动作。
 - `remote.get_status` 不新增下行消息，服务端把当前缓存的 `device.report` 快照只回给请求方，

@@ -18,6 +18,7 @@ from companion.server.app.routers import (
     ws,
 )
 from companion.server.app.security.dependencies import require_app_token
+from companion.server.app.services.events import drain_background_tasks
 
 
 @asynccontextmanager
@@ -27,6 +28,7 @@ async def lifespan(app: FastAPI):
     yield
     await ws.device_gateway.shutdown()
     await ws.app_gateway.shutdown()
+    await drain_background_tasks()
 
 
 app = FastAPI(
@@ -83,5 +85,5 @@ if __name__ == "__main__":
         reload=settings.DEBUG,
         ws_ping_interval=settings.WS_PING_INTERVAL_SECONDS,
         ws_ping_timeout=settings.WS_PING_TIMEOUT_SECONDS,
-        ws_max_size=settings.WS_MAX_MESSAGE_BYTES,
+        ws_max_size=settings.WS_TRANSPORT_MAX_MESSAGE_BYTES,
     )

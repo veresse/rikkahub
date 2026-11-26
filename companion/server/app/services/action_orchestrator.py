@@ -334,6 +334,23 @@ def invalidate_device_scheduler(device_id: str) -> None:
         _stop_scheduler(scheduler, "device_offline")
 
 
+def mark_action_reported(device_id: str, action_id: str) -> bool:
+    """设备已经回报该 `action_id` 的终态，调度器不得再生成第二条终态。
+
+    必须在 `DeviceSession.resolve_result()` 解析 future 的同一事件循环 tick
+    内同步调用。否则急停/断连可能在 worker 恢复前看到仍是 `current` 的 job，
+    再广播一次 `failed/stopped`，违反协议「同一 action_id 只出现一次」。
+    """
+    scheduler = _SCHEDULERS.get(device_id)
+    if scheduler is None or scheduler.current is None:
+        return False
+    job = scheduler.current
+    if job.command.get("action_id") != action_id:
+        return False
+    job.emitted = True
+    return True
+
+
 def get_device_scheduler(device_id: str, link: Any) -> _DeviceScheduler:
     """按设备取唯一调度器；设备链路变化时先终止旧队列，避免向旧连接发指令。"""
     scheduler = _SCHEDULERS.get(device_id)

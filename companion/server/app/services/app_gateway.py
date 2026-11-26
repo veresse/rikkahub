@@ -161,9 +161,10 @@ class AppGateway:
             self._detach(session)
 
     def _ensure_subscribed(self) -> None:
-        if not self._subscribed:
-            self.bus.subscribe(self._broadcast)
-            self._subscribed = True
+        # 不用布尔标记做幂等判断：`EventBus.clear()` 可能已移除订阅，
+        # 而 `subscribe` 自身会去重。
+        self.bus.subscribe(self._broadcast)
+        self._subscribed = True
 
     def _detach(self, session: AppSession) -> None:
         sessions = self._sessions.get(session.token_id)

@@ -9,6 +9,7 @@ import pytest
 from sqlalchemy import delete
 
 from companion.server.app.database import AsyncSessionLocal
+from companion.server.app.config import settings
 from companion.server.app.models.device import DeviceModel
 from companion.server.app.routers.ws import StarletteChannel, serve_websocket
 from companion.server.app.security.tokens import hash_token
@@ -144,6 +145,21 @@ async def test_starlette_channel_translates_messages():
 
     await channel.send_json({"ok": True})
     assert ws.sent == [{"ok": True}]
+
+
+async def test_starlette_channel_rejects_oversized_text(monkeypatch):
+    monkeypatch.setattr(settings, "WS_MAX_MESSAGE_BYTES", 8)
+    ws = FakeWebSocket()
+    channel = StarletteChannel(ws)
+
+    ws.push_text('{"x": "definitely too long"}')
+    assert await channel.receive() is None
+    assert ws.closed == (4429, "message_too_large")
+
+
+async def test_transport_limit_is_above_application_limit():
+    """uvicorn 必须先放过超限帧，应用层才能用 4429 关闭。"""
+    assert settings.WS_TRANSPORT_MAX_MESSAGE_BYTES > settings.WS_MAX_MESSAGE_BYTES
 
 
 async def _wait_accepted(ws: FakeWebSocket, timeout: float = 2.0) -> bool:

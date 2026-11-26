@@ -19,7 +19,10 @@ from typing import Any, Protocol
 from companion.server.app.config import settings
 from companion.server.app.database import AsyncSessionLocal
 from companion.server.app.models.device import DeviceModel
-from companion.server.app.services.action_orchestrator import invalidate_device_scheduler
+from companion.server.app.services.action_orchestrator import (
+    invalidate_device_scheduler,
+    mark_action_reported,
+)
 from companion.server.app.services.clock import now_ms
 from companion.server.app.services.device_registry import (
     ActionResult,
@@ -110,6 +113,7 @@ class DeviceSession:
             Callable[[DeviceSession, dict[str, Any]], Awaitable[None]] | None
         ) = None
         self._writer: asyncio.Task | None = None
+        self._writer_stopping = False
 
     @staticmethod
     def _initial_report(device: DeviceModel) -> dict[str, Any]:
@@ -204,10 +208,11 @@ class DeviceSession:
         self, handler: Callable[[DeviceSession, dict[str, Any]], Awaitable[None]]
     ) -> None:
         self._report_handler = handler
+        self._writer_stopping = False
         self._writer = asyncio.create_task(self._writer_loop())
 
     def queue_report(self, report: dict[str, Any]) -> None:
-        if self.closed:
+        if self.closed or self._writer_stopping:
             return
         try:
             self._report_queue.put_nowait(report)
@@ -250,21 +255,36 @@ class DeviceSession:
                 logger.exception("device report flush failed: %s", self.device_id)
 
     async def stop_writer(self) -> None:
-        """优雅停止 writer：先冲刷最后一条上报，再让循环自行退出。"""
+        """优雅停止 writer：按 FIFO 冲刷最后一条上报后退出。
+
+        不能一边让 writer 跑、一边自己 flush：两个 handler 并发写库时，慢的
+        旧上报可能晚于新上报提交，把最新状态覆盖回旧值。这里先投递停止哨兵，
+        让 writer 以自己的顺序处理完剩余上报；只有 writer 卡死超时才取消它，
+        再由当前协程接管队列。
+        """
         writer = self._writer
+        self._writer_stopping = True
         if writer is None or writer.done():
+            await self._flush_reports()
             return
-        await self._flush_reports()
-        for _ in range(3):
-            try:
-                self._report_queue.put_nowait(_WRITER_STOP)
-                break
-            except asyncio.QueueFull:
-                await self._flush_reports()
+
+        # 队列容量为 1；等 writer 取走当前条目后再放哨兵。
         try:
-            await asyncio.wait_for(writer, timeout=1.0)
-        except (asyncio.TimeoutError, asyncio.CancelledError):
+            await asyncio.wait_for(self._report_queue.put(_WRITER_STOP), timeout=1.0)
+        except asyncio.TimeoutError:
+            pass
+
+        try:
+            await asyncio.wait_for(asyncio.shield(writer), timeout=1.0)
+            return
+        except asyncio.TimeoutError:
             writer.cancel()
+        except asyncio.CancelledError:
+            if not writer.cancelled():
+                raise
+
+        await asyncio.gather(writer, return_exceptions=True)
+        await self._flush_reports()
 
     def _stop_writer(self) -> None:
         if self._writer and not self._writer.done():
@@ -560,8 +580,13 @@ class DeviceGateway:
                 await self._publish_status(session.device_id, online=False)
 
     async def shutdown(self) -> None:
-        """服务关闭时主动断开所有设备，避免连接悬挂。"""
+        """服务关闭时主动断开所有设备，避免连接悬挂。
+
+        先冲刷 writer 再注销链路，否则最后一条 `device.report` 会因
+        `_handle_report` 的「已不是当前链路」检查而被丢弃。
+        """
         for session in list(self._sessions):
+            await session.stop_writer()
             if get_device_link(session.device_id) is session:
                 unregister_device_link(session.device_id, link=session)
                 invalidate_device_scheduler(session.device_id)
@@ -604,6 +629,8 @@ class DeviceGateway:
                 # 服务端已广播过终态（超时/急停/断连）或该 action_id 不是本
                 # 会话下发的；迟到回执只更新设备内部状态，不再打扰 App。
                 return
+            # 同步标记，堵住「设备先回报、服务端随后急停/断连」的重复终态窗口。
+            mark_action_reported(session.device_id, action_id)
             publish_async(
                 self.bus,
                 {

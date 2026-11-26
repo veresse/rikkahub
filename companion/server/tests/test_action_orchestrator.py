@@ -280,9 +280,96 @@ async def test_inflight_command_timeout_emits_terminal_and_stop(monkeypatch):
         assert event["detail"] == "timeout"
         assert event["source"] == "app"
         assert any(c.get("type") == "action.stop" for c in link.commands)
+        # 终态必须恰好一次（worker 结算与急停不得各发一条）。
+        assert len([e for e in events if e.get("action_id") == "term-1"]) == 1
     finally:
         bus.unsubscribe(collect)
         mod.invalidate_device_scheduler("dev-force")
+
+
+class _DeviceReportingLink:
+    """模拟设备已回报结果、但 worker 还没被调度恢复的窗口。"""
+
+    def __init__(self, device_id: str, action_id: str):
+        self.device_id = device_id
+        self.action_id = action_id
+        self.commands: list[dict] = []
+        self.reported = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def send(self, command: dict) -> ActionResult:
+        self.commands.append(command)
+        if command.get("type") == "action.stop":
+            return ActionResult(status="done")
+        # 与 DeviceGateway 收到 action.result 后的处理顺序一致：
+        # 先同步标记已回报，再由 worker 恢复。
+        import companion.server.app.services.action_orchestrator as mod
+
+        mod.mark_action_reported(self.device_id, self.action_id)
+        self.reported.set()
+        await self.release.wait()
+        return ActionResult(status="done", action_id=self.action_id)
+
+    async def get_status(self) -> dict:
+        return {}
+
+
+async def test_device_reported_result_suppresses_late_stop_terminal():
+    import companion.server.app.services.action_orchestrator as mod
+    from companion.server.app.services.events import get_event_bus
+
+    bus = get_event_bus()
+    events: list[dict] = []
+
+    async def collect(event: dict) -> None:
+        events.append(event)
+
+    bus.subscribe(collect)
+    link = _DeviceReportingLink("dev-race", "race-1")
+    scheduler = _DeviceScheduler("dev-race", link)
+    mod._SCHEDULERS["dev-race"] = scheduler
+    try:
+        await scheduler.enqueue(
+            {
+                "v": 2,
+                "type": "action.play",
+                "action_id": "race-1",
+                "name": "nod",
+                "source": "app",
+            }
+        )
+        await asyncio.wait_for(link.reported.wait(), timeout=1.0)
+
+        # 网关在设备回报时已经广播过一次 done；此时用户急停。
+        mod.publish_async(
+            bus,
+            {
+                "v": 2,
+                "type": "action.result",
+                "device_id": "dev-race",
+                "action_id": "race-1",
+                "status": "done",
+                "detail": "",
+                "source": "app",
+                "ts": 1,
+            },
+        )
+        await scheduler.stop("user_stop")
+        link.release.set()
+
+        await _collect_until(
+            lambda: [e for e in events if e.get("action_id") == "race-1"]
+        )
+        await asyncio.sleep(0.05)
+        results = [
+            e
+            for e in events
+            if e.get("type") == "action.result" and e.get("action_id") == "race-1"
+        ]
+        assert [r["status"] for r in results] == ["done"]
+    finally:
+        bus.unsubscribe(collect)
+        mod.invalidate_device_scheduler("dev-race")
 
 
 async def test_expired_queued_command_is_dropped_with_terminal_event(monkeypatch):

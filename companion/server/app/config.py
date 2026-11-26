@@ -84,6 +84,9 @@ class Settings(BaseSettings):
     DEVICE_HELLO_TIMEOUT_SECONDS: float = 5.0
     DEVICE_STATUS_TIMEOUT_SECONDS: float = 3.0
     WS_MAX_MESSAGE_BYTES: int = 64 * 1024
+    # 传输层上限必须高于应用层阈值，否则超限帧会先被 uvicorn 以 1009 关闭，
+    # 应用层的 4429 message_too_large 分支永远不可达。
+    WS_TRANSPORT_MAX_MESSAGE_BYTES: int = 128 * 1024
     WS_PING_INTERVAL_SECONDS: float = 25.0
     WS_PING_TIMEOUT_SECONDS: float = 10.0
 

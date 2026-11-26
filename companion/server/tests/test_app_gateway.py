@@ -487,3 +487,29 @@ async def test_rate_limit_covers_stop_and_get_status():
     assert blocked["error"] == "rate_limited"
 
     await _stop(task, channel)
+
+
+async def test_app_gateway_resubscribes_after_bus_clear():
+    from companion.server.app.services.events import EventBus
+
+    bus = EventBus()
+    gateway = AppGateway(bus)
+
+    first = FakeChannel()
+    first_task = asyncio.create_task(gateway.handle(TOKEN_ID, first))
+    await asyncio.sleep(0)
+
+    # 测试隔离/进程重启用 clear 清掉订阅后，新连接必须能重新订阅。
+    bus.clear()
+    second = FakeChannel()
+    second_task = asyncio.create_task(gateway.handle(TOKEN_ID, second))
+    await asyncio.sleep(0)
+
+    await bus.publish(
+        {"v": 2, "type": "device.report", "device_id": DEVICE_ID, "volume": 10}
+    )
+    message = await second.wait_sent(lambda m: m.get("type") == "device.report")
+    assert message["volume"] == 10
+
+    await _stop(first_task, first)
+    await _stop(second_task, second)

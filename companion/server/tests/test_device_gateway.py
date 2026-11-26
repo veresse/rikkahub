@@ -369,6 +369,57 @@ async def test_last_report_is_persisted_on_disconnect(seeded_device):
         assert device.last_report_json["volume"] == 23
 
 
+async def test_stop_writer_flushes_reports_in_order(seeded_device):
+    """下线冲刷不得与 writer 并发，否则慢的旧上报会覆盖新上报。"""
+    harness = Harness()
+    task, channel, _ = await harness.connected()
+    session = get_device_link(DEVICE_ID)
+    assert session is not None
+
+    order: list[int] = []
+    started = asyncio.Event()
+
+    async def slow_handler(_session, report: dict) -> None:
+        order.append(report["volume"])
+        if report["volume"] == 1:
+            started.set()
+            await asyncio.sleep(0.05)
+
+    session._report_handler = slow_handler
+    session.queue_report({"volume": 1})
+    # 等 writer 真正取走第一条并进入慢 handler，再把第二条放进容量为 1 的队列。
+    await asyncio.wait_for(started.wait(), timeout=1.0)
+    session.queue_report({"volume": 2})
+    await session.stop_writer()
+
+    assert order == [1, 2]
+    await _stop(task, channel)
+
+
+async def test_shutdown_flushes_queued_report(seeded_device):
+    """服务关闭也必须冲刷最后一条上报，而不是直接 cancel writer。"""
+    harness = Harness()
+    task, channel, _ = await harness.connected()
+    session = get_device_link(DEVICE_ID)
+    assert session is not None
+
+    persisted: list[int] = []
+
+    async def handler(_session, report: dict) -> None:
+        persisted.append(report["volume"])
+
+    session._report_handler = handler
+    # 让 writer 先退出，模拟「上报已入队、writer 尚未/无法消费」。
+    session._writer.cancel()
+    await asyncio.gather(session._writer, return_exceptions=True)
+    session.queue_report({"volume": 77})
+
+    await harness.gateway.shutdown()
+    assert persisted == [77]
+
+    await asyncio.wait_for(task, timeout=2.0)
+
+
 async def test_device_report_updates_snapshot_and_publishes_event(seeded_device):
     harness = Harness()
     task, channel, _ = await harness.connected()
