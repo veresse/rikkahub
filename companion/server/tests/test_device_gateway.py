@@ -33,11 +33,16 @@ class FakeChannel:
     def __init__(self):
         self.incoming: asyncio.Queue = asyncio.Queue()
         self.sent: list[dict] = []
+        self.sent_bytes: list[bytes] = []
         self.closed: tuple[int, str] | None = None
         self.sent_event = asyncio.Event()
 
     async def send_json(self, payload: dict) -> None:
         self.sent.append(payload)
+        self.sent_event.set()
+
+    async def send_bytes(self, data: bytes) -> None:
+        self.sent_bytes.append(data)
         self.sent_event.set()
 
     async def receive(self):

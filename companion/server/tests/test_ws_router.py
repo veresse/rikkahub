@@ -27,6 +27,7 @@ class FakeWebSocket:
         self.accepted = False
         self.closed: tuple[int, str] | None = None
         self.sent: list[dict] = []
+        self.sent_bytes: list[bytes] = []
         self.incoming: asyncio.Queue = asyncio.Queue()
         self.sent_event = asyncio.Event()
 
@@ -40,6 +41,10 @@ class FakeWebSocket:
 
     async def send_json(self, payload: dict) -> None:
         self.sent.append(payload)
+        self.sent_event.set()
+
+    async def send_bytes(self, data: bytes) -> None:
+        self.sent_bytes.append(data)
         self.sent_event.set()
 
     async def receive(self):
@@ -145,6 +150,9 @@ async def test_starlette_channel_translates_messages():
 
     await channel.send_json({"ok": True})
     assert ws.sent == [{"ok": True}]
+
+    await channel.send_bytes(b"\xa1\x01\x01\x00" + b"\x00" * 8 + b"x")
+    assert ws.sent_bytes == [b"\xa1\x01\x01\x00" + b"\x00" * 8 + b"x"]
 
 
 async def test_starlette_channel_rejects_oversized_text(monkeypatch):

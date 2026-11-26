@@ -37,6 +37,11 @@ class StarletteChannel:
         async with self._send_lock:
             await self.websocket.send_json(payload)
 
+    async def send_bytes(self, data: bytes) -> None:
+        # 与 send_json 共用一把锁：voice.segment 文本必须先于同段音频帧发出。
+        async with self._send_lock:
+            await self.websocket.send_bytes(data)
+
     async def receive(self) -> dict[str, Any] | bytes | None:
         message = await self.websocket.receive()
         if message.get("type") == "websocket.disconnect":

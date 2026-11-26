@@ -19,6 +19,16 @@ from typing import Any, Protocol
 from sqlalchemy import update
 
 from companion.server.app.config import settings
+from companion.server.app.audio.framing import (
+    FLAG_LAST,
+    FLAG_SILENCE,
+    KIND_DOWNLINK,
+    KIND_UPLINK,
+    MAX_PAYLOAD_BYTES,
+    AudioFrame,
+    FrameError,
+)
+from companion.server.app.audio.pipeline import VoiceSession
 from companion.server.app.database import AsyncSessionLocal
 from companion.server.app.models.device import DeviceModel
 from companion.server.app.services.action_orchestrator import (
@@ -66,6 +76,8 @@ class WSChannel(Protocol):
     """WebSocket 的最小抽象，测试用 FakeChannel 实现。"""
 
     async def send_json(self, payload: dict[str, Any]) -> None: ...
+
+    async def send_bytes(self, data: bytes) -> None: ...
 
     async def receive(self) -> dict[str, Any] | bytes | None: ...
 
@@ -129,6 +141,9 @@ class DeviceSession:
         self._pending: dict[str, asyncio.Future[ActionResult]] = {}
         self._sources: dict[str, str] = {}
         self._send_lock = asyncio.Lock()
+        self._audio_seq = 0
+        # 每连接至多一轮语音；由网关在 voice.start 时创建，Block B 接入管线。
+        self.voice: VoiceSession | None = None
         # 上报合并队列：设备高频上报时只保留最新一条，避免阻塞读循环。
         self._report_queue: asyncio.Queue[Any] = asyncio.Queue(maxsize=1)
         self._report_handler: (
@@ -235,6 +250,54 @@ class DeviceSession:
             "tilt_offset": report["tilt_offset"],
             "ts": now_ms(),
         }
+
+    async def send_audio(
+        self, payload: bytes, *, turn_seq: int, flags: int = 0
+    ) -> bool:
+        """下发一帧下行 TTS；`seq` 由本连接单调分配。
+
+        返回 False 表示链路不可写或参数非法；调用方应结束本轮，不要重试到
+        下一轮（旧音频串入新轮比丢一段更糟）。
+        """
+        if not self.ready or self.closing or self.closed:
+            return False
+        if self.protocol_version < 2:
+            return False
+        if not isinstance(turn_seq, int) or isinstance(turn_seq, bool) or turn_seq < 0:
+            return False
+        if flags & ~(FLAG_LAST | FLAG_SILENCE):
+            return False
+        data = bytes(payload)
+        if len(data) > MAX_PAYLOAD_BYTES:
+            return False
+        if not data and not (flags & FLAG_SILENCE):
+            return False
+
+        async with self._send_lock:
+            frame = AudioFrame(
+                kind=KIND_DOWNLINK,
+                flags=flags,
+                seq=self._audio_seq,
+                turn_seq=turn_seq,
+                payload=data,
+            )
+            self._audio_seq = (self._audio_seq + 1) & 0xFFFFFFFF
+            try:
+                await self.channel.send_bytes(frame.encode())
+                return True
+            except Exception:
+                logger.debug(
+                    "device audio send failed: %s", self.device_id, exc_info=True
+                )
+                self.closing = True
+                return False
+
+    async def close_voice(self) -> None:
+        voice = self.voice
+        if voice is None:
+            return
+        voice.close()
+        self.voice = None
 
     # ---- 上报写出 ----
 
@@ -436,6 +499,7 @@ class DeviceSession:
                 self.close_reason = reason
             await self.stop_writer()
             self.closed = True
+            await self.close_voice()
             self._stop_writer()
             self._resolve_all(ActionResult(status="failed", detail="device_offline"))
             try:
@@ -820,8 +884,9 @@ class DeviceGateway:
         # 已被替换/关闭的连接不再处理上报，避免旧连接覆盖新会话状态。
         if session.closed:
             return
-        # 二进制音频帧属于后续音频 Block；这里只保证不阻塞控制消息。
+        # 二进制音频帧只进入当前语音轮次；未 start 或非 listening 时丢弃。
         if isinstance(message, (bytes, bytearray)):
+            await self._handle_audio_frame(session, bytes(message))
             return
         if not isinstance(message, dict):
             return
@@ -878,7 +943,119 @@ class DeviceGateway:
             )
             return
 
+        if message_type in {
+            "voice.start",
+            "voice.end",
+            "voice.cancel",
+            "voice.segment_played",
+        }:
+            await self._handle_voice_message(session, message)
+            return
+
         logger.debug("ignore unknown device message: %s", message_type)
+
+    async def _handle_audio_frame(self, session: DeviceSession, raw: bytes) -> None:
+        """解析上行帧并交给当前轮次；不因畸形帧关闭控制通道。"""
+        if not session.ready or session.closing or session.closed:
+            return
+        if session.protocol_version < 2:
+            return
+        voice = session.voice
+        # 只有正在收音的轮次才解析 payload：THINKING/SPEAKING 期间的迟到帧
+        # 按半双工规则直接丢弃，避免旧麦克风数据串入下一轮。
+        if voice is None or voice.state != "listening":
+            return
+        try:
+            frame = AudioFrame.parse(raw)
+        except FrameError as exc:
+            logger.debug(
+                "device audio frame rejected: %s reason=%s", session.device_id, exc
+            )
+            await self._send_voice_error(session, "invalid_frame", voice.turn_id)
+            return
+        if frame.kind != KIND_UPLINK:
+            logger.debug(
+                "device sent non-uplink audio: %s kind=%s",
+                session.device_id,
+                frame.kind,
+            )
+            await self._send_voice_error(session, "invalid_frame", voice.turn_id)
+            return
+        await voice.accept_frame(frame)
+
+    async def _handle_voice_message(
+        self, session: DeviceSession, message: dict[str, Any]
+    ) -> None:
+        if not session.ready or session.closing or session.closed:
+            return
+        if session.protocol_version < 2:
+            return
+
+        message_type = message.get("type")
+        turn_id = message.get("turn_id")
+        if not isinstance(turn_id, str):
+            turn_id = ""
+
+        if message_type == "voice.start":
+            if not turn_id:
+                await self._send_voice_error(session, "invalid_turn", "")
+                return
+            voice = session.voice
+            if voice is None or voice.state == "closed":
+                voice = VoiceSession(session.device_id)
+                session.voice = voice
+            if not voice.start(turn_id):
+                await self._send_voice_error(session, "busy", turn_id)
+            return
+
+        voice = session.voice
+        if message_type == "voice.end":
+            if voice is None or not voice.active or voice.turn_id != turn_id:
+                await self._send_voice_error(session, "invalid_turn", turn_id)
+                return
+            voice.end_user_speech()
+            return
+
+        if message_type == "voice.cancel":
+            if voice is None or not voice.active or voice.turn_id != turn_id:
+                await self._send_voice_error(session, "invalid_turn", turn_id)
+                return
+            reason = message.get("reason")
+            if reason not in ("barge_in", "user_stop"):
+                await self._send_voice_error(session, "invalid_turn", turn_id)
+                return
+            voice.cancel()
+            await session._safe_send(
+                {
+                    "v": 2,
+                    "type": "voice.cancel_ack",
+                    "turn_id": turn_id,
+                    "reason": reason,
+                    "ts": now_ms(),
+                }
+            )
+            return
+
+        if message_type == "voice.segment_played":
+            if voice is None or voice.turn_id != turn_id:
+                await self._send_voice_error(session, "invalid_turn", turn_id)
+                return
+            # 重复的 segment_seq 由 VoiceSession 幂等丢弃；轮次已结束时也静默忽略。
+            voice.segment_played(message.get("segment_seq"))
+
+    async def _send_voice_error(
+        self, session: DeviceSession, code: str, turn_id: str | None
+    ) -> None:
+        await session._safe_send(
+            {
+                "v": 2,
+                "type": "voice.error",
+                "turn_id": turn_id or "",
+                "code": code,
+                "message": "",
+                "ts": now_ms(),
+            }
+        )
 
     async def _handle_report(self, session: DeviceSession, report: dict[str, Any]) -> None:
         """合并队列的消费者：应用上报、落库、广播协议 §5.2 形状。"""
