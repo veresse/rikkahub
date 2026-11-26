@@ -19,8 +19,12 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import subprocess
+import sys
 import threading
 import time
+import uuid
+from pathlib import Path
 
 import pytest
 import uvicorn
@@ -139,30 +143,28 @@ class E2EContext:
     async def login_other_app(self) -> SimulatedApp:
         other = SimulatedApp(self.app.base_url)
         await other.__aenter__()
-        await other.login(password=ADMIN_PASSWORD)
+        # 先登记再登录：登录失败时 cleanup 也能关闭底层 httpx client。
         self.extra_apps.append(other)
+        await other.login(password=ADMIN_PASSWORD)
         return other
 
     async def connect_app(self, app: SimulatedApp | None = None) -> SimulatedApp:
-        """连接 `/app/ws` 并等待服务端真正注册会话。
+        """连接 `/app/ws` 并用一次黑盒往返确认服务端已注册会话。
 
-        `websockets.connect()` 在收到 101 后就返回，但服务端可能还没执行完
-        `AppGateway.handle()`。广播只在已注册会话间投递、不补发，因此测试
-        必须先确认会话已挂载，否则会漏掉紧接着发生的事件。
+        `websockets.connect()` 收到 101 就返回，服务端可能还没执行完
+        `AppGateway.handle()`；广播只投递给已注册会话且不补发。用一个不存在
+        的 device_id 发 `remote.get_status` 会得到 `device_offline` ack：既能
+        证明会话已挂载，又不依赖进程内私有状态，对远端服务器同样适用。
         """
         target = app or self.app
         if target.ws is None:
             await target.connect_ws()
 
-        from companion.server.app.routers import ws as ws_module
-
-        deadline = time.monotonic() + 5.0
-        while time.monotonic() < deadline:
-            sessions = ws_module.app_gateway._sessions.get(target.token_id, set())
-            if any(not session.closed for session in sessions):
-                return target
-            await asyncio.sleep(0.01)
-        raise AssertionError("App WebSocket 会话未在服务端注册")
+        ack = await target.remote("remote.get_status", "__readiness_probe__")
+        assert ack["type"] == "remote.ack", ack
+        assert ack["ok"] is False, ack
+        assert ack["error"] == "device_offline", ack
+        return target
 
     async def new_assistant(self, name: str = "E2E 角色") -> str:
         payload = {
@@ -236,6 +238,10 @@ class E2EContext:
         self.device_ids.append(paired["device_id"])
         if connect:
             await device.connect()
+            assert device.hello_ack is not None, (
+                f"设备握手失败：close_code={device.close_code} "
+                f"reason={device.close_reason}"
+            )
         return device
 
     async def cleanup(self) -> None:
@@ -348,8 +354,11 @@ async def test_v1_device_degrades_and_rejects_remote_commands(e2e):
     assert resp["error"] == "unsupported_protocol"
 
     # v1 设备只走音频通道，绝不能收到 v2 控制消息。
-    await asyncio.sleep(0.1)
+    # 用一次优雅关连接作屏障：服务端在关闭帧之前写下的任何帧都会先被接收循环
+    # 读入 `commands`，因此关闭后断言不存在时序窗口。
+    await device.close()
     assert device.commands_of_type("action.play") == []
+    assert device.received == [], device.received
 
 
 # ---------------------------------------------------------------------------
@@ -391,32 +400,71 @@ async def test_all_18_actions_closed_loop(e2e):
 # ---------------------------------------------------------------------------
 
 
+async def _send_remote_no_wait(app, message_type: str, device_id: str, **fields) -> str:
+    request_id = str(uuid.uuid4())
+    await app.send(
+        {
+            "v": 2,
+            "type": message_type,
+            "request_id": request_id,
+            "device_id": device_id,
+            **fields,
+        }
+    )
+    return request_id
+
+
+async def _wait_ack(app, request_id: str, timeout: float = 5.0) -> dict:
+    return await app.wait_for(
+        lambda e: e.get("type") == "remote.ack" and e.get("request_id") == request_id,
+        timeout=timeout,
+    )
+
+
 async def test_volume_last_write_wins_and_status_snapshot(e2e):
-    device = await e2e.new_device(name="E2E 音量")
+    # 用永不完成的动作占住 worker，才能让两条 volume.set 真正同时排队。
+    device = await e2e.new_device(name="E2E 音量", auto_complete=False)
     await e2e.connect_app()
 
-    first = await e2e.app.remote(
-        "remote.volume.set", device.device_id, volume=30
+    busy = await e2e.app.remote("remote.action.play", device.device_id, name="nod")
+    assert busy["ok"] is True
+    await device.wait_for(
+        lambda e: e.get("type") == "action.play"
+        and e.get("action_id") == busy["action_id"],
+        timeout=5.0,
     )
-    second = await e2e.app.remote(
-        "remote.volume.set", device.device_id, volume=65
-    )
-    assert first["ok"] is True and second["ok"] is True
 
+    first_req = await _send_remote_no_wait(
+        e2e.app, "remote.volume.set", device.device_id, volume=30
+    )
+    second_req = await _send_remote_no_wait(
+        e2e.app, "remote.volume.set", device.device_id, volume=65
+    )
+    first = await _wait_ack(e2e.app, first_req)
+    second = await _wait_ack(e2e.app, second_req)
+    assert first["ok"] is True and second["ok"] is True
+    assert first["action_id"] != second["action_id"]
+
+    # 后到的 volume.set 覆盖仍在排队的前一条：前者 superseded，且从未下发。
+    first_result = await expect_result(e2e.app, first["action_id"])
+    assert (first_result["status"], first_result["detail"]) == ("failed", "superseded")
+    assert len(_results_for(e2e.app, first["action_id"])) == 1
+    assert device.commands_of_type("volume.set") == []
+
+    device.release()
+    second_result = await expect_result(e2e.app, second["action_id"])
+    assert (second_result["status"], second_result["detail"]) == ("done", "")
+    assert len(_results_for(e2e.app, second["action_id"])) == 1
+    assert device.volume == 65
+
+    # 先等设备侧上报把快照推到 65，再查询服务端缓存，避免读到旧音量。
     await e2e.app.wait_for(
         lambda e: e.get("type") == "device.report"
         and e.get("device_id") == device.device_id
+        and e.get("source") is None
         and e.get("volume") == 65,
         timeout=5.0,
     )
-    assert device.volume == 65
-
-    # 每个已受理的 action_id 都有且仅有一条终态。
-    for ack in (first, second):
-        result = await expect_result(e2e.app, ack["action_id"])
-        assert result["status"] in ("done", "failed")
-    for ack in (first, second):
-        assert len(_results_for(e2e.app, ack["action_id"])) == 1
 
     # remote.get_status 返回服务端缓存快照，source=server。
     status = await e2e.app.remote("remote.get_status", device.device_id)
@@ -552,13 +600,82 @@ async def test_offline_device_never_replays_commands(e2e):
     )
     e2e.devices.append(reconnected)
     await reconnected.connect()
-    await asyncio.sleep(0.3)
+    # 用「App 收到新会话上线」作为正向前进屏障：`_install()` 完成才会广播
+    # online=True，任何补发都必然发生在此之前；再断言设备历史为空。
+    await e2e.app.wait_for(
+        lambda e: e.get("type") == "device.status"
+        and e.get("device_id") == device_id
+        and e.get("online") is True,
+        timeout=5.0,
+    )
     assert reconnected.commands_of_type("action.play") == []
 
 
 # ---------------------------------------------------------------------------
 # 撤销断连
 # ---------------------------------------------------------------------------
+
+
+async def test_device_wait_closed_without_timeout_blocks_until_close(e2e):
+    """CLI 联调依赖 `wait_closed(timeout=None)` 常驻，不能被默认 5s 超时打断。"""
+    device = await e2e.new_device(name="E2E 常驻等待")
+    waiter = asyncio.create_task(device.wait_closed(timeout=None))
+    await asyncio.sleep(0.1)
+    assert not waiter.done()
+
+    await device.close()
+    await asyncio.wait_for(waiter, timeout=5.0)
+
+
+async def test_device_simulator_cli_stays_connected(e2e):
+    """CLI 主用法必须常驻；旧实现 `wait_closed()` 默认 5s 超时会直接崩掉。"""
+    repo_root = Path(__file__).resolve().parents[2]
+    device = await e2e.new_device(name="E2E CLI", connect=False)
+    proc = subprocess.Popen(
+        [
+            sys.executable,
+            "-m",
+            "companion.simulators.device_simulator",
+            "--base-url",
+            e2e.app.base_url,
+            "--device-id",
+            device.device_id,
+            "--token",
+            device.token,
+            "--time-scale",
+            "0.01",
+            "--report-interval",
+            "1",
+        ],
+        cwd=str(repo_root),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        # 超过旧实现的 5s 默认超时；仍在运行说明 CLI 没有自行退出。
+        await asyncio.sleep(6.0)
+        assert proc.poll() is None, proc.stderr.read() if proc.stderr else ""
+
+        # 不仅活着，还必须真的握上手、能接收指令。
+        await e2e.connect_app()
+        ack = await e2e.app.remote(
+            "remote.volume.set", device.device_id, volume=44
+        )
+        assert ack["ok"] is True, ack
+        await e2e.app.wait_for(
+            lambda e: e.get("type") == "device.report"
+            and e.get("device_id") == device.device_id
+            and e.get("volume") == 44,
+            timeout=5.0,
+        )
+    finally:
+        proc.terminate()
+        try:
+            await asyncio.to_thread(proc.wait, 10)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            await asyncio.to_thread(proc.wait, 5)
 
 
 async def test_app_token_revocation_closes_ws(e2e):
@@ -635,6 +752,14 @@ async def test_chat_tool_loop_drives_real_device(e2e, monkeypatch):
     assert "好的" in contents and "收到" in contents
     assert any(e.get("type") == "done" for e in events)
 
+    # 第二轮必须把 tool 结果回灌给模型，否则模型只是凭空续说。
+    assert len(fake.calls) == 2
+    tool_messages = [
+        m for m in fake.calls[1]["messages"] if m.get("role") == "tool"
+    ]
+    assert [m["tool_call_id"] for m in tool_messages] == ["call_1"]
+    assert json.loads(tool_messages[0]["content"])["ok"] is True
+
     command = device.commands_of_type("action.play")[0]
     assert command["name"] == "nod"
     assert command["intensity"] == 3
@@ -647,24 +772,39 @@ async def test_chat_tool_loop_drives_real_device(e2e, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-async def test_app_remote_rate_limit(e2e):
+async def test_app_remote_rate_limit(e2e, monkeypatch):
+    # 固定窗口为 3 条/秒，避免依赖「15 次串行 RTT 必须挤进 1 秒」的时序。
+    from companion.server.app.services import app_gateway as app_gateway_module
+
+    monkeypatch.setattr(app_gateway_module, "MAX_REMOTE_PER_SECOND", 3)
+
     device = await e2e.new_device(name="E2E 限速")
-    await e2e.connect_app()
+    # 这里只需要 ack（会话已注册），不需要广播就绪同步，避免探针占用窗口。
+    await e2e.app.connect_ws()
 
     acks = []
-    for _ in range(15):
+    for _ in range(6):
         acks.append(await e2e.app.remote("remote.get_status", device.device_id))
-    assert any(a.get("error") == "rate_limited" for a in acks)
-    assert all(a["ok"] is False for a in acks if a.get("error") == "rate_limited")
+    limited = [a for a in acks if a.get("error") == "rate_limited"]
+    assert len(limited) == 3, acks
+    assert all(a["ok"] is False for a in limited)
+    assert all(a["ok"] is True for a in acks if a not in limited)
 
 
 async def test_logs_do_not_leak_tokens_or_passwords(e2e, caplog):
     import logging
 
-    # 排除客户端库：httpx/httpcore/websockets 在 DEBUG 级别会打印自己发出的
-    # 请求头（含 Authorization），那是模拟器本地日志，不是服务端泄漏。
-    client_loggers = ("httpx", "httpcore", "websockets")
+    # 第三方库在 DEBUG 会打印自己收发的请求头（含 Authorization），属于
+    # 库日志而非本项目日志；这里把它们的级别压回 WARNING，只断言本项目
+    # 与服务端框架的 logger。
+    for library in ("httpx", "httpcore", "websockets"):
+        logging.getLogger(library).setLevel(logging.WARNING)
     caplog.set_level(logging.DEBUG)
+
+    # 登录必须发生在 call 阶段：caplog 在用例开始时才安装，setup 阶段的
+    # 登录日志不会被采集，密码断言否则恒真。
+    await e2e.login_other_app()
+
     device = await e2e.new_device(name="E2E 日志", auto_complete=False)
     await e2e.connect_app()
     ack = await e2e.app.remote(
@@ -682,10 +822,10 @@ async def test_logs_do_not_leak_tokens_or_passwords(e2e, caplog):
     records = [
         r
         for r in caplog.records
-        if not any(r.name == p or r.name.startswith(p + ".") for p in client_loggers)
+        if r.name.startswith(("companion.", "uvicorn"))
     ]
     logged = "\n".join(f"{r.name}: {r.getMessage()}" for r in records)
-    assert records, "服务端/数据库日志为空，测试失去意义"
+    assert records, "服务端日志为空，测试失去意义"
     assert any(r.name.startswith("companion.server") for r in records)
     assert e2e.app.token not in logged
     assert device.token not in logged

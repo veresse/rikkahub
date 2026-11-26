@@ -143,9 +143,14 @@ class SimulatedDevice:
             return self
 
         try:
-            self.hello_ack = json.loads(raw)
+            parsed = json.loads(raw)
         except (TypeError, json.JSONDecodeError):
+            parsed = None
+        if not isinstance(parsed, dict) or parsed.get("type") != "hello_ack":
             self.hello_ack = None
+            await self.close()
+            return self
+        self.hello_ack = parsed
 
         self._receiver = asyncio.create_task(self._receive_loop())
         if self.report_interval:
@@ -154,6 +159,16 @@ class SimulatedDevice:
         return self
 
     async def close(self) -> None:
+        # 先断链再取消动作，模拟真机掉电/断网：在途动作没有机会补发
+        # `action.result`，服务端应走 device_offline 路径。需要「优雅停止」
+        # 语义的测试请显式发送 `action.stop`。
+        ws = self.ws
+        self.ws = None
+        if ws is not None:
+            try:
+                await ws.close()
+            except Exception:
+                pass
         for task in list(self._actions.values()):
             task.cancel()
         if self._actions:
@@ -163,13 +178,6 @@ class SimulatedDevice:
             self._heartbeat.cancel()
             await asyncio.gather(self._heartbeat, return_exceptions=True)
             self._heartbeat = None
-        ws = self.ws
-        self.ws = None
-        if ws is not None:
-            try:
-                await ws.close()
-            except Exception:
-                pass
         if self._receiver is not None:
             try:
                 await asyncio.wait_for(self._receiver, timeout=2.0)
@@ -179,8 +187,11 @@ class SimulatedDevice:
             self._receiver = None
         self._closed.set()
 
-    async def wait_closed(self, timeout: float = 5.0) -> "SimulatedDevice":
-        await asyncio.wait_for(self._closed.wait(), timeout=timeout)
+    async def wait_closed(self, timeout: float | None = 5.0) -> "SimulatedDevice":
+        if timeout is None:
+            await self._closed.wait()
+        else:
+            await asyncio.wait_for(self._closed.wait(), timeout=timeout)
         return self
 
     # ---- 上行 ----
@@ -197,9 +208,12 @@ class SimulatedDevice:
             return False
 
     async def send_report(self) -> bool:
+        if self.protocol_version < 2:
+            # v1 设备只走音频通道，不发送 v2 控制面状态帧。
+            return False
         return await self._send(
             {
-                "v": 2,
+                "v": self.protocol_version,
                 "type": "device.report",
                 "volume": int(self.volume),
                 "pan": float(self.pan),
@@ -215,15 +229,15 @@ class SimulatedDevice:
 
     async def _send_result(self, action_id: str, status: str, detail: str = "") -> None:
         payload = {
-            "v": 2,
+            "v": self.protocol_version,
             "type": "action.result",
             "action_id": action_id,
             "status": status,
             "detail": detail,
             "ts": _now_ms(),
         }
-        self.results_sent.append(payload)
-        await self._send(payload)
+        if await self._send(payload):
+            self.results_sent.append(payload)
 
     # ---- 测试辅助 ----
 
@@ -289,6 +303,11 @@ class SimulatedDevice:
             if isinstance(name, str) and name:
                 self.expression = name
             await self.send_report()
+            # §4.4 是 fire-and-forget（无 action_id）；但若服务端/固件变体带了
+            # action_id，必须回执，否则调用方会一直等到超时。
+            action_id = message.get("action_id")
+            if isinstance(action_id, str) and action_id:
+                await self._send_result(action_id, "done", "")
             return
 
         action_id = message.get("action_id")
@@ -315,8 +334,12 @@ class SimulatedDevice:
 
     def _apply_offsets(self, message: dict[str, Any]) -> None:
         try:
-            self.pan_offset = _clamp(float(message.get("pan_offset", 0.0)), -OFFSET_LIMIT, OFFSET_LIMIT)
-            self.tilt_offset = _clamp(float(message.get("tilt_offset", 0.0)), -OFFSET_LIMIT, OFFSET_LIMIT)
+            self.pan_offset = _clamp(
+                float(message.get("pan_offset", 0.0)), -OFFSET_LIMIT, OFFSET_LIMIT
+            )
+            self.tilt_offset = _clamp(
+                float(message.get("tilt_offset", 0.0)), -OFFSET_LIMIT, OFFSET_LIMIT
+            )
         except (TypeError, ValueError):
             pass
 
@@ -461,7 +484,7 @@ def main() -> None:
         await device.connect()
         print(f"device ws connected, hello_ack={json.dumps(device.hello_ack, ensure_ascii=False)}")
         try:
-            await device.wait_closed()
+            await device.wait_closed(timeout=None)
         finally:
             await device.close()
 

@@ -458,6 +458,84 @@ async def test_stop_writer_retries_inflight_report_after_timeout(
     await _stop(task, channel)
 
 
+async def test_close_flushes_queued_report(seeded_device):
+    """撤销设备等外部 `close()` 路径也必须落库最后一条上报。"""
+    harness = Harness()
+    task, channel, _ = await harness.connected()
+    session = get_device_link(DEVICE_ID)
+    assert session is not None
+
+    # 模拟「上报已入队、writer 尚未消费」时连接被关闭（例如设备被撤销）。
+    session._writer.cancel()
+    await asyncio.gather(session._writer, return_exceptions=True)
+    channel.push({"v": 2, "type": "device.report", "volume": 42, "state": "speaking"})
+    await wait_until(lambda: not session._report_queue.empty())
+
+    await session.close(4401, "device_revoked")
+    await asyncio.wait_for(task, timeout=2.0)
+
+    async with AsyncSessionLocal() as db:
+        device = await db.get(DeviceModel, DEVICE_ID)
+        assert device.volume == 42
+        assert device.state == "speaking"
+        assert device.last_report_json["volume"] == 42
+
+
+async def test_replacement_flushes_queued_report(seeded_device):
+    """新连接替换旧连接前，旧连接最后一条上报必须落库，避免快照回退。"""
+    harness = Harness()
+    task_a, channel_a, _ = await harness.connected()
+    session_a = get_device_link(DEVICE_ID)
+    assert session_a is not None
+
+    session_a._writer.cancel()
+    await asyncio.gather(session_a._writer, return_exceptions=True)
+    channel_a.push({"v": 2, "type": "device.report", "volume": 51})
+    await wait_until(lambda: not session_a._report_queue.empty())
+
+    task_b, channel_b, _ = await harness.connected()
+
+    async with AsyncSessionLocal() as db:
+        device = await db.get(DeviceModel, DEVICE_ID)
+        assert device.volume == 51
+        assert device.last_report_json["volume"] == 51
+
+    await asyncio.wait_for(task_a, timeout=2.0)
+    await _stop(task_b, channel_b)
+
+
+async def test_concurrent_stop_writer_preserves_fifo(seeded_device, monkeypatch):
+    """并发 stop_writer() 不得各取一部分队列，导致慢的旧上报后提交。"""
+    import companion.server.app.services.device_gateway as mod
+
+    monkeypatch.setattr(mod, "REPORT_STOP_QUEUE_TIMEOUT_SECONDS", 0.02)
+    monkeypatch.setattr(mod, "REPORT_STOP_DRAIN_TIMEOUT_SECONDS", 0.02)
+
+    harness = Harness()
+    task, channel, _ = await harness.connected()
+    session = get_device_link(DEVICE_ID)
+    assert session is not None
+
+    order: list[int] = []
+    started = asyncio.Event()
+
+    async def slow_handler(_session, report: dict) -> None:
+        if report["volume"] == 1:
+            started.set()
+            await asyncio.sleep(0.1)
+        order.append(report["volume"])
+
+    session._report_handler = slow_handler
+    session.queue_report({"volume": 1})
+    await asyncio.wait_for(started.wait(), timeout=1.0)
+    session.queue_report({"volume": 2})
+
+    await asyncio.gather(session.stop_writer(), session.stop_writer())
+
+    assert order == [1, 2]
+    await _stop(task, channel)
+
+
 class SlowStopChannel(FakeChannel):
     """让 action.stop 的 send_json 阻塞，制造「stop 已广播、stop 帧未发完」窗口。"""
 
@@ -677,7 +755,8 @@ async def test_second_connection_replaces_first(seeded_device):
     task_a, channel_a, _ = await harness.connected()
     task_b, channel_b, _ = await harness.connected()
 
-    assert channel_a.closed == (4409, "replaced")
+    # hello_ack 在 _install 之前发送；旧连接关闭发生在替换流程内，需等待。
+    await wait_until(lambda: channel_a.closed == (4409, "replaced"))
     assert get_device_link(DEVICE_ID) is not None
 
     await asyncio.wait_for(task_a, timeout=2.0)

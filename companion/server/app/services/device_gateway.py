@@ -118,6 +118,9 @@ class DeviceSession:
         ) = None
         self._writer: asyncio.Task | None = None
         self._writer_stopping = False
+        # 串行化 stop_writer()：teardown/shutdown/handle 异常路径可能并发调用，
+        # 两个 _flush_reports() 同时取走 in-flight 与队列会导致 FIFO 反转。
+        self._writer_stop_lock = asyncio.Lock()
         # writer 已取出、正在 await handler 的上报；超时取消后用于补写。
         self._inflight: dict[str, Any] | None = None
 
@@ -277,7 +280,15 @@ class DeviceSession:
         旧上报可能晚于新上报提交，把最新状态覆盖回旧值。这里先投递停止哨兵，
         让 writer 以自己的顺序处理完剩余上报；只有 writer 卡死超时才取消它，
         再由当前协程接管队列。
+
+        调用方可能并发（`_teardown` / `shutdown` / `handle()` 异常路径），
+        因此整段冲刷必须串行；否则两个 `_flush_reports()` 会分别取走
+        in-flight 与队列条目，慢的旧上报仍可能后提交。
         """
+        async with self._writer_stop_lock:
+            await self._drain_writer()
+
+    async def _drain_writer(self) -> None:
         writer = self._writer
         self._writer_stopping = True
         if writer is None or writer.done():
@@ -385,6 +396,9 @@ class DeviceSession:
         return dict(self._report)
 
     async def close(self, code: int = 1000, reason: str = "") -> None:
+        # 必须先冲刷再标记 closed：`_handle_report()` 会丢弃 closed 会话的上报，
+        # 撤销设备、会话替换等直接调用 close() 的路径否则会丢最后一条状态。
+        await self.stop_writer()
         self.closed = True
         self._stop_writer()
         self._resolve_all(ActionResult(status="failed", detail="device_offline"))
@@ -588,6 +602,11 @@ class DeviceGateway:
     async def _install(self, session: DeviceSession) -> None:
         async with self._device_lock(session.device_id):
             old = get_device_link(session.device_id)
+            # 替换前先在旧链路仍是 current 时冲刷上报 writer：
+            # `_handle_report()` 会丢弃「已不是当前链路」的上报，先注册新链路
+            # 会让旧连接最后一条 device.report 永远不落库，重连快照回退。
+            if isinstance(old, DeviceSession) and old is not session:
+                await old.stop_writer()
             register_device_link(session.device_id, session)
             self._sessions.add(session)
             session.start_writer(self._handle_report)

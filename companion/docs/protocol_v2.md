@@ -230,6 +230,9 @@
 ```
 
 - `name` ∈ `actions.json.expressions`。
+- 本消息是 fire-and-forget：不带 `action_id`，也不产生 `action.result`。本轮服务端 `remote.*`
+  未开放该指令（表情由动作的 `linked_expression` 驱动）。设备若收到带 `action_id` 的变体，
+  应执行后回 `action.result`，不得沉默等待超时。
 
 ### 4.5 `idle.set`
 
