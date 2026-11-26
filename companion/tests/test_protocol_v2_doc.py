@@ -37,8 +37,24 @@ def test_protocol_declares_all_device_messages():
         "servo.calibrate_preview",
         "servo.calibrate_save",
         "voice.event",
+        "voice.start",
+        "voice.end",
+        "voice.cancel",
+        "voice.segment_played",
+        "voice.segment",
+        "voice.cancel_ack",
+        "voice.error",
     ]:
         assert message_type in doc, message_type
+
+
+def test_protocol_declares_voice_flow_rules():
+    doc = read_protocol()
+    assert "turn_start" in doc
+    assert "barge_in" in doc
+    assert "cancel_ack" in doc
+    assert "invalid_frame" in doc
+    assert "turn_seq" in doc
 
 
 def test_protocol_declares_all_app_messages():

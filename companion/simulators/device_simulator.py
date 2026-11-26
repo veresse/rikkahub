@@ -26,6 +26,11 @@ from typing import Any
 import websockets
 from websockets.exceptions import ConnectionClosed
 
+from companion.server.app.audio.framing import (
+    KIND_UPLINK,
+    AudioFrame,
+    FrameError,
+)
 from companion.shared.catalog import estimate_duration_ms, get_action
 
 DEFAULT_AUDIO = {
@@ -100,6 +105,8 @@ class SimulatedDevice:
         self.hello_ack: dict[str, Any] | None = None
         self.received: list[dict[str, Any]] = []
         self.results_sent: list[dict[str, Any]] = []
+        self.downlink_frames: list[AudioFrame] = []
+        self.voice_messages: list[dict[str, Any]] = []
         self.close_code: int | None = None
         self.close_reason: str = ""
         self.last_poses: dict[str, tuple[float, float]] = {}
@@ -109,6 +116,8 @@ class SimulatedDevice:
         self._heartbeat: asyncio.Task | None = None
         self._actions: dict[str, asyncio.Task] = {}
         self._send_lock = asyncio.Lock()
+        self._audio_seq = 0
+        self._audio_event = asyncio.Event()
         self._closed = asyncio.Event()
         self._release = asyncio.Event()
         self._closing = False
@@ -217,6 +226,80 @@ class SimulatedDevice:
         except Exception:
             return False
 
+    async def _send_bytes(self, data: bytes) -> bool:
+        ws = self.ws
+        if ws is None:
+            return False
+        try:
+            async with self._send_lock:
+                await ws.send(data)
+            return True
+        except Exception:
+            return False
+
+    async def send_audio(
+        self, payload: bytes, *, turn_seq: int, flags: int = 0
+    ) -> bool:
+        frame = AudioFrame(
+            kind=KIND_UPLINK,
+            flags=flags,
+            seq=self._audio_seq,
+            turn_seq=turn_seq,
+            payload=payload,
+        )
+        self._audio_seq = (self._audio_seq + 1) & 0xFFFFFFFF
+        return await self._send_bytes(frame.encode())
+
+    async def start_voice(self, turn_id: str) -> bool:
+        self.state = "listening"
+        return await self._send(
+            {
+                "v": 2,
+                "type": "voice.start",
+                "turn_id": turn_id,
+                "ts": _now_ms(),
+            }
+        )
+
+    async def end_voice(self, turn_id: str) -> bool:
+        self.state = "thinking"
+        return await self._send(
+            {"v": 2, "type": "voice.end", "turn_id": turn_id, "ts": _now_ms()}
+        )
+
+    async def cancel_voice(self, turn_id: str, reason: str = "user_stop") -> bool:
+        self.state = "idle"
+        return await self._send(
+            {
+                "v": 2,
+                "type": "voice.cancel",
+                "turn_id": turn_id,
+                "reason": reason,
+                "ts": _now_ms(),
+            }
+        )
+
+    async def segment_played(self, turn_id: str, segment_seq: int) -> bool:
+        return await self._send(
+            {
+                "v": 2,
+                "type": "voice.segment_played",
+                "turn_id": turn_id,
+                "segment_seq": segment_seq,
+                "ts": _now_ms(),
+            }
+        )
+
+    async def wait_for_audio(self, predicate=None, *, timeout: float = 5.0) -> AudioFrame:
+        deadline = time.monotonic() + timeout
+        while True:
+            for frame in self.downlink_frames:
+                if predicate is None or predicate(frame):
+                    return frame
+            if time.monotonic() >= deadline:
+                raise asyncio.TimeoutError("等待下行音频帧超时")
+            await asyncio.sleep(0.01)
+
     async def send_report(self) -> bool:
         if self.protocol_version < 2:
             # v1 设备只走音频通道，不发送 v2 控制面状态帧。
@@ -284,6 +367,12 @@ class SimulatedDevice:
         try:
             async for raw in self.ws:
                 if isinstance(raw, (bytes, bytearray)):
+                    try:
+                        frame = AudioFrame.parse(bytes(raw))
+                    except FrameError:
+                        continue
+                    self.downlink_frames.append(frame)
+                    self._audio_event.set()
                     continue
                 try:
                     message = json.loads(raw)
@@ -321,6 +410,14 @@ class SimulatedDevice:
             action_id = message.get("action_id")
             if isinstance(action_id, str) and action_id:
                 await self._send_result(action_id, "done", "")
+            return
+
+        if message_type in {"voice.segment", "voice.cancel_ack", "voice.error"}:
+            self.voice_messages.append(message)
+            if message_type == "voice.segment":
+                self.state = "speaking"
+            elif message_type in {"voice.cancel_ack", "voice.error"}:
+                self.state = "idle"
             return
 
         action_id = message.get("action_id")

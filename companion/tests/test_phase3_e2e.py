@@ -29,8 +29,10 @@ from pathlib import Path
 import pytest
 import uvicorn
 
+from companion.server.app.audio.framing import FLAG_LAST, KIND_DOWNLINK
 from companion.server.app.config import settings
 from companion.server.app.main import app as fastapi_app
+from companion.server.app.services.device_registry import get_device_link
 from companion.simulators.app_simulator import SimulatedApp
 from companion.simulators.device_simulator import SimulatedDevice
 from companion.shared.catalog import get_action_names
@@ -296,6 +298,16 @@ async def expect_result(app: SimulatedApp, action_id: str, timeout: float = 5.0)
         and e.get("action_id") == action_id,
         timeout=timeout,
     )
+
+
+async def wait_until(predicate, timeout: float = 3.0) -> None:
+    async def _poll():
+        while True:
+            if predicate():
+                return
+            await asyncio.sleep(0.01)
+
+    await asyncio.wait_for(_poll(), timeout)
 
 
 def _results_for(app: SimulatedApp, action_id: str) -> list[dict]:
@@ -860,3 +872,41 @@ async def test_logs_do_not_leak_tokens_or_passwords(e2e, caplog, monkeypatch):
     assert e2e.app.token not in logged
     assert device.token not in logged
     assert ADMIN_PASSWORD not in logged
+
+
+async def test_device_audio_frames_are_gated_by_voice_start(e2e):
+    device = await e2e.new_device()
+    link = get_device_link(device.device_id)
+    assert link is not None
+
+    # 未 voice.start：服务端必须丢弃，不建立语音轮次。
+    assert await device.send_audio(b"\x78\x00", turn_seq=0) is True
+    await asyncio.sleep(0.05)
+    assert link.voice is None
+
+    assert await device.start_voice("turn-a") is True
+    await wait_until(lambda: link.voice is not None and link.voice.state == "listening")
+
+    assert await device.send_audio(b"\x78\x01", turn_seq=0) is True
+    assert await device.send_audio(b"\x78\x02", turn_seq=1) is True
+    await wait_until(lambda: link.voice.frames_received == 2)
+
+    assert await device.cancel_voice("turn-a", "user_stop") is True
+    ack = await device.wait_for(lambda m: m.get("type") == "voice.cancel_ack")
+    assert ack["turn_id"] == "turn-a"
+    assert ack["reason"] == "user_stop"
+    await wait_until(lambda: link.voice.state == "idle")
+
+
+async def test_server_downlink_audio_reaches_the_simulator(e2e):
+    device = await e2e.new_device()
+    await device.start_voice("turn-b")
+    link = get_device_link(device.device_id)
+    assert link is not None
+    await wait_until(lambda: link.voice is not None and link.voice.state == "listening")
+
+    assert await link.send_audio(b"\x78\x03", turn_seq=0, flags=FLAG_LAST) is True
+    frame = await device.wait_for_audio(timeout=2.0)
+    assert frame.kind == KIND_DOWNLINK
+    assert frame.payload == b"\x78\x03"
+    assert frame.last is True

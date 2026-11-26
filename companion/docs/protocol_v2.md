@@ -164,8 +164,9 @@
 ## 4. 下行控制消息（服务端 → 设备）
 
 所有控制消息都带 `action_id`（服务端生成的 UUID）用于 `action.result` 关联；例外是
-§4.4 `expression.set`、§4.7 `servo.calibrate_preview`（fire-and-forget，各自章节有说明）
-与 §4.6 `action.stop`（最高优先级、不带 `action_id`、不等待回执）。
+§4.4 `expression.set`、§4.7 `servo.calibrate_preview`（fire-and-forget，各自章节有说明）、
+§4.6 `action.stop`（最高优先级、不带 `action_id`、不等待回执）与 §4.8 的 `voice.*`
+（以 `turn_id`/`segment_seq` 关联，不产生 `action.result`）。
 
 ### 4.1 `action.play`
 
@@ -273,6 +274,24 @@
 - `calibrate_preview` 仅实时叠加偏移，不持久化；`calibrate_save` 写入 NVS 并回 `action.result(status="done")` + `device.report`。
 - 偏移范围 `[-30, 30]`；叠加后物理角度必须再次硬限位到 `[0,180]`。
 
+### 4.8 语音下行消息
+
+语音消息不带 `action_id`，不产生 `action.result`；只对 `protocol_version >= 2` 的设备发送。
+
+| type | 字段 | 说明 |
+| :--- | :--- | :--- |
+| `voice.segment` | `turn_id, segment_seq, text, last` | 一段 TTS 的元数据；必须在该段第一帧二进制音频之前发出。`text` 供静音时屏幕显示；`last=true` 表示本轮最后一段。 |
+| `voice.cancel_ack` | `turn_id, reason` | 服务端已停止本轮 LLM/TTS 并清空下行队列；`reason` 原样回显 `barge_in`/`user_stop`。 |
+| `voice.error` | `turn_id, code, message` | 本轮无法继续；设备收到后回 `IDLE`。 |
+
+`voice.error.code` ∈ `{busy, unbound, no_speech, asr_unavailable, tts_unavailable,
+idle_timeout, invalid_turn, invalid_frame, unsupported_protocol, internal_error}`。
+
+- `voice.segment` 与音频帧在同一个下行发送锁内按序发出，避免“段文本晚于音频”。
+- 下行帧的 `flags.bit0` 表示**本轮**最后一帧，不是每段最后一帧；段边界由 `voice.segment` 标识。
+- `voice.cancel_ack` 由语音管线立即发送；barge-in 的 `action.stop(barge_in)` 由被取消的
+  聊天生成器在停止本轮在途动作时发送，二者不重复。
+
 ---
 
 ## 5. 上行消息（设备 → 服务端）
@@ -322,8 +341,34 @@
 {"v": 2, "type": "voice.event", "event": "asr_final", "turn_id": "uuid", "text": "今天天气怎么样"}
 ```
 
-- `event` ∈ `{"asr_partial","asr_final","tts_segment_start","tts_segment_end","turn_end"}`。
+- `event` ∈ `{"turn_start","asr_partial","asr_final","tts_segment_start","tts_segment_end","turn_end"}`。
+- `turn_start` 带 `turn_id` 与可选 `conversation_id`；`turn_end` 带 `turn_id`、`interrupted` 与
+  `finish_reason`（`stop/interrupted/error/timeout/playback_timeout`）。
 - 默认不下发原始音频；`text` 允许 App 展示与纠正。
+
+### 5.4 语音上行消息
+
+| type | 字段 | 说明 |
+| :--- | :--- | :--- |
+| `voice.start` | `turn_id` | 设备短按进入收音；`turn_id` 由设备生成，服务端校验后复用。 |
+| `voice.end` | `turn_id` | 设备 VAD 判定用户说完；服务端结束 ASR 输入并等待最终结果。 |
+| `voice.cancel` | `turn_id, reason` | 中止本轮；`reason ∈ {barge_in, user_stop}`。SPEAKING 中短按为 `barge_in`。 |
+| `voice.segment_played` | `turn_id, segment_seq` | 设备播完某段 TTS；服务端据此推进轮次与 App 事件。 |
+
+```json
+{"v": 2, "type": "voice.start", "turn_id": "uuid", "ts": 1764000000000}
+{"v": 2, "type": "voice.end", "turn_id": "uuid", "ts": 1764000000000}
+{"v": 2, "type": "voice.cancel", "turn_id": "uuid", "reason": "barge_in", "ts": 1764000000000}
+{"v": 2, "type": "voice.segment_played", "turn_id": "uuid", "segment_seq": 2, "ts": 1764000000000}
+```
+
+- 同一设备同时只允许一轮；重复 `voice.start` 或轮次不匹配的 `voice.end`/`voice.cancel`/
+  `voice.segment_played` 回 `voice.error(code="busy"|"invalid_turn")`，原轮次不变。
+- `voice.start` 之前的二进制上行帧丢弃（设备此时麦克风应关闭）；`voice.end`/`voice.cancel`
+  之后的帧同样丢弃，直到下一轮 `voice.start`。
+- 同一轮内 `turn_seq` 必须严格递增；服务端丢弃重复或回退帧，不因缺口断开连接。
+- 同一 `(turn_id, segment_seq)` 的 `voice.segment_played` 幂等，只处理一次。
+- 半双工：服务端在 `THINKING/SPEAKING` 期间忽略上行音频帧；设备在 `SPEAKING` 期间暂停采集。
 
 ---
 
@@ -346,9 +391,14 @@
 - 上行：16kHz、单声道、20/60ms（以 `hello` 协商为准）。
 - 下行：24kHz（协商可降为 16kHz）、单声道。
 - 服务端只做短暂内存缓冲，**不落盘、不入库、不打印原始音频**。
+- 帧头校验：长度 ≥12、magic=`0xA1`、version=`0x01`、`kind ∈ {0x01,0x02}`、`flags` 保留位必须为 0；
+  空 payload 只允许静音帧（`flags.bit1=1`）。服务端只接受 `kind=0x01` 的上行帧；畸形帧回
+  `voice.error(code="invalid_frame")` 并丢弃该帧，**不关闭控制通道**。
 - 半双工：设备处于 `SPEAKING` 时暂停麦克风采集与上行；服务端忽略该期间的上行帧。
-- 旧帧过滤：服务端丢弃 `turn_seq` 小于当前播放代次的帧；设备丢弃 `turn_seq` 小于当前轮次的 TTS 帧。
-- 打断：设备短按立即本地停扬声器、递增播放代次、发送 `cancel`；服务端取消 LLM/TTS 并回 `cancel_ack`，同时下发 `action.stop(reason="barge_in")`。
+- 旧帧过滤：服务端丢弃同一轮内 `turn_seq` 重复或回退的帧；设备丢弃 `turn_seq` 小于当前轮次的 TTS 帧。
+- 打断：设备短按立即本地停扬声器、递增播放代次、发送 `voice.cancel(reason="barge_in")`；服务端取消
+  LLM/TTS 并回 `voice.cancel_ack`，同时由被取消的聊天生成器下发一次 `action.stop(reason="barge_in")`
+  （仅当本轮有在途动作）。
 
 ---
 
@@ -517,13 +567,15 @@ App 携带 `Authorization: Bearer <app_token>` 发起请求，响应为 `text/ev
 
 ```text
 BOOT → IDLE
-IDLE --短按--> LISTENING
-LISTENING --检测到语音结束/VAD--> THINKING
+IDLE --短按/voice.start--> LISTENING
+LISTENING --检测到语音结束/VAD/voice.end--> THINKING
 THINKING --收到首段 TTS--> SPEAKING
-SPEAKING --segment 播放完--> SPEAKING/IDLE
+SPEAKING --voice.segment_played(last)--> IDLE
+SPEAKING --voice.segment_played(非 last)--> SPEAKING
+ANY --voice.cancel(reason)--> IDLE（落库 interrupted；barge_in 时停本轮动作）
 ANY --长按(≥1500ms)--> IDLE（结束本轮）
 ANY --静默 5 分钟--> IDLE（结束本轮）
-SPEAKING --短按--> IDLE（本地停声 + cancel）
+SPEAKING --短按--> IDLE（本地停声 + voice.cancel(barge_in)）
 ERROR --短按--> LISTENING（重试）
 ```
 
@@ -550,6 +602,14 @@ ERROR --短按--> LISTENING（重试）
 | `unknown_action` | 动作名不在动作库 |
 | `action_limit_exceeded` | 单轮动作工具调用超过 3 次 |
 | `timeout` | 动作/工具超时 |
+| `busy` | 设备已有语音轮次或会话正在生成 |
+| `unbound` | 设备没有绑定角色/会话，无法开始语音对话 |
+| `invalid_turn` | `turn_id` 不匹配或缺失 |
+| `invalid_frame` | 二进制帧头/长度/kind/flags 非法 |
+| `no_speech` | ASR 未识别到有效文本 |
+| `asr_unavailable` | ASR 连接或鉴权失败 |
+| `tts_unavailable` | TTS 首包超时或服务错误 |
+| `idle_timeout` | 收音期间静默超过 5 分钟 |
 | `internal_error` | 未预期异常 |
 
 ---
