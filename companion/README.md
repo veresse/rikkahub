@@ -43,6 +43,8 @@ PYTHONPATH=../.. python3 -m companion.server.app.main
 > 在 uvicorn 关闭连接之前广播设备下线。直接 `uvicorn companion.server.app.main:app`
 > 仍可正常服务，但 App 在停机时收不到 `server_shutdown`（只会看到 1012）。
 > 多 worker（`workers>1`）不受支持，启动会直接失败。
+> 停机有界：应用层 10s、App 通道收尾 2s、1012 之后的连接 drain 20s、lifespan 兜底
+> 2s + 2s；超时后剩余连接由 uvicorn 直接断开。
 
 健康检查：`GET /api/health`（公开）。
 

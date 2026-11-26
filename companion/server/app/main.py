@@ -1,5 +1,6 @@
 from contextlib import asynccontextmanager
 
+import uvicorn
 from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
@@ -18,7 +19,11 @@ from companion.server.app.routers import (
     ws,
 )
 from companion.server.app.security.dependencies import require_app_token
-from companion.server.app.services.events import drain_background_tasks
+from companion.server.app.services.application_shutdown import (
+    GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS,
+    LIFESPAN_SHUTDOWN_TIMEOUT_SECONDS,
+    bounded_shutdown_application,
+)
 
 
 @asynccontextmanager
@@ -30,13 +35,11 @@ async def lifespan(app: FastAPI):
     ws.device_gateway.open_for_connections()
     ws.app_gateway.open_for_connections()
     yield
-    try:
-        await ws.device_gateway.shutdown()
-        # 设备下线可能异步广播 failed/device_offline 终态，先等它送达 App，
-        # 再关闭 App 通道。
-        await drain_background_tasks()
-    finally:
-        await ws.app_gateway.shutdown()
+    # 兜底：正常情况下 `CompanionServer` 已经清空两个网关，这里近似空操作；但
+    # 直接 `uvicorn ...:app` 或第一次应用层停机超时时仍会走到，所以同样必须有界。
+    await bounded_shutdown_application(
+        LIFESPAN_SHUTDOWN_TIMEOUT_SECONDS, source="lifespan shutdown"
+    )
 
 
 app = FastAPI(
@@ -83,18 +86,21 @@ async def health_check():
     }
 
 
-if __name__ == "__main__":
-    import uvicorn
-
-    from companion.server.app.server import run
-
-    config = uvicorn.Config(
+def build_config() -> uvicorn.Config:
+    """与部署入口共用一份配置，便于测试停机相关参数。"""
+    return uvicorn.Config(
         "companion.server.app.main:app",
         host=settings.HOST,
         port=settings.PORT,
         reload=settings.DEBUG,
+        timeout_graceful_shutdown=GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS,
         ws_ping_interval=settings.WS_PING_INTERVAL_SECONDS,
         ws_ping_timeout=settings.WS_PING_TIMEOUT_SECONDS,
         ws_max_size=settings.WS_TRANSPORT_MAX_MESSAGE_BYTES,
     )
-    run(config)
+
+
+if __name__ == "__main__":
+    from companion.server.app.server import run
+
+    run(build_config())

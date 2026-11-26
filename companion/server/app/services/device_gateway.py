@@ -750,30 +750,35 @@ class DeviceGateway:
 
         置 `_shutting_down` 后不再注册新链路；逐个从 `_sessions` 取出处理（而不是
         先拍快照再 `clear()`），这样「`_install()` 在快照之后才完成」的会话也会被
-        关闭。offline 事件在全部链路关闭、释放生命周期锁之后统一广播，避免慢 App
-        的单次发送超时把每设备锁的持有时间叠加进停机总时长。
+        关闭。每条设备的 offline 在释放生命周期锁后**立即**广播：被上层总时限取消
+        时最多丢失「正在广播的那一条」，已经关闭的设备不会因为后面还有慢设备而漏发。
+
+        被取消（上层总时限/`force_exit`）时把当前会话放回集合，lifespan 的兜底
+        还能再试一次；否则这条链路会既没 close 也没广播，凭空消失。
         """
         self._shutting_down = True
-        offline: list[tuple[str, str]] = []
         while self._sessions:
             session = self._sessions.pop()
             # 与 `_teardown` 串行，避免一方在另一方 flush 期间 unregister 导致
             # 最后一条上报被 `_handle_report` 的链路检查丢弃。
-            async with device_lifecycle_lock(session.device_id):
-                await session.stop_writer()
-                was_current = get_device_link(session.device_id) is session
-                if was_current:
-                    unregister_device_link(session.device_id, link=session)
-                    invalidate_device_scheduler(session.device_id)
-                await session.close(1011, "server_shutdown")
-                if was_current:
+            try:
+                async with device_lifecycle_lock(session.device_id):
+                    await session.stop_writer()
+                    was_current = get_device_link(session.device_id) is session
+                    if was_current:
+                        unregister_device_link(session.device_id, link=session)
+                        invalidate_device_scheduler(session.device_id)
+                    await session.close(1011, "server_shutdown")
                     # 链路若已被撤销/异常路径关闭，`close()` 是空操作，
                     # `close_reason` 保留先到的原因；否则就是 server_shutdown。
-                    offline.append(
-                        (session.device_id, session.close_reason or "server_shutdown")
-                    )
-        for device_id, reason in offline:
-            await self._publish_status(device_id, online=False, reason=reason)
+                    reason = session.close_reason or "server_shutdown"
+            except BaseException:
+                self._sessions.add(session)
+                raise
+            if was_current:
+                await self._publish_status(
+                    session.device_id, online=False, reason=reason
+                )
 
     async def _read_loop(self, session: DeviceSession) -> None:
         while True:

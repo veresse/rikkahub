@@ -281,3 +281,24 @@ MUTATIONS THAT STAYED GREEN: none
 2. 派独立子智能体审查 `e9fde99e..HEAD`（重点：`run()` 的 reload 分支与多 worker 拒绝、
    10s 软上界的实际行为、`AppGateway` 门控的竞态、M-1 强化后的测试是否仍能自证）。
 3. 审查通过后进入音频 Block。
+
+## 10. 勘误（日志 21 修订）
+
+- **§2.2 的「10s 是软上界……实际耗时是 10s + 关闭 App 通道，不会无限增长」不成立。**
+  `wait_for` 只约束第一次应用层关闭；lifespan 兜底会**再无条件跑一遍无界的**
+  `device_gateway.shutdown()`，`AppSession.close()` 没有超时，1012 之后的连接 drain
+  也是 `timeout_graceful_shutdown=None`。日志 21 加入 10s/2s/2s/20s 四层预算，并用
+  真实 uvicorn 探针复现：旧提交慢设备 30s 时停机 30.41s，新提交 2.39s。
+- **§2.2 / §7 的「`force_exit` 直接跳过应用层关闭」只在停机开始前成立。** 第二次
+  Ctrl+C 落在应用层关闭窗口内时，旧实现仍会等满时限；日志 21 改为 0.1s 轮询，探针从
+  4.61s 降到 0.16s。
+- **§5 的「no total deadline for application shutdown → RED」只证明了第一次
+  `wait_for` 生效，不能证明“总”时限。** 真正的无界来自 lifespan 重跑与 App close；
+  日志 21 的 mutation 把这三点分别锁死，并把脚本纳入
+  `companion/tests/mutation/round15_shutdown.py`。
+- **§2.4 的 App 门控论证不受影响**：`_prune_revoked()` / `AppSession(...)` /
+  `setdefault().add()` 之间确实没有 `await`，检查与注册不存在窗口。
+- **§4 新增的 `test_lifespan_resets_shutdown_flags` 会把模块级网关留在
+  `_shutting_down=True`**，属于测试隔离隐患；日志 21 已在 `finally` 中复位。
+- **§2.1 的 `run()` 与 `uvicorn.run()` 仍有两处未对齐**：uds 未清理、非字符串 app +
+  reload 未显式拒绝；日志 21 已补齐（`Server.startup()` 的 exit 3 语义经实测一致）。

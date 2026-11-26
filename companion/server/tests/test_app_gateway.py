@@ -5,6 +5,7 @@
 """
 
 import asyncio
+import time
 
 import pytest
 
@@ -568,6 +569,27 @@ async def test_open_for_connections_allows_new_connections_after_shutdown():
 
     task, channel = await harness.connect()
     assert channel.closed is None
+    await _stop(task, channel)
+
+
+async def test_shutdown_deadline_does_not_wait_for_hanging_app_close():
+    """App 的 close 卡住时预算仍要生效，剩余连接交给 uvicorn 的 1012 收尾。"""
+    harness = Harness()
+    task, channel = await harness.connect()
+
+    async def hanging_close(code: int = 1000, reason: str = "") -> None:
+        await asyncio.Event().wait()
+
+    channel.close = hanging_close
+
+    started = time.monotonic()
+    await harness.gateway.shutdown(timeout=0.1)
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 1.0, f"App 关闭未受预算约束：{elapsed:.2f}s"
+    assert harness.gateway._sessions == {}
+    assert harness.gateway._subscribed is False
+
     await _stop(task, channel)
 
 

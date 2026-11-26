@@ -6,7 +6,8 @@ uvicorn 的 `Server.shutdown()` 会先对所有连接发 1012 并等待连接清
 事件没有接收者，`server_shutdown` 原因也就永远到不了 App。
 
 `CompanionServer` 把应用层的关闭顺序（设备下线 → 等待广播 → 关闭 App）提前到
-uvicorn 关闭连接之前；lifespan 里的同名调用保留为兜底（此时集合为空，幂等）。
+uvicorn 关闭连接之前；lifespan 里的同名调用保留为有界兜底（正常路径下集合为空，
+幂等）。
 
 **该保证只在通过本模块的 `run()`（即 `python -m companion.server.app.main`）启动时
 成立。** 直接 `uvicorn companion.server.app.main:app` 会绕过这里的覆盖。
@@ -16,32 +17,64 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import socket
 
 import uvicorn
 from uvicorn.supervisors import ChangeReload
 
+from companion.server.app.services.application_shutdown import (
+    APP_SHUTDOWN_TIMEOUT_SECONDS,
+    shutdown_application,
+)
+
 logger = logging.getLogger(__name__)
 
-# 应用层停机的总时限。设备上报冲刷要写 SQLite（`busy_timeout=15000`），慢盘或
-# 设备较多时单台就可能到秒级；超过这个总时限就不再等，交给 uvicorn 的 1012 收尾
-# （进程即将退出，继续等只会让 systemd / docker 的停止宽限先到并 SIGKILL）。
-APP_SHUTDOWN_TIMEOUT_SECONDS = 10.0
+# 第二次 Ctrl+C 的生效粒度：等待应用层关闭时按这个间隔检查 `force_exit`。
+FORCE_EXIT_POLL_SECONDS = 0.1
 
 
 class CompanionServer(uvicorn.Server):
     async def _shutdown_application(self) -> None:
-        # 延迟导入：`routers.ws` 会构建网关单例，放在模块顶部易与 main 形成环。
-        from companion.server.app.routers import ws
-        from companion.server.app.services.events import drain_background_tasks
+        await shutdown_application()
 
+    async def _wait_application_shutdown(self) -> None:
+        """至多等 `APP_SHUTDOWN_TIMEOUT_SECONDS`；期间响应第二次 Ctrl+C。
+
+        用“任务 + 轮询”而不是 `wait_for`：取消后还要等 `finally` 关 App 通道，
+        `wait_for` 会把这段收尾也算进总时长；这里显式区分“超时/强制退出”与
+        “应用层抛错”，避免把内部 `TimeoutError` 误报成超时。
+        """
+        task = asyncio.ensure_future(self._shutdown_application())
+        loop = asyncio.get_running_loop()
+        deadline = loop.time() + APP_SHUTDOWN_TIMEOUT_SECONDS
         try:
-            await ws.device_gateway.shutdown()
-            # 设备下线可能异步广播 failed/device_offline 终态，先等它送达 App，
-            # 再关闭 App 通道。
-            await drain_background_tasks()
+            while True:
+                remaining = deadline - loop.time()
+                if remaining <= 0:
+                    logger.warning(
+                        "application shutdown exceeded %.1fs, "
+                        "falling back to uvicorn connection cleanup",
+                        APP_SHUTDOWN_TIMEOUT_SECONDS,
+                    )
+                    break
+                done, _ = await asyncio.wait(
+                    {task}, timeout=min(remaining, FORCE_EXIT_POLL_SECONDS)
+                )
+                if task in done:
+                    break
+                if self.force_exit:
+                    logger.warning("force exit: abandoning application shutdown")
+                    break
         finally:
-            await ws.app_gateway.shutdown()
+            if not task.done():
+                task.cancel()
+            results = await asyncio.gather(task, return_exceptions=True)
+            error = results[0] if results else None
+            if isinstance(error, BaseException) and not isinstance(
+                error, asyncio.CancelledError
+            ):
+                logger.error("application shutdown failed", exc_info=error)
 
     async def shutdown(self, sockets: list[socket.socket] | None = None) -> None:
         try:
@@ -49,18 +82,7 @@ class CompanionServer(uvicorn.Server):
                 # 第二次 Ctrl+C：放弃应用层关闭，让 uvicorn 立刻清理连接。
                 logger.warning("force exit: skipping application shutdown")
             else:
-                try:
-                    await asyncio.wait_for(
-                        self._shutdown_application(), APP_SHUTDOWN_TIMEOUT_SECONDS
-                    )
-                except asyncio.TimeoutError:
-                    logger.warning(
-                        "application shutdown exceeded %.1fs, "
-                        "falling back to uvicorn connection cleanup",
-                        APP_SHUTDOWN_TIMEOUT_SECONDS,
-                    )
-                except Exception:
-                    logger.exception("application shutdown failed")
+                await self._wait_application_shutdown()
         finally:
             # 即使应用层关闭抛错/超时，也要让 uvicorn 完成连接清理与 lifespan 收尾。
             await super().shutdown(sockets)
@@ -81,6 +103,9 @@ def run(config: uvicorn.Config) -> None:
             "workers > 1 is not supported: graceful device shutdown requires "
             "CompanionServer in a single process"
         )
+    if config.reload and not isinstance(config.app, str):
+        # 与 uvicorn.run() 一致：reload 需要子进程重新导入应用，非字符串会静默失效。
+        raise SystemExit("reload requires the application to be an import string")
     server = CompanionServer(config)
     try:
         if config.should_reload:
@@ -90,3 +115,6 @@ def run(config: uvicorn.Config) -> None:
             server.run()
     except KeyboardInterrupt:
         pass
+    finally:
+        if config.uds and os.path.exists(config.uds):
+            os.remove(config.uds)

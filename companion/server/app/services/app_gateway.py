@@ -207,17 +207,44 @@ class AppGateway:
             if stamp < cutoff:
                 self._revoked.pop(token_id, None)
 
-    async def shutdown(self) -> None:
+    async def shutdown(self, timeout: float | None = None) -> None:
+        """关闭全部 App 连接；`timeout` 是这次关闭的总预算（None 表示不限）。
+
+        每个 `AppSession.close()` 也受剩余预算约束：close 是网络操作，卡住时不能
+        让调用方（应用层停机 / lifespan 兜底）重新变成无界等待。超时后剩下的连接
+        交给 uvicorn 的 1012 收尾。
+        """
         # 先置标志再遍历：期间不会再有新连接加入（`handle()` 的检查到注册之间
         # 没有 await），快照就是完整集合；晚到的连接直接以 1011 关闭。
         self._shutting_down = True
-        for sessions in list(self._sessions.values()):
-            for session in list(sessions):
-                await session.close(1011, "server_shutdown")
-        self._sessions.clear()
-        if self._subscribed:
-            self.bus.unsubscribe(self._broadcast)
-            self._subscribed = False
+        loop = asyncio.get_running_loop()
+        deadline = None if timeout is None else loop.time() + timeout
+        try:
+            for sessions in list(self._sessions.values()):
+                for session in list(sessions):
+                    remaining = None if deadline is None else deadline - loop.time()
+                    if remaining is not None and remaining <= 0:
+                        logger.warning(
+                            "app gateway shutdown deadline reached, %d session(s) "
+                            "left to connection cleanup",
+                            sum(len(group) for group in self._sessions.values()),
+                        )
+                        return
+                    try:
+                        await asyncio.wait_for(
+                            session.close(1011, "server_shutdown"), timeout=remaining
+                        )
+                    except asyncio.TimeoutError:
+                        logger.warning(
+                            "app gateway shutdown timed out closing %s",
+                            session.token_id,
+                        )
+                        return
+        finally:
+            self._sessions.clear()
+            if self._subscribed:
+                self.bus.unsubscribe(self._broadcast)
+                self._subscribed = False
 
     # ---- 事件广播 ----
 

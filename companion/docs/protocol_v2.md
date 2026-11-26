@@ -424,6 +424,11 @@
 `uvicorn companion.server.app.main:app` 时 lifespan 晚于 uvicorn 关闭连接，App 只会
 收到 1012。
 
+停机预算（单进程）：应用层关闭 10s、取消后关闭 App 通道 ≤2s、1012 之后等待连接任务
+20s（`timeout_graceful_shutdown`）、lifespan 兜底 2s + 2s；超时后剩余连接由 uvicorn
+直接断开，最多丢失最后一次设备下线广播。第二次 Ctrl+C（`force_exit`）会放弃应用层
+关闭，直接进入 uvicorn 的连接清理。
+
 设备离线时，`remote.*` 立即返回：
 
 ```json

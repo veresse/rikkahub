@@ -892,6 +892,36 @@ async def test_shutdown_rejects_install_in_flight(seeded_device, monkeypatch):
     assert statuses == [], harness.events
 
 
+async def test_shutdown_cancelled_midway_keeps_session_for_retry(
+    seeded_device, monkeypatch
+):
+    """上层总时限取消时，当前会话要放回集合，lifespan 兜底还能再试一次。"""
+    harness = Harness()
+    task, channel, _ = await harness.connected()
+    session = get_device_link(DEVICE_ID)
+    assert session is not None
+
+    async def never():
+        await asyncio.Event().wait()
+
+    original_stop_writer = session.stop_writer
+    monkeypatch.setattr(session, "stop_writer", never)
+
+    shutdown_task = asyncio.create_task(harness.gateway.shutdown())
+    await asyncio.sleep(0.05)
+    shutdown_task.cancel()
+    await asyncio.gather(shutdown_task, return_exceptions=True)
+
+    assert session in harness.gateway._sessions
+    assert get_device_link(DEVICE_ID) is session
+    assert channel.closed is None
+
+    # 恢复 real stop_writer 再取消 handle：`_teardown()` 也会调用它，否则清理会挂住。
+    monkeypatch.setattr(session, "stop_writer", original_stop_writer)
+    task.cancel()
+    await asyncio.gather(task, return_exceptions=True)
+
+
 async def test_shutdown_reports_reason_of_already_closed_link(seeded_device, monkeypatch):
     """停机遇到「已关闭但仍注册」的链路：保留先到的原因，不能漏发 offline。"""
     harness = Harness()

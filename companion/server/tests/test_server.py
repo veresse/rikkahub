@@ -77,6 +77,33 @@ def test_run_rejects_multiple_workers():
         server_module.run(_config(workers=2))
 
 
+def test_run_rejects_reload_with_object_app(monkeypatch):
+    """reload 需要子进程重新导入应用；对象 app 会静默失去 reload。"""
+
+    class BoomServer:
+        def __init__(self, config):
+            self.config = config
+
+        def run(self, *args, **kwargs):
+            raise AssertionError("必须拒绝，而不是真的启动服务")
+
+    monkeypatch.setattr(server_module, "CompanionServer", BoomServer)
+    with pytest.raises(SystemExit):
+        server_module.run(uvicorn.Config(object(), reload=True))
+
+
+def test_build_config_sets_graceful_shutdown_timeout():
+    """1012 之后的连接 drain 也必须有界，否则整个停机仍可能无界。"""
+    from companion.server.app.main import build_config
+    from companion.server.app.services.application_shutdown import (
+        GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS,
+    )
+
+    config = build_config()
+
+    assert config.timeout_graceful_shutdown == GRACEFUL_SHUTDOWN_TIMEOUT_SECONDS
+
+
 async def test_application_shutdown_timeout_still_runs_uvicorn_shutdown(monkeypatch):
     """应用层关闭超时不能把 uvicorn 的连接清理/lifespan 收尾一起吞掉。"""
     calls: list[str] = []
@@ -120,7 +147,7 @@ async def test_application_shutdown_error_still_runs_uvicorn_shutdown(monkeypatc
 
 
 async def test_force_exit_skips_application_shutdown(monkeypatch):
-    """第二次 Ctrl+C：不再等应用层关闭，直接交给 uvicorn。"""
+    """第二次 Ctrl+C（停机开始前）：不再等应用层关闭，直接交给 uvicorn。"""
     calls: list[str] = []
 
     class Probe(server_module.CompanionServer):
@@ -139,6 +166,75 @@ async def test_force_exit_skips_application_shutdown(monkeypatch):
     assert calls == ["uvicorn"]
 
 
+async def test_force_exit_during_application_shutdown_abandons_wait(monkeypatch):
+    """第二次 Ctrl+C 落在应用层关闭窗口内时也必须立刻收尾，而不是等满时限。"""
+    calls: list[str] = []
+
+    class Probe(server_module.CompanionServer):
+        async def _shutdown_application(self):
+            calls.append("app")
+            await asyncio.sleep(30)
+
+    async def fake_uvicorn_shutdown(self, sockets=None):
+        calls.append("uvicorn")
+
+    monkeypatch.setattr(server_module, "APP_SHUTDOWN_TIMEOUT_SECONDS", 5.0)
+    monkeypatch.setattr(uvicorn.Server, "shutdown", fake_uvicorn_shutdown)
+    server = Probe(_config())
+
+    task = asyncio.create_task(server.shutdown())
+    await asyncio.sleep(0.3)  # 超过一个轮询周期，确保已进入等待
+    assert calls == ["app"]
+
+    started = time.monotonic()
+    server.force_exit = True
+    await asyncio.wait_for(task, timeout=3.0)
+    elapsed = time.monotonic() - started
+
+    assert calls == ["app", "uvicorn"]
+    assert elapsed < 1.0, f"第二次 Ctrl+C 未及时生效：{elapsed:.2f}s"
+
+
+async def test_application_shutdown_bounds_app_close(monkeypatch):
+    """取消后 `finally` 里的 App 关闭必须带独立预算，否则仍可能无界。"""
+    from companion.server.app.routers import ws
+    from companion.server.app.services import application_shutdown as module
+
+    recorded: list[float | None] = []
+
+    async def device_shutdown():
+        return None
+
+    async def app_shutdown(timeout: float | None = None):
+        recorded.append(timeout)
+
+    monkeypatch.setattr(ws.device_gateway, "shutdown", device_shutdown)
+    monkeypatch.setattr(ws.app_gateway, "shutdown", app_shutdown)
+
+    await module.shutdown_application()
+
+    assert recorded == [module.APP_CLOSE_TIMEOUT_SECONDS]
+
+
+async def test_lifespan_shutdown_is_bounded(monkeypatch):
+    """第一次应用层停机超时后，lifespan 兜底也不能无界重跑设备关闭。"""
+    from companion.server.app import main as main_module
+    from companion.server.app.routers import ws
+
+    async def never():
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(ws.device_gateway, "shutdown", never)
+    monkeypatch.setattr(main_module, "LIFESPAN_SHUTDOWN_TIMEOUT_SECONDS", 0.1)
+
+    started = time.monotonic()
+    async with main_module.app.router.lifespan_context(main_module.app):
+        pass
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 2.0, f"lifespan 兜底未在预算内收尾：{elapsed:.2f}s"
+
+
 async def test_lifespan_resets_shutdown_flags():
     """同进程重新跑 lifespan 后，网关必须重新接受设备/App 连接。"""
     from companion.server.app.main import app as web_app
@@ -147,6 +243,11 @@ async def test_lifespan_resets_shutdown_flags():
     ws.device_gateway._shutting_down = True
     ws.app_gateway._shutting_down = True
 
-    async with web_app.router.lifespan_context(web_app):
-        assert ws.device_gateway._shutting_down is False
-        assert ws.app_gateway._shutting_down is False
+    try:
+        async with web_app.router.lifespan_context(web_app):
+            assert ws.device_gateway._shutting_down is False
+            assert ws.app_gateway._shutting_down is False
+    finally:
+        # lifespan 退出会重新置位；不复位会污染后续直接用模块级网关的测试。
+        ws.device_gateway.open_for_connections()
+        ws.app_gateway.open_for_connections()
