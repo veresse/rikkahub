@@ -38,3 +38,4 @@
 | 16 | Phase 3 五次审查修复 | ✅ 已完成 | ack 阻塞期间撤销不再广播上线、App 网关同时拦未 ready、orchestrator 在线判定回归、争锁死锁有界失败、移除重复在线函数；201 passed |
 | 17 | Phase 3 六次审查修复 | ✅ 已完成 | 撤销提交与关闭串行化、`ready` 后移到复核之后、offline reason 统一、三道守卫独立回归；204 passed |
 | 18 | Phase 3 六次审查收尾 | ✅ 已完成 | 停机补发 `server_shutdown` 下线事件、新用例按握手阶段定位并提供诊断、删除弱断言与旧注释；205 passed |
+| 19 | Phase 3 停机链路 | ✅ 已完成 | `CompanionServer` 在 uvicorn 关连接前下线、停机标志拒绝并发注册、offline 原因保留先到者、异常路径进锁、真 uvicorn 停机 e2e；211 passed |

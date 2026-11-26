@@ -415,6 +415,10 @@
 | `remote.ack` | `request_id, ok, error?, action_id?` | 遥控请求受理结果 |
 | `error` | `code, message, request_id?` | 统一错误 |
 
+优雅停机时服务端先下发 `device.status online=false`（`reason="server_shutdown"`，
+设备通道以 `1011/server_shutdown` 关闭）再关闭 App 通道；若链路此前已因撤销/内部
+错误关闭，则保留其先到的 `device_revoked` / `internal_error`。
+
 设备离线时，`remote.*` 立即返回：
 
 ```json

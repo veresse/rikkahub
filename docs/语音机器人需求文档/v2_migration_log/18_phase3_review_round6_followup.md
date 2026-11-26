@@ -193,3 +193,19 @@ $ & "...\companion-venv\Scripts\python.exe" -m pytest -q companion/server/tests/
 2. 派独立子智能体审查 `53a3765f..HEAD`（重点：停机 offline 的唯一性、测试定位改动是否
    削弱覆盖、M-2/M-3 的接受理由是否成立）。
 3. 审查通过后进入音频 Block。
+
+## 10. 勘误（日志 19 修订）
+
+- **§3.1 / §7 的「停机补发 offline，App 能看到」只对进程内直接调用成立。** 真实
+  uvicorn 先对连接发 1012、最后才跑 lifespan shutdown，`DeviceGateway.shutdown()`
+  进入时 `_sessions` 已空；`server_shutdown` 在部署路径上仍不可达。日志 19 用
+  `CompanionServer` 把应用停机提前到 uvicorn 关闭连接之前，并补了真实 uvicorn 的
+  停机 e2e。
+- **§7 的 M-3「不修理由：锁顺序反转」不成立。** `stop_writer()` 的
+  `_writer_stop_lock` 在返回前已释放，不存在 `writer_stop → lifecycle` 的持锁边；
+  异常路径可以安全地「生命周期锁 → close」。日志 19 已修复并补 `internal_error`
+  用例。
+- **§4.1 的 `needs_offline = was_current and not session.closed` 会漏发。** 撤销/
+  异常路径先 `close()`、`_teardown()` 尚未拿锁时，`closed=True` 但链路仍是 current，
+  旧判定会跳过唯一一条 offline。日志 19 改为「进锁时是 current 就发」，原因取
+  `close_reason or "server_shutdown"`。

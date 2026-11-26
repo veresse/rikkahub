@@ -181,9 +181,12 @@ async def _wait_mark_ready_entered(
             getattr(link, "closing", None),
             getattr(link, "closed", None),
         )
+        hint = ""
+        if link is not None and getattr(link, "ready", False):
+            hint = "；链路已 ready，复核可能在 hello_ack 之前就执行了"
         raise AssertionError(
-            "`_mark_ready()` 的复核未触发；"
-            f"sent={[m.get('type') for m in channel.sent]} "
+            "`_mark_ready()` 的复核未触发"
+            f"{hint}；sent={[m.get('type') for m in channel.sent]} "
             f"link(ready,closing,closed)={state}"
         ) from None
 
@@ -270,7 +273,7 @@ class Harness:
         # 门控）。测试里的「连上后立刻下发」应等握手真正完成，而不是只看 ack。
         link = get_device_link(DEVICE_ID)
         try:
-            await wait_until(lambda: getattr(link, "ready", False))
+            await wait_until(lambda: getattr(get_device_link(DEVICE_ID), "ready", False))
         except asyncio.TimeoutError:
             state = None if link is None else (
                 getattr(link, "ready", None),
@@ -819,6 +822,165 @@ async def test_shutdown_broadcasts_offline_once(seeded_device):
         if e.get("type") == "device.status" and e.get("online") is False
     ]
     assert [e.get("reason") for e in offline] == ["server_shutdown"], harness.events
+
+
+async def test_shutdown_after_failed_send_reports_offline_once(seeded_device):
+    """写失败只置 closing（未 closed）后停机：仍要发出一条 server_shutdown。
+
+    `_safe_send()` 失败不会 close 链路（要保留冲刷最后一条上报的能力），所以
+    `shutdown()` 不能把 `closed` 当作「已下线」而跳过广播。
+    """
+    harness = Harness()
+    channel = FlakyChannel()
+    task = await harness.start(channel)
+    channel.push(hello())
+    await channel.wait_sent(lambda m: m.get("type") == "hello_ack")
+    link = get_device_link(DEVICE_ID)
+    assert link is not None
+    await wait_until(lambda: link.ready)
+
+    channel.fail = True
+    result = await link.send({"type": "idle.set", "enabled": False})
+    assert (result.status, result.detail) == ("failed", "device_offline")
+    assert link.closing is True
+    assert link.closed is False
+
+    await harness.gateway.shutdown()
+    await asyncio.wait_for(task, timeout=2.0)
+
+    assert channel.closed == (1011, "server_shutdown")
+    offline = [
+        e
+        for e in harness.events
+        if e.get("type") == "device.status" and e.get("online") is False
+    ]
+    assert [e.get("reason") for e in offline] == ["server_shutdown"], harness.events
+
+
+async def test_shutdown_rejects_install_in_flight(seeded_device, monkeypatch):
+    """停机开始后才完成注册的链路必须被拒绝，且不能先广播上线。"""
+    harness = Harness()
+    gateway = harness.gateway
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    real_install = gateway._install
+
+    async def gated_install(session):
+        entered.set()
+        await release.wait()
+        return await real_install(session)
+
+    monkeypatch.setattr(gateway, "_install", gated_install)
+
+    channel = FakeChannel()
+    task = await harness.start(channel)
+    channel.push(hello())
+    await asyncio.wait_for(entered.wait(), timeout=3.0)
+
+    # 注册还卡在 `_install()` 之前：停机先跑完，随后 install 必须看到停机标志。
+    await gateway.shutdown()
+    release.set()
+    await wait_until(
+        lambda: channel.closed is not None or get_device_link(DEVICE_ID) is not None
+    )
+
+    assert get_device_link(DEVICE_ID) is None, "停机后仍注册了链路"
+    await asyncio.wait_for(task, timeout=3.0)
+
+    assert channel.closed == (1011, "server_shutdown")
+    statuses = [e for e in harness.events if e.get("type") == "device.status"]
+    assert statuses == [], harness.events
+
+
+async def test_shutdown_reports_reason_of_already_closed_link(seeded_device, monkeypatch):
+    """停机遇到「已关闭但仍注册」的链路：保留先到的原因，不能漏发 offline。"""
+    harness = Harness()
+
+    async def never(_session):
+        await asyncio.Event().wait()
+
+    # 让 handle 不退出：否则 close() 之后 `_teardown()` 会先注销链路。
+    monkeypatch.setattr(harness.gateway, "_read_loop", never)
+
+    task, channel, _ = await harness.connected()
+    link = get_device_link(DEVICE_ID)
+    assert link is not None
+    await link.close(4401, "device_revoked")
+    assert get_device_link(DEVICE_ID) is link
+
+    try:
+        await harness.gateway.shutdown()
+    finally:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+
+    offline = [
+        e
+        for e in harness.events
+        if e.get("type") == "device.status" and e.get("online") is False
+    ]
+    assert [e.get("reason") for e in offline] == ["device_revoked"], harness.events
+    assert get_device_link(DEVICE_ID) is None
+
+
+async def test_mark_ready_does_not_publish_online_after_shutdown_started(
+    seeded_device, monkeypatch
+):
+    """停机已开始、复核随后通过：不得再广播上线。"""
+    harness = Harness()
+    gateway = harness.gateway
+    real = gateway._device_is_active
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    channel = FakeChannel()
+
+    async def gated(device_id: str) -> bool:
+        if not any(m.get("type") == "hello_ack" for m in channel.sent):
+            return await real(device_id)
+        entered.set()
+        await release.wait()
+        return await real(device_id)
+
+    monkeypatch.setattr(gateway, "_device_is_active", gated)
+
+    task = await harness.start(channel)
+    channel.push(hello())
+    await _wait_mark_ready_entered(entered, channel)
+
+    shutdown_task = asyncio.create_task(gateway.shutdown())
+    await asyncio.sleep(0)  # 让 shutdown 置标志并开始等复核释放锁
+    release.set()
+
+    await asyncio.wait_for(shutdown_task, timeout=3.0)
+    await asyncio.wait_for(task, timeout=3.0)
+
+    statuses = [e for e in harness.events if e.get("type") == "device.status"]
+    assert [e.get("online") for e in statuses] == [False], harness.events
+    assert statuses[0].get("reason") == "server_shutdown"
+    assert channel.closed == (1011, "server_shutdown")
+    assert get_device_link(DEVICE_ID) is None
+
+
+async def test_read_loop_error_closes_with_internal_error(seeded_device, monkeypatch):
+    """读循环异常：锁内关闭并广播 reason=internal_error。"""
+    harness = Harness()
+
+    async def boom(_session):
+        raise RuntimeError("read loop boom")
+
+    monkeypatch.setattr(harness.gateway, "_read_loop", boom)
+
+    task, channel, _ = await harness.connected()
+    await asyncio.wait_for(task, timeout=2.0)
+
+    assert channel.closed == (1011, "internal_error")
+    assert get_device_link(DEVICE_ID) is None
+    offline = [
+        e
+        for e in harness.events
+        if e.get("type") == "device.status" and e.get("online") is False
+    ]
+    assert [e.get("reason") for e in offline] == ["internal_error"], harness.events
 
 
 async def test_stop_writer_retries_inflight_report_after_timeout(

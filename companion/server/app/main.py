@@ -25,6 +25,9 @@ from companion.server.app.services.events import drain_background_tasks
 async def lifespan(app: FastAPI):
     # 服务启动时执行 Alembic 迁移到 head
     await init_db()
+    # 同进程重新运行 lifespan（测试/嵌入式）时复位停机标志，否则所有握手都会被
+    # 上一次停机的 `_shutting_down` 拒绝。
+    ws.device_gateway.open_for_connections()
     yield
     try:
         await ws.device_gateway.shutdown()
@@ -82,7 +85,9 @@ async def health_check():
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run(
+    from companion.server.app.server import CompanionServer
+
+    config = uvicorn.Config(
         "companion.server.app.main:app",
         host=settings.HOST,
         port=settings.PORT,
@@ -91,3 +96,4 @@ if __name__ == "__main__":
         ws_ping_timeout=settings.WS_PING_TIMEOUT_SECONDS,
         ws_max_size=settings.WS_TRANSPORT_MAX_MESSAGE_BYTES,
     )
+    CompanionServer(config).run()

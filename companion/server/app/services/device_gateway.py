@@ -449,6 +449,15 @@ class DeviceGateway:
         self.bus = bus or get_event_bus()
         self._session_factory = session_factory
         self._sessions: set[DeviceSession] = set()
+        self._shutting_down = False
+
+    def open_for_connections(self) -> None:
+        """应用（重新）启动时允许注册新链路。
+
+        `_shutting_down` 只对一次停机有效；同进程重新跑 lifespan（测试/嵌入式
+        运行）时需要复位，否则所有握手都会被当作停机拒绝。
+        """
+        self._shutting_down = False
 
     async def handle(self, device_id: str, channel: WSChannel) -> None:
         session: DeviceSession | None = None
@@ -506,9 +515,11 @@ class DeviceGateway:
         except Exception:
             logger.exception("device gateway error: %s", device_id)
             if session is not None:
-                # 先冲刷最后一条上报，再关闭；close() 会 cancel writer。
-                await session.stop_writer()
-                await session.close(1011, "internal_error")
+                # 与撤销/停机在同一把锁内关闭：异常若与撤销竞争，谁先进锁谁决定
+                # 关闭码与 `close_reason`，不会出现「已撤销但报 internal_error」
+                # 之外的乱序。`close()` 内部会先冲刷 writer。
+                async with device_lifecycle_lock(device_id):
+                    await session.close(1011, "internal_error")
             else:
                 await self._close(channel, 1011, "internal_error")
         finally:
@@ -656,7 +667,7 @@ class DeviceGateway:
         return device is not None and bool(device.is_active)
 
     async def _install(self, session: DeviceSession) -> bool:
-        """注册链路；设备已撤销时拒绝并关闭，返回是否注册成功。"""
+        """注册链路；设备已撤销/服务正在停机时拒绝并关闭，返回是否注册成功。"""
         async with device_lifecycle_lock(session.device_id):
             # 撤销路由在同一把锁里「查链路 + close(4401)」。锁内复核 is_active
             # 才能堵住：鉴权通过 → 撤销提交（此时还没有链路）→ hello 到达 →
@@ -668,6 +679,11 @@ class DeviceGateway:
                 await self._publish_status(
                     session.device_id, online=False, reason="device_revoked"
                 )
+                return False
+            # DB 读是 await，期间可能已开始停机；此后不再接受新链路，否则该
+            # 会话会错过 `shutdown()` 的遍历，还会在停机过程中广播上线。
+            if self._shutting_down:
+                await session.close(1011, "server_shutdown")
                 return False
             old = get_device_link(session.device_id)
             # 替换前先在旧链路仍是 current 时冲刷上报 writer：
@@ -704,6 +720,9 @@ class DeviceGateway:
                 # 停机路径）可能已经关闭链路。置 ready 前统一在这里确认，避免
                 # 「已关闭但仍置 ready 并广播上线」。
                 return
+            if self._shutting_down:
+                # 停机已开始：不再广播上线（链路会由 `shutdown()` 关闭）。
+                return
             session.ready = True
             await self._publish_status(session.device_id, online=True)
 
@@ -728,27 +747,33 @@ class DeviceGateway:
 
         先冲刷 writer 再注销链路，否则最后一条 `device.report` 会因
         `_handle_report` 的「已不是当前链路」检查而被丢弃。
+
+        置 `_shutting_down` 后不再注册新链路；逐个从 `_sessions` 取出处理（而不是
+        先拍快照再 `clear()`），这样「`_install()` 在快照之后才完成」的会话也会被
+        关闭。offline 事件在全部链路关闭、释放生命周期锁之后统一广播，避免慢 App
+        的单次发送超时把每设备锁的持有时间叠加进停机总时长。
         """
-        for session in list(self._sessions):
+        self._shutting_down = True
+        offline: list[tuple[str, str]] = []
+        while self._sessions:
+            session = self._sessions.pop()
             # 与 `_teardown` 串行，避免一方在另一方 flush 期间 unregister 导致
             # 最后一条上报被 `_handle_report` 的链路检查丢弃。
             async with device_lifecycle_lock(session.device_id):
                 await session.stop_writer()
                 was_current = get_device_link(session.device_id) is session
-                # 若链路已被撤销/写失败关闭，offline 由那边的 `_teardown()` 发；
-                # 这里再发会得到两条原因不同的事件。
-                needs_offline = was_current and not session.closed
                 if was_current:
                     unregister_device_link(session.device_id, link=session)
                     invalidate_device_scheduler(session.device_id)
                 await session.close(1011, "server_shutdown")
-                # `_teardown()` 稍后运行时链路已不是 current，不会补发；停机事件
-                # 必须在这里发，否则 App 只会看到上线、看不到下线。
-                if needs_offline:
-                    await self._publish_status(
-                        session.device_id, online=False, reason="server_shutdown"
+                if was_current:
+                    # 链路若已被撤销/异常路径关闭，`close()` 是空操作，
+                    # `close_reason` 保留先到的原因；否则就是 server_shutdown。
+                    offline.append(
+                        (session.device_id, session.close_reason or "server_shutdown")
                     )
-        self._sessions.clear()
+        for device_id, reason in offline:
+            await self._publish_status(device_id, online=False, reason=reason)
 
     async def _read_loop(self, session: DeviceSession) -> None:
         while True:
