@@ -547,6 +547,30 @@ async def test_connection_attaching_after_revoke_is_closed():
     assert channel.closed == (4401, "token_revoked")
 
 
+async def test_new_connection_during_shutdown_is_closed_with_1011():
+    """停机后到达的 App 连接必须走 1011，而不是被 uvicorn 以 1012 收尾。"""
+    harness = Harness()
+    await harness.gateway.shutdown()
+
+    channel = FakeChannel()
+    task = asyncio.create_task(harness.gateway.handle(TOKEN_ID, channel))
+    await asyncio.wait_for(task, timeout=2.0)
+
+    assert channel.closed == (1011, "server_shutdown")
+    assert harness.gateway._sessions == {}
+
+
+async def test_open_for_connections_allows_new_connections_after_shutdown():
+    """同进程重新跑 lifespan 时要复位停机标志，否则重启后所有 App 都连不上。"""
+    harness = Harness()
+    await harness.gateway.shutdown()
+    harness.gateway.open_for_connections()
+
+    task, channel = await harness.connect()
+    assert channel.closed is None
+    await _stop(task, channel)
+
+
 async def test_rate_limit_covers_stop_and_get_status():
     register_device_link(DEVICE_ID, FakeLink())
     harness = Harness()

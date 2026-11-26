@@ -135,11 +135,25 @@ class AppGateway:
         self._sessions: dict[str, set[AppSession]] = {}
         self._revoked: dict[str, float] = {}
         self._subscribed = False
+        self._shutting_down = False
+
+    def open_for_connections(self) -> None:
+        """应用启动时允许新连接（复位上一次停机留下的标志）。"""
+        self._shutting_down = False
 
     # ---- 连接生命周期 ----
 
     async def handle(self, token_id: str, channel: WSChannel) -> None:
         self._prune_revoked()
+        if self._shutting_down:
+            # 停机已开始：新连接不能进入广播集合（否则会被 uvicorn 以 1012 收尾，
+            # 而不是协议承诺的 1011）。检查与下面的注册之间没有 await，因此
+            # 与 `shutdown()` 置标志之间不存在“检查通过后才注册”的窗口。
+            try:
+                await channel.close(1011, "server_shutdown")
+            except Exception:
+                logger.debug("app close failed during shutdown: %s", token_id, exc_info=True)
+            return
         session = AppSession(token_id, channel, self.bus)
         self._sessions.setdefault(token_id, set()).add(session)
         self._ensure_subscribed()
@@ -194,6 +208,9 @@ class AppGateway:
                 self._revoked.pop(token_id, None)
 
     async def shutdown(self) -> None:
+        # 先置标志再遍历：期间不会再有新连接加入（`handle()` 的检查到注册之间
+        # 没有 await），快照就是完整集合；晚到的连接直接以 1011 关闭。
+        self._shutting_down = True
         for sessions in list(self._sessions.values()):
             for session in list(sessions):
                 await session.close(1011, "server_shutdown")

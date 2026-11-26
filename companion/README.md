@@ -39,6 +39,11 @@ PYTHONPATH=../.. python3 -m companion.server.app.main
 
 默认监听 `127.0.0.1:8000`。启动时会自动执行 `alembic upgrade head`（`AUTO_MIGRATE=false` 可关闭）。
 
+> 必须用 `python -m companion.server.app.main` 启动：优雅停机依赖 `CompanionServer`
+> 在 uvicorn 关闭连接之前广播设备下线。直接 `uvicorn companion.server.app.main:app`
+> 仍可正常服务，但 App 在停机时收不到 `server_shutdown`（只会看到 1012）。
+> 多 worker（`workers>1`）不受支持，启动会直接失败。
+
 健康检查：`GET /api/health`（公开）。
 
 ## 鉴权流程

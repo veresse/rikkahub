@@ -241,3 +241,21 @@ $ & "...\companion-venv\Scripts\python.exe" -m pytest -q companion/tests/test_ph
 2. 派独立子智能体审查 `a6f221ab..HEAD`（重点：`CompanionServer` 覆盖是否与
    reload/graceful timeout 兼容、停机标志的生命周期、offline 唯一性）。
 3. 审查通过后进入音频 Block。
+
+## 10. 勘误（日志 20 修订）
+
+- **§4.1 / §7 的「App 通道以 1011 关闭」不覆盖停机窗口内新到达的连接。** 旧实现
+  对会话集合拍快照后 `clear()`，晚到的 App 会被 uvicorn 以 1012 收尾。日志 20 给
+  `AppGateway` 加了对称的 `_shutting_down`（新连接直接 1011，lifespan 启动复位）。
+- **§7 的「writer 冲刷 ≤2s」低估了停机时长。** 2s 只覆盖 `stop_writer()` 的等待，
+  不覆盖取消后 `_flush_reports()` 的写库（`busy_timeout=15000`）。日志 20 给应用层
+  停机加了 10s 总时限，超时后交给 uvicorn 的 1012 收尾，并让 `force_exit` 直接跳过。
+- **§5 的「shutdown skips already-closed link → RED」只对窄变体成立。** 断言原本写在
+  `task.cancel()` 之后，取消 `handle()` 触发的 `_teardown()` 会补发同一条 offline；
+  把 `shutdown()` 改成「已 closed 就 `continue`」仍为 GREEN。日志 20 把断言移到取消
+  之前，该变体现在为 RED。
+- **§4.1 的 `CompanionServer(config).run()` 不启动 reloader。** `reload=settings.DEBUG`
+  被静默忽略（`Server.run()` 没有 reload 分支），日志 20 改为 `run(config)` 照抄
+  `uvicorn.run()` 的 `ChangeReload` 分支。
+- **§4.1 的保证只在 `python -m` / `CompanionServer` 入口成立**，直接
+  `uvicorn ...:app` 仍不可达；已在协议 §8.2 与 `companion/README.md` 写明。

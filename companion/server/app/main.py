@@ -28,6 +28,7 @@ async def lifespan(app: FastAPI):
     # 同进程重新运行 lifespan（测试/嵌入式）时复位停机标志，否则所有握手都会被
     # 上一次停机的 `_shutting_down` 拒绝。
     ws.device_gateway.open_for_connections()
+    ws.app_gateway.open_for_connections()
     yield
     try:
         await ws.device_gateway.shutdown()
@@ -85,7 +86,7 @@ async def health_check():
 if __name__ == "__main__":
     import uvicorn
 
-    from companion.server.app.server import CompanionServer
+    from companion.server.app.server import run
 
     config = uvicorn.Config(
         "companion.server.app.main:app",
@@ -96,4 +97,4 @@ if __name__ == "__main__":
         ws_ping_timeout=settings.WS_PING_TIMEOUT_SECONDS,
         ws_max_size=settings.WS_TRANSPORT_MAX_MESSAGE_BYTES,
     )
-    CompanionServer(config).run()
+    run(config)

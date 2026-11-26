@@ -910,17 +910,19 @@ async def test_shutdown_reports_reason_of_already_closed_link(seeded_device, mon
 
     try:
         await harness.gateway.shutdown()
+
+        # 断言必须在取消 `handle()` 之前：取消会触发 `_teardown()`，它自身可能
+        # 补发这条 offline，从而掩盖 `shutdown()` 漏发的情况。
+        offline = [
+            e
+            for e in harness.events
+            if e.get("type") == "device.status" and e.get("online") is False
+        ]
+        assert [e.get("reason") for e in offline] == ["device_revoked"], harness.events
+        assert get_device_link(DEVICE_ID) is None
     finally:
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
-
-    offline = [
-        e
-        for e in harness.events
-        if e.get("type") == "device.status" and e.get("online") is False
-    ]
-    assert [e.get("reason") for e in offline] == ["device_revoked"], harness.events
-    assert get_device_link(DEVICE_ID) is None
 
 
 async def test_mark_ready_does_not_publish_online_after_shutdown_started(

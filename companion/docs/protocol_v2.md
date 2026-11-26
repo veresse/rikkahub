@@ -417,7 +417,12 @@
 
 优雅停机时服务端先下发 `device.status online=false`（`reason="server_shutdown"`，
 设备通道以 `1011/server_shutdown` 关闭）再关闭 App 通道；若链路此前已因撤销/内部
-错误关闭，则保留其先到的 `device_revoked` / `internal_error`。
+错误关闭，则保留其先到的 `device_revoked` / `internal_error`。停机开始后新到达的
+`/app/ws` 连接直接以 `1011/server_shutdown` 关闭。
+
+该保证要求通过 `python -m companion.server.app.main`（`CompanionServer`）启动：直接
+`uvicorn companion.server.app.main:app` 时 lifespan 晚于 uvicorn 关闭连接，App 只会
+收到 1012。
 
 设备离线时，`remote.*` 立即返回：
 
