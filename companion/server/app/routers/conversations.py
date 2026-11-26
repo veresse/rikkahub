@@ -46,10 +46,6 @@ async def list_conversations(
 
 @router.post("")
 async def create_conversation(data: ConversationCreate, db: AsyncSession = Depends(get_db)):
-    assistant = await db.get(AssistantModel, data.assistant_id)
-    if not assistant:
-        raise HTTPException(status_code=404, detail="关联角色不存在")
-
     new_id = str(uuid.uuid4())
     conv = ConversationModel(
         id=new_id,
@@ -59,6 +55,11 @@ async def create_conversation(data: ConversationCreate, db: AsyncSession = Depen
         updated_at=int(time.time() * 1000)
     )
     async with db.begin():
+        # 必须先开启事务再查询：db.get() 会自动开启事务，之后再调 begin() 会抛
+        # InvalidRequestError("A transaction is already begun on this Session")。
+        assistant = await db.get(AssistantModel, data.assistant_id)
+        if not assistant:
+            raise HTTPException(status_code=404, detail="关联角色不存在")
         db.add(conv)
     return {"id": new_id, "status": "created"}
 
