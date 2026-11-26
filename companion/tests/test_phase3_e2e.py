@@ -600,8 +600,8 @@ async def test_offline_device_never_replays_commands(e2e):
     )
     e2e.devices.append(reconnected)
     await reconnected.connect()
-    # 用「App 收到新会话上线」作为正向前进屏障：`_install()` 完成才会广播
-    # online=True，任何补发都必然发生在此之前；再断言设备历史为空。
+    # 用「App 收到新会话上线」作为正向前进屏障：`hello_ack` 之后 `_mark_ready()`
+    # 复核通过才广播 online=True，任何补发都必然发生在此之前；再断言设备历史为空。
     await e2e.app.wait_for(
         lambda e: e.get("type") == "device.status"
         and e.get("device_id") == device_id

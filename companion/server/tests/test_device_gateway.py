@@ -246,6 +246,9 @@ class Harness:
         task = await self.start(channel)
         channel.push(hello(**overrides))
         ack = await channel.wait_sent(lambda m: m.get("type") == "hello_ack")
+        # ready 在 ack 之后、`_mark_ready()` 锁内复核通过才置位（撤销与替换的
+        # 门控）。测试里的「连上后立刻下发」应等握手真正完成，而不是只看 ack。
+        await wait_until(lambda: getattr(get_device_link(DEVICE_ID), "ready", False))
         return task, channel, ack
 
 
@@ -420,7 +423,8 @@ async def test_revoke_while_ack_blocked_does_not_broadcast_online(
     """ack 发送期间撤销：ack 写成功后也不得再广播 online=true。
 
     `_mark_ready()` 只检查「链路仍是 current」是不够的：撤销路由会关闭链路但
-    不在注册表里删除它，因此必须在锁内复核 closed/closing 与 is_active。
+    不在注册表里删除它，因此必须复核 closed/closing（并在锁内复核 is_active）。
+    offline 只由 `_teardown()` 广播一次，reason 要能区分撤销。
     """
     harness = Harness()
     channel = SlowAckChannel()
@@ -438,12 +442,169 @@ async def test_revoke_while_ack_blocked_does_not_broadcast_online(
     assert resp.status_code == 200, resp.text
 
     await asyncio.wait_for(task, timeout=3.0)
-    online = [
-        e
-        for e in harness.events
+    status_events = [e for e in harness.events if e.get("type") == "device.status"]
+    assert [e for e in status_events if e.get("online") is True] == [], harness.events
+    offline = [e for e in status_events if e.get("online") is False]
+    assert len(offline) == 1, status_events
+    assert offline[0].get("reason") == "device_revoked"
+    assert get_device_link(DEVICE_ID) is None
+    assert channel.closed == (4401, "device_revoked")
+
+
+async def test_mark_ready_keeps_link_offline_until_recheck_passes(
+    seeded_device, monkeypatch
+):
+    """`ready` 只能在锁内复核之后置位，复核期间撤销的话命令一律拒绝。"""
+
+    harness = Harness()
+    gateway = harness.gateway
+    real = gateway._device_is_active
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    calls = 0
+
+    async def gated(device_id: str) -> bool:
+        # 1 = handle 预检，2 = `_install()`，3 = `_mark_ready()`
+        nonlocal calls
+        calls += 1
+        if calls < 3:
+            return await real(device_id)
+        entered.set()
+        await release.wait()
+        return False
+
+    monkeypatch.setattr(gateway, "_device_is_active", gated)
+
+    channel = FakeChannel()
+    task = await harness.start(channel)
+    channel.push(hello())
+    await asyncio.wait_for(entered.wait(), timeout=3.0)
+
+    link = get_device_link(DEVICE_ID)
+    assert link is not None
+    # 复核还没通过：即使 ack 已发出，也不能置 ready / 下发 / 显示在线。
+    assert link.ready is False
+    assert (await link.get_status())["online"] is False
+    rejected = await link.send({"type": "idle.set", "enabled": False})
+    assert (rejected.status, rejected.detail) == ("failed", "device_offline")
+    assert not [m for m in channel.sent if m.get("type") == "idle.set"]
+    assert not [
+        e for e in harness.events
         if e.get("type") == "device.status" and e.get("online") is True
     ]
-    assert online == [], harness.events
+
+    release.set()
+    await wait_until(lambda: link.closed or link.ready)
+    status_events = [e for e in harness.events if e.get("type") == "device.status"]
+    assert [e for e in status_events if e.get("online") is True] == [], status_events
+    assert [e.get("reason") for e in status_events if e.get("online") is False] == [
+        "device_revoked"
+    ]
+    assert link.ready is False
+    await _stop(task, channel)
+
+
+async def test_mark_ready_skips_online_when_link_closes_during_recheck(
+    seeded_device, monkeypatch
+):
+    """链路在复核窗口内被关闭（仍是 current）：不得广播上线。
+
+    `closed/closing` 是独立于 `is_active` 的一层：关闭不一定等于撤销（未来的
+    写失败 / 主动断开路径也可能只 close 而不注销），这里直接构造该状态。
+    """
+
+    harness = Harness()
+    gateway = harness.gateway
+    real = gateway._device_is_active
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    calls = 0
+
+    async def gated(device_id: str) -> bool:
+        nonlocal calls
+        calls += 1
+        if calls < 3:
+            return await real(device_id)
+        active = await real(device_id)
+        entered.set()
+        await release.wait()
+        return active
+
+    monkeypatch.setattr(gateway, "_device_is_active", gated)
+
+    channel = FakeChannel()
+    task = await harness.start(channel)
+    channel.push(hello())
+    await asyncio.wait_for(entered.wait(), timeout=3.0)
+
+    link = get_device_link(DEVICE_ID)
+    assert link is not None
+    await link.close(4401, "device_revoked")
+    release.set()
+    await asyncio.wait_for(task, timeout=3.0)
+
+    status_events = [e for e in harness.events if e.get("type") == "device.status"]
+    assert [e for e in status_events if e.get("online") is True] == [], status_events
+    assert [e.get("reason") for e in status_events if e.get("online") is False] == [
+        "device_revoked"
+    ]
+    assert link.ready is False
+
+
+async def test_revoke_commit_waits_for_mark_ready_lock(
+    seeded_device, client, auth_headers, monkeypatch
+):
+    """撤销的提交与关闭必须在生命周期锁内，不能插进 `_mark_ready()` 的复核窗口。
+
+    `_mark_ready()` 读到 is_active=True 之后暂停；撤销请求此刻提交若不受同一把
+    锁约束，就会在「复核通过 → 置 ready → 广播上线」之前完成，导致已撤销设备
+    仍被放行。这里断言 DELETE 在复核期间无法完成。
+    """
+
+    harness = Harness()
+    gateway = harness.gateway
+    real = gateway._device_is_active
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    calls = 0
+
+    async def gated(device_id: str) -> bool:
+        nonlocal calls
+        calls += 1
+        if calls < 3:
+            return await real(device_id)
+        active = await real(device_id)  # 撤销提交前读到 True
+        entered.set()
+        await release.wait()
+        return active
+
+    monkeypatch.setattr(gateway, "_device_is_active", gated)
+
+    channel = FakeChannel()
+    task = await harness.start(channel)
+    channel.push(hello())
+    await asyncio.wait_for(entered.wait(), timeout=3.0)
+
+    delete_task = asyncio.create_task(
+        client.delete(f"/api/devices/{DEVICE_ID}", headers=auth_headers)
+    )
+    try:
+        # 复核期间撤销的提交必须还没生效：若提交在锁外，这里会读到 is_active=False。
+        for _ in range(40):
+            async with AsyncSessionLocal() as db:
+                row = await db.get(DeviceModel, DEVICE_ID)
+            assert row is not None and row.is_active is True, "撤销提交不应在复核期间生效"
+            await asyncio.sleep(0.01)
+        assert not delete_task.done()
+    finally:
+        release.set()
+    resp = await asyncio.wait_for(delete_task, timeout=5.0)
+    assert resp.status_code == 200, resp.text
+
+    channel.push(None)
+    await asyncio.wait_for(task, timeout=3.0)
+    link_commands = [m for m in channel.sent if m.get("type") != "hello_ack"]
+    assert link_commands == []
     assert get_device_link(DEVICE_ID) is None
 
 
@@ -981,6 +1142,7 @@ async def test_send_failure_keeps_flushing_later_reports(seeded_device):
     await channel.wait_sent(lambda m: m.get("type") == "hello_ack")
     session = get_device_link(DEVICE_ID)
     assert session is not None
+    await wait_until(lambda: session.ready)
 
     channel.fail = True
     result = await session.send({"type": "idle.set", "enabled": False})
@@ -1038,6 +1200,8 @@ async def test_device_result_during_stop_send_is_not_rebroadcast(seeded_device):
     channel.push(hello())
     await channel.wait_sent(lambda m: m.get("type") == "hello_ack")
     link = get_device_link(DEVICE_ID)
+    assert link is not None
+    await wait_until(lambda: link.ready)
     scheduler = mod._DeviceScheduler(DEVICE_ID, link)
     mod._SCHEDULERS[DEVICE_ID] = scheduler
 

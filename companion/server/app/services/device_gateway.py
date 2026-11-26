@@ -112,10 +112,14 @@ class DeviceSession:
         # closing 表示「已开始冲刷最后一条上报」（撤销 / 替换 / 下线）：
         # 链路不再接受新指令，但仍允许上报落库；closed 表示冲刷已完成。
         self.closing = False
-        # ready 表示 hello_ack 已发出。链路会比 ack 更早进入注册表，但协议 §2
+        # ready 表示 hello_ack 已发出、且 `_mark_ready()` 在生命周期锁内复核过
+        # 「仍是当前链路 + 未被撤销」。链路会比 ack 更早进入注册表，但协议 §2
         # 的 session_id 就在 ack 里，设备（含自带模拟器）会把 ack 之前的控制帧
-        # 当成握手失败；因此 ack 之前一律拒绝下发。
+        # 当成握手失败；因此复核通过前一律拒绝下发。
         self.ready = False
+        # 关闭原因，供 `_teardown()` 广播 offline 时复用（撤销应显示
+        # device_revoked，而不是和其它断线一样的空原因）。
+        self.close_reason = ""
 
         self._report = self._initial_report(device)
         self._pending: dict[str, asyncio.Future[ActionResult]] = {}
@@ -424,6 +428,8 @@ class DeviceSession:
             self.closing = True
             # 必须先冲刷再标记 closed：`_handle_report()` 会丢弃 closed 会话的
             # 上报，撤销设备、会话替换等直接调用 close() 的路径否则会丢最后一条。
+            if reason:
+                self.close_reason = reason
             await self.stop_writer()
             self.closed = True
             self._stop_writer()
@@ -489,11 +495,10 @@ class DeviceGateway:
             await self._persist_hello(device_id, hello, protocol_version, capabilities)
             if not await self._install(session):
                 return
-            # 注册早于 ack，但 ack 之前链路一律不可下发（见 DeviceSession.ready）；
-            # ack 返回后立即置 ready：设备已拿到 session_id，接下来由 closing/closed
-            # 继续兜住撤销与替换窗口。
+            # 注册早于 ack，但 ack 之前链路一律不可下发（见 DeviceSession.ready）。
+            # ack 之后还要在锁内复核「未被撤销」才置 ready：撤销的 DB 提交与
+            # link.close() 在同一把生命周期锁内完成，复核通过才允许控制。
             await self._send_hello_ack(session, hello)
-            session.ready = True
             await self._mark_ready(session)
             await self._read_loop(session)
         except asyncio.CancelledError:
@@ -678,20 +683,28 @@ class DeviceGateway:
             return True
 
     async def _mark_ready(self, session: DeviceSession) -> None:
-        """hello_ack 发出后把会话标记为可下发，并在仍是当前链路时广播上线。"""
+        """hello_ack 发出后，在生命周期锁内复核并置 ready + 广播上线。
+
+        `ready` 只能在复核之后置位：撤销路由在同一把锁内「提交 is_active=False
+        → close(4401)」，因此锁内复核通过意味着撤销尚未发生；反之若撤销先拿到
+        锁，链路已 `closing/closed`，这里不会再放行任何控制帧。
+        """
         async with device_lifecycle_lock(session.device_id):
             if get_device_link(session.device_id) is not session:
                 # 期间被更新的连接替换：上线事件由新连接负责，避免认领错链路。
                 return
-            if session.closed or session.closing:
-                # ack 发送期间被撤销/替换/写失败关闭：链路已不可用，不能再上线。
-                return
             if not await self._device_is_active(session.device_id):
-                # 撤销已提交但还没拿到生命周期锁关闭链路（`DELETE` 在等同一把锁）：
-                # 这里补一次权威复核，避免广播 `online=true` 后立刻发 offline。
-                # offline 事件交给 `_teardown()` 统一发，避免重复。
+                # 防御性复核：撤销若来自本进程之外（多进程 / 直接改库），提交与
+                # close 不经过这把锁，这里仍要拒绝上线。offline 由 `_teardown()`
+                # 统一广播，避免重复。
                 await session.close(4401, "device_revoked")
                 return
+            if session.closed or session.closing:
+                # 上一行的 DB 读是 await：期间 `close()`（不经生命周期锁的写失败 /
+                # 停机路径）可能已经关闭链路。置 ready 前统一在这里确认，避免
+                # 「已关闭但仍置 ready 并广播上线」。
+                return
+            session.ready = True
             await self._publish_status(session.device_id, online=True)
 
     async def _teardown(self, session: DeviceSession) -> None:
@@ -706,7 +719,9 @@ class DeviceGateway:
             if not session.closed:
                 await session.close(1000)
             if was_current:
-                await self._publish_status(session.device_id, online=False)
+                await self._publish_status(
+                    session.device_id, online=False, reason=session.close_reason
+                )
 
     async def shutdown(self) -> None:
         """服务关闭时主动断开所有设备，避免连接悬挂。

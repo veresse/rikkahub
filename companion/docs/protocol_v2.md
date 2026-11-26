@@ -408,7 +408,7 @@
 
 | type | 字段 | 说明 |
 | :--- | :--- | :--- |
-| `device.status` | `device_id, online, reason` | 上线/离线 |
+| `device.status` | `device_id, online, reason` | 上线/离线；离线 `reason` ∈ `{""（普通断线）, "handshake_failed", "device_revoked", "server_shutdown", "internal_error"}` |
 | `device.report` | 同设备上报 | 实时状态 |
 | `action.result` | `device_id, action_id, status, detail, source` | 执行结果（设备上报或服务端终态） |
 | `conversation.turn_state` | `conversation_id, state`（`idle/generating`） | 会话是否正在生成 |

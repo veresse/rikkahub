@@ -100,8 +100,8 @@ async with device_lifecycle_lock(session.device_id):
 - `52 passed` → `55 passed`（`f2affdbc` 时 `test_device_gateway.py` 35 +
   `test_app_gateway.py` 20）。
 - 「只删预检则仍绿」不成立：删除预检后 `pause_on_get=2` 会落进 `_install()` 持锁的
-  `get()`，与测试线程的真实 `DELETE` 争同一把生命周期锁；实测 5.87s 后
-  `TimeoutError`（已加 5s 上界），不是「仍绿」。
+  `get()`，与测试线程的真实 `DELETE` 争同一把生命周期锁；实测约 5.9s 后
+  `TimeoutError` / `CancelledError`（已加 5s 上界），不是「仍绿」。
 
 ### 3.5 M-4：让争锁死锁以失败结束
 
@@ -132,7 +132,7 @@ for closed_loop in stale:
 | `test_revoke_while_ack_blocked_does_not_broadcast_online` | ack 阻塞期间真实撤销；ack 写成功后事件流中**没有** `online=true`，链路最终注销 |
 | `test_not_ready_link_is_offline_without_dispatching_commands` | `ready=False` 的链路：遥控直接 `device_offline`，无命令下发 |
 | `test_registered_but_not_ready_link_gets_no_tools` | `ready=False` 时 LLM 不注入 `robot.*`，system 提示离线，无工具调用 |
-| `test_revoke_after_precheck_is_caught_by_install_lock`（改） | `DELETE` 有 5s 上界；核心守卫回退时 5.87s 内 `TimeoutError`，不再挂起 |
+| `test_revoke_after_precheck_is_caught_by_install_lock`（改） | `DELETE` 有 5s 上界；核心守卫回退时约 5.9s 内超时失败，不再挂起 |
 
 **红/绿证据**（临时脚本在内存中改回旧行为，`finally` 还原，工作区最终干净）：
 
@@ -215,3 +215,22 @@ exit=1 elapsed=7.4s；1 failed in 5.87s；restored
 1. 提交本轮修复并推送。
 2. 派独立子智能体审查 `f2affdbc..HEAD`。
 3. 审查通过后进入音频 Block。
+
+## 9. 勘误（日志 17 修订）
+
+- **「`ready` 在 ack 返回后立即置位」被推翻**：本日志 §3.1 与 §6 Ruling 认为「撤销后
+  `ready` 仍为 True 也不会误发，因为 `send()/get_status()` 同时检查 closing/closed」。
+  该前提不成立：撤销的 `close()` 要等生命周期锁，而 `_mark_ready()` 的 `is_active`
+  复核正持着那把锁；复核窗口内 `closing` 仍是 False，`send()` 会把指令写到已撤销设备
+  （第十一轮审查用 `pause_on_get` 探针实测 `idle.set` 发出、`status='done'`）。
+  日志 17 已把 `ready` 改回复核通过后置位，并把撤销的 DB 提交移入生命周期锁。
+- **「`_mark_ready()` 锁内复核 `is_active` 就能堵住撤销窗口」只对一半**：撤销提交
+  在锁外时，提交与 close 之间仍有残窗，且 `_mark_ready()` 的读与广播之间可插入提交
+  （本日志只把它当作已接受风险）。日志 17 通过在锁内提交 + 置位后复核关闭该窗口。
+- **「MUTATIONS THAT STAYED GREEN: none」只对当时的脚本成立**：该脚本的 I1 mutation
+  是同时删掉 `closed/closing` 与 `is_active` 两道守卫，不能说明两道守卫各自被独立
+  覆盖。日志 17 新增三条用例分别锁住「复核前不得 ready」「`is_active` 判定被忽略」
+  「复核的 await 期间链路被关闭」。
+- **5.87s 的措辞**：重跑时输出为 `1 failed in 5.96s`，pytest 最终暴露的是
+  `CancelledError`（`wait_for` 取消请求 → SQLAlchemy 回滚清理），主因仍是 5s 上界；
+  具体耗时与异常类型随调度变化，不影响结论。

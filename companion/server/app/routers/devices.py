@@ -213,20 +213,22 @@ async def revoke_device(
     db: AsyncSession = Depends(get_db),
 ):
     """撤销设备：软删除并让旧 Token 立即失效（保留历史记录）。"""
-    async with db.begin():
-        device = await db.get(DeviceModel, device_id)
-        if not device:
-            raise HTTPException(status_code=404, detail="device_not_found")
-        device.is_active = False
-        # 换成一个不可能再被使用的随机哈希，旧 Token 立即失效。
-        device.token_hash = hash_token(generate_token())
-        device.state = "revoked"
-
-    # 已建立的 `/device/ws` 连接不会周期性复验 Token，撤销时必须主动断开。
-    # 「查链路 + 关闭」与 `DeviceGateway._install()` 的「复核活跃 + 注册」共用
-    # 每设备生命周期锁：撤销可能恰好落在「已鉴权、还在等 hello」的窗口，
-    # 此时查不到链路；不加锁的话该连接会在撤销后重新注册并仍可被控制。
+    # 提交撤销与关闭链路必须在同一把生命周期锁内完成：`DeviceGateway._mark_ready()`
+    # 也在这把锁内「复核 is_active → 置 ready → 广播上线」。若提交在锁外，复核通过
+    # 后、广播前的毫秒窗口里撤销可以提交，设备会以「已撤销但 ready」的状态接收指令。
     async with device_lifecycle_lock(device_id):
+        async with db.begin():
+            device = await db.get(DeviceModel, device_id)
+            if not device:
+                raise HTTPException(status_code=404, detail="device_not_found")
+            device.is_active = False
+            # 换成一个不可能再被使用的随机哈希，旧 Token 立即失效。
+            device.token_hash = hash_token(generate_token())
+            device.state = "revoked"
+
+        # 已建立的 `/device/ws` 连接不会周期性复验 Token，撤销时必须主动断开。
+        # 撤销可能恰好落在「已鉴权、还在等 hello」的窗口，此时查不到链路；不加锁
+        # 的话该连接会在撤销后重新注册并仍可被控制。
         link = get_device_link(device_id)
         close = getattr(link, "close", None)
         if close is not None:
