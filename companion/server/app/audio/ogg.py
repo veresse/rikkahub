@@ -318,6 +318,8 @@ class OggOpusDemuxer:
                 if len(segment) < 255:
                     packet = bytes(self._partial)
                     self._partial.clear()
+                    if not packet:
+                        continue
                     if self._is_header(packet):
                         continue
                     packets.append(packet)

@@ -42,3 +42,5 @@
 | 20 | Phase 3 停机收尾 | ✅ 已完成 | `run()` 恢复 reload 分支并拒绝多 worker、应用层停机 10s 总时限与 `force_exit`、App 侧停机门控、强化 M-1 用例；220 passed |
 | 21 | Phase 3 停机总预算 | ✅ 已完成 | 10s + 2s + 2s + 20s 四层预算、lifespan 有界兜底、中窗 `force_exit` 轮询、取消可重试与逐台 offline、真实 TCP 1011 e2e、mutation 入库；228 passed |
 | 22 | Phase 3 停机（三）：offline 补偿 | ✅ 已完成 | 取消越过 unregister 后靠 `pending_offline_reason` 补发、`_teardown()` 取消回填、offline at-least-once、测试隔离与 mutation 超时区分；231 passed |
+| 23 | 音频 Block 设计（ASR/TTS/barge-in） | ✅ 设计已批准 | 协议补齐、纯 Python Ogg、VoiceSession/打断/落库/超时方案；子块 A→B→C |
+| 24 | 音频 Block A：协议 / 帧 / Ogg / 传输 | ✅ 已完成（待审查） | 12B 帧、Ogg mux/demux、`send_bytes/send_audio`、VoiceSession 门控、模拟器二进制、协议 §4.8/§5.4；278 passed、mutation 10/10 |

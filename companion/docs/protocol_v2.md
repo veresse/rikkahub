@@ -114,6 +114,8 @@
 
 - v1 设备：`v: 1` 或不含 `capabilities`。服务端按纯音频降级，不注入动作工具、不下发 v2 控制消息，`hello_ack.capabilities` 返回 `[]`。
 - `action_catalog_version` 与服务端不一致时：服务端仍接受连接，但在 `hello_ack.warnings` 中返回 `action_catalog_mismatch`，并下发当前版本号；固件应记录并提示升级。
+- 下行帧长以服务端 `VOICE_DOWNLINK_FRAME_MS` 为准；与 `hello.audio.downlink.frame_ms` 不同时，
+  `hello_ack.audio.downlink.frame_ms` 改为服务端值并附 `downlink_frame_ms_adjusted`，设备必须按 ack 播放。
 
 ### 3.2 服务端 → 设备 `hello_ack`
 

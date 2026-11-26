@@ -25,6 +25,10 @@ def test_frame_header_is_big_endian():
     assert raw[4:8] == b"\x01\x02\x03\x04"
     assert raw[8:12] == b"\x05\x06\x07\x08"
 
+    parsed = AudioFrame.parse(raw)
+    assert parsed.seq == 0x01020304
+    assert parsed.turn_seq == 0x05060708
+
 
 @pytest.mark.parametrize(
     "raw",
@@ -46,6 +50,12 @@ def test_frame_rejects_bad_header(raw):
 def test_frame_rejects_empty_payload_without_silence():
     with pytest.raises(FrameError):
         AudioFrame.parse(b"\xa1\x01\x01\x00" + b"\x00" * 8)
+
+
+def test_frame_rejects_reserved_flags_with_payload():
+    raw = bytes([0xA1, 0x01, 0x01, 0x04]) + b"\x00" * 8 + b"x"
+    with pytest.raises(FrameError):
+        AudioFrame.parse(raw)
 
 
 def test_frame_accepts_empty_silence_payload():

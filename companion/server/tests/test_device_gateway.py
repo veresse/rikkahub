@@ -349,6 +349,19 @@ async def test_hello_v2_registers_link_and_ack_contains_server_state(seeded_devi
     assert get_device_link(DEVICE_ID) is None
 
 
+async def test_hello_ack_adjusts_downlink_frame_ms(seeded_device):
+    harness = Harness()
+    audio = {
+        "uplink": {"codec": "opus", "sample_rate": 16000, "channels": 1, "frame_ms": 60},
+        "downlink": {"codec": "opus", "sample_rate": 24000, "channels": 1, "frame_ms": 20},
+    }
+    task, channel, ack = await harness.connected(audio=audio)
+
+    assert ack["audio"]["downlink"]["frame_ms"] == 60
+    assert "downlink_frame_ms_adjusted" in ack["warnings"]
+    await _stop(task, channel)
+
+
 async def test_hello_timeout_closes_4408(seeded_device, monkeypatch):
     monkeypatch.setattr(settings, "DEVICE_HELLO_TIMEOUT_SECONDS", 0.05)
     harness = Harness()

@@ -97,7 +97,20 @@ def test_muxer_requires_known_duration():
 
 def test_ogg_crc32_is_not_zlib():
     assert ogg_crc32(b"") == 0
-    assert ogg_crc32(b"OggS") != 0
+    assert ogg_crc32(b"OggS") == 0x5FB0A94F
+
+
+def test_muxer_granule_counts_48k_samples():
+    from companion.server.app.audio.ogg import parse_ogg_page
+
+    muxer = OggOpusMuxer(serial=7, max_packets_per_page=3)
+    muxer.header_bytes()
+    muxer.push(PACKET_20MS)
+    muxer.push(PACKET_20MS)
+    page, _ = parse_ogg_page(muxer.push(PACKET_20MS))
+    assert page is not None
+    # 3 × 20 ms × 48 kHz
+    assert page.granule_position == 2880
 
 
 def test_demuxer_waits_for_partial_page():

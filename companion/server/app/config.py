@@ -75,6 +75,8 @@ class Settings(BaseSettings):
     DASHSCOPE_ASR_MODEL: str = "fun-asr-realtime"
     DASHSCOPE_TTS_MODEL: str = "qwen-audio-3.0-tts-flash"
     DASHSCOPE_TTS_VOICE: str = "cherry"  # 默认温柔男声预设
+    # 下行 TTS 帧长；与设备 hello 请求不同时以本值为准并附 warning。
+    VOICE_DOWNLINK_FRAME_MS: int = 60
 
     # 动作编排限制
     MAX_ACTIONS_PER_TURN: int = 3

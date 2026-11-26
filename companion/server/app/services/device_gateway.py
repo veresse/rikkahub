@@ -645,6 +645,13 @@ class DeviceGateway:
         if not audio_ok:
             warnings.append("audio_defaulted")
 
+        downlink_frame_ms = settings.VOICE_DOWNLINK_FRAME_MS
+        if downlink_frame_ms not in VALID_FRAME_MS:
+            downlink_frame_ms = DEFAULT_AUDIO["downlink"]["frame_ms"]
+        if audio["downlink"]["frame_ms"] != downlink_frame_ms:
+            audio["downlink"]["frame_ms"] = downlink_frame_ms
+            warnings.append("downlink_frame_ms_adjusted")
+
         volume_limits = limits.get("volume", {})
         await session.channel.send_json(
             {
