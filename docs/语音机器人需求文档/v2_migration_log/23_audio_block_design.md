@@ -88,9 +88,12 @@ Device WS ──binary──> DeviceGateway._on_message()
 
 规则：
 
-- 仅 `protocol_version >= 2` 接受；否则 `voice.error(code="unsupported_protocol")`。
-- 同一设备同时只允许一轮；重复 `voice.start` 或轮次不匹配的 `voice.end`/`cancel`/`segment_played`
-  一律发 `voice.error(code="busy"|"invalid_turn")` 并保持原轮次不变。
+- 仅 `protocol_version >= 2` 接受；否则回一次 `voice.error(code="unsupported_protocol", fatal=true)`，
+  之后忽略该连接的语音消息。
+- 同一设备同时只允许一轮。同一 `turn_id` 的重复 `voice.start` 是幂等重传（不返回 `busy`、
+  不清空已收帧）；不同 `turn_id` 的 `voice.start` 回 `voice.error(code="busy", fatal=false)`，
+  原轮次不变。轮次不匹配的 `voice.end`/`cancel`/`segment_played` 回
+  `voice.error(code="invalid_turn", fatal=false)`；属于刚结束/取消的上一轮的迟到消息静默忽略。
 - `voice.start` 之前的二进制上行帧丢弃（设备此时麦克风应关闭）。
 - `voice.end` 后到达的上行帧丢弃；`voice.cancel` 后到达的上行帧丢弃。
 - 设备重复 `voice.segment_played` 幂等：同一 `(turn_id, segment_seq)` 只处理一次。
@@ -101,9 +104,14 @@ Device WS ──binary──> DeviceGateway._on_message()
 | :--- | :--- | :--- |
 | `voice.segment` | `turn_id, segment_seq, text, last` | 在一段 TTS 的第一帧之前发送；`text` 供静音时屏幕显示；`last=true` 表示本轮最后一段。 |
 | `voice.cancel_ack` | `turn_id, reason` | 已停止本轮 LLM/TTS、清空下行队列。 |
-| `voice.error` | `turn_id, code, message` | `code ∈ {busy, unbound, no_speech, asr_unavailable, tts_unavailable, idle_timeout, invalid_turn, unsupported_protocol, internal_error}`；设备收到后回 IDLE。 |
+| `voice.error` | `turn_id, code, message, fatal` | `code ∈ {busy, unbound, no_speech, asr_unavailable, tts_unavailable, idle_timeout, invalid_turn, invalid_frame, unsupported_protocol, internal_error}`。`fatal=true` 时设备回 IDLE；`fatal=false` 只否定触发它的这条消息，设备保持当前状态。 |
 
-- `voice.segment` 与后续帧在同一个 `DeviceSession._send_lock` 内按序发送，避免“段文本晚于音频”。
+- `fatal=true`：`unbound`、`no_speech`、`asr_unavailable`、`tts_unavailable`、`idle_timeout`、
+  `unsupported_protocol`、`internal_error`，以及对话锁被 App 生成占用时的 `busy`。
+- `fatal=false`：`invalid_turn`、`invalid_frame`，以及同一设备已有活跃语音轮次时拒绝另一个
+  `voice.start` 的 `busy`。
+- `voice.segment` 与后续帧在同一个 `DeviceSession._send_lock` 内按序发送（`send_segment`），
+  避免“段文本晚于音频”；每轮只有一个下行发送器。
 - `action.stop` 仍按 §4.6；barge-in 只发一次，`reason="barge_in"`。
 - 下行帧的 `flags.bit0` 仍表示**本轮最后一帧**，不是每段最后一帧；
   段边界由 `voice.segment` 标识。
@@ -298,7 +306,7 @@ class TtsProvider(Protocol):
 
 沿用 `get_conversation_lock()`。设备语音与 App 文字共享同一把锁：
 
-- 锁被占用 → `voice.error(code="busy")`，设备回 IDLE；不排队、不打断 App 的生成。
+- 锁被占用 → `voice.error(code="busy", fatal=true)`，设备回 IDLE；不排队、不打断 App 的生成。
 - 语音轮次持有锁直到 LLM/TTS 结束或取消；取消时锁随生成器退出释放。
 
 ## 9. barge-in 与 `action.stop` 去重

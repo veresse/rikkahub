@@ -284,12 +284,18 @@
 | :--- | :--- | :--- |
 | `voice.segment` | `turn_id, segment_seq, text, last` | 一段 TTS 的元数据；必须在该段第一帧二进制音频之前发出。`text` 供静音时屏幕显示；`last=true` 表示本轮最后一段。 |
 | `voice.cancel_ack` | `turn_id, reason` | 服务端已停止本轮 LLM/TTS 并清空下行队列；`reason` 原样回显 `barge_in`/`user_stop`。 |
-| `voice.error` | `turn_id, code, message` | 本轮无法继续；设备收到后回 `IDLE`。 |
+| `voice.error` | `turn_id, code, message, fatal` | 见下方致命/非致命规则。 |
 
 `voice.error.code` ∈ `{busy, unbound, no_speech, asr_unavailable, tts_unavailable,
 idle_timeout, invalid_turn, invalid_frame, unsupported_protocol, internal_error}`。
 
-- `voice.segment` 与音频帧在同一个下行发送锁内按序发出，避免“段文本晚于音频”。
+- `fatal=true`（`unbound`、`no_speech`、`asr_unavailable`、`tts_unavailable`、
+  `idle_timeout`、`unsupported_protocol`、`internal_error`）：本轮无法继续，设备回 `IDLE`。
+- `fatal=false`（`busy`、`invalid_turn`、`invalid_frame`）：只否定触发它的这条消息，
+  设备保持当前状态；服务端的原轮次也不变（重复 `voice.start` 的 `busy` 是唯一例外：
+  同一 `turn_id` 的重传按幂等成功处理，不返回 `busy`）。
+- `voice.segment` 必须在同一轮的下行音频帧之前发送；服务端保证每轮只有一个下行发送器，
+  不会出现“音频先于段文本”。
 - 下行帧的 `flags.bit0` 表示**本轮**最后一帧，不是每段最后一帧；段边界由 `voice.segment` 标识。
 - `voice.cancel_ack` 由语音管线立即发送；barge-in 的 `action.stop(barge_in)` 由被取消的
   聊天生成器在停止本轮在途动作时发送，二者不重复。
@@ -364,13 +370,19 @@ idle_timeout, invalid_turn, invalid_frame, unsupported_protocol, internal_error}
 {"v": 2, "type": "voice.segment_played", "turn_id": "uuid", "segment_seq": 2, "ts": 1764000000000}
 ```
 
-- 同一设备同时只允许一轮；重复 `voice.start` 或轮次不匹配的 `voice.end`/`voice.cancel`/
-  `voice.segment_played` 回 `voice.error(code="busy"|"invalid_turn")`，原轮次不变。
+- 同一设备同时只允许一轮。同一 `turn_id` 的重复 `voice.start` 是幂等重传（不返回
+  `busy`、不清空已收帧）；不同 `turn_id` 的 `voice.start` 回 `voice.error(busy, fatal=false)`，
+  原轮次不变。轮次不匹配的 `voice.end`/`voice.cancel`/`voice.segment_played` 回
+  `voice.error(invalid_turn, fatal=false)`；但属于上一轮（刚结束/取消）的迟到消息静默忽略，
+  避免设备因重传被误判。
 - `voice.start` 之前的二进制上行帧丢弃（设备此时麦克风应关闭）；`voice.end`/`voice.cancel`
   之后的帧同样丢弃，直到下一轮 `voice.start`。
 - 同一轮内 `turn_seq` 必须严格递增；服务端丢弃重复或回退帧，不因缺口断开连接。
-- 同一 `(turn_id, segment_seq)` 的 `voice.segment_played` 幂等，只处理一次。
+- 同一 `(turn_id, segment_seq)` 的 `voice.segment_played` 幂等，只处理一次；乱序/重复的
+  `segment_seq` 丢弃，不回错误。
 - 半双工：服务端在 `THINKING/SPEAKING` 期间忽略上行音频帧；设备在 `SPEAKING` 期间暂停采集。
+- `protocol_version = 1` 的设备发送任意 `voice.*` 时，服务端回一次
+  `voice.error(unsupported_protocol, fatal=true)` 后忽略后续语音消息。
 
 ---
 
@@ -386,18 +398,22 @@ idle_timeout, invalid_turn, invalid_frame, unsupported_protocol, internal_error}
 | 3 | 1 | flags | bit0=本轮最后一帧；bit1=静音帧 |
 | 4 | 4 | seq | 帧序号，单调递增，溢出回绕 |
 | 8 | 4 | turn_seq | 轮次序号，每个 `turn_id` 从 0 开始 |
-| 12 | N | payload | Opus 包 |
+| 12 | N | payload | Opus 包，最大 16 KiB |
 
 ### 6.2 音频参数
 
 - 上行：16kHz、单声道、20/60ms（以 `hello` 协商为准）。
-- 下行：24kHz（协商可降为 16kHz）、单声道。
+- 下行：24kHz（协商可降为 16kHz）、单声道。`hello_ack.audio.downlink.frame_ms`
+  只是标称节拍；服务端不重编码，实际播放时长以每个 Opus 包的 TOC 为准。
 - 服务端只做短暂内存缓冲，**不落盘、不入库、不打印原始音频**。
-- 帧头校验：长度 ≥12、magic=`0xA1`、version=`0x01`、`kind ∈ {0x01,0x02}`、`flags` 保留位必须为 0；
-  空 payload 只允许静音帧（`flags.bit1=1`）。服务端只接受 `kind=0x01` 的上行帧；畸形帧回
-  `voice.error(code="invalid_frame")` 并丢弃该帧，**不关闭控制通道**。
+- 帧头校验：长度 ≥12、magic=`0xA1`、version=`0x01`、`kind ∈ {0x01,0x02}`、`flags` 保留位必须为 0、
+  payload ≤16 KiB；空 payload 只允许静音帧（`flags.bit1=1`）。服务端只接受 `kind=0x01` 的上行帧；
+  畸形帧回 `voice.error(code="invalid_frame", fatal=false)` 并丢弃该帧，**不关闭控制通道**。
+  同一轮内最多回一次 `invalid_frame`，避免设备持续灌垃圾时占满下行锁。
 - 半双工：设备处于 `SPEAKING` 时暂停麦克风采集与上行；服务端忽略该期间的上行帧。
-- 旧帧过滤：服务端丢弃同一轮内 `turn_seq` 重复或回退的帧；设备丢弃 `turn_seq` 小于当前轮次的 TTS 帧。
+- 旧帧过滤：服务端丢弃同一轮内 `turn_seq` 重复或回退的帧。设备以最近一次
+  `voice.segment.turn_id` 标识当前轮次，收到新 `turn_id` 时忽略尚未播完的旧帧；
+  服务端保证不会跨轮下发旧帧（每轮一个下行发送器，取消时递增代次并清空队列）。
 - 打断：设备短按立即本地停扬声器、递增播放代次、发送 `voice.cancel(reason="barge_in")`；服务端取消
   LLM/TTS 并回 `voice.cancel_ack`，同时由被取消的聊天生成器下发一次 `action.stop(reason="barge_in")`
   （仅当本轮有在途动作）。
@@ -578,6 +594,8 @@ ANY --voice.cancel(reason)--> IDLE（落库 interrupted；barge_in 时停本轮�
 ANY --长按(≥1500ms)--> IDLE（结束本轮）
 ANY --静默 5 分钟--> IDLE（结束本轮）
 SPEAKING --短按--> IDLE（本地停声 + voice.cancel(barge_in)）
+ANY --voice.error(fatal=true)--> IDLE（本轮无法继续）
+ANY --voice.error(fatal=false)--> 状态不变（只否定触发它的那条消息）
 ERROR --短按--> LISTENING（重试）
 ```
 

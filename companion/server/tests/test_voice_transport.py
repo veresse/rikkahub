@@ -34,15 +34,18 @@ class VoiceChannel:
         self.incoming: asyncio.Queue = asyncio.Queue()
         self.sent: list[dict[str, Any]] = []
         self.sent_bytes: list[bytes] = []
+        self.order: list[tuple[str, Any]] = []
         self.closed: tuple[int, str] | None = None
         self.sent_event = asyncio.Event()
 
     async def send_json(self, payload: dict[str, Any]) -> None:
         self.sent.append(payload)
+        self.order.append(("json", payload))
         self.sent_event.set()
 
     async def send_bytes(self, data: bytes) -> None:
         self.sent_bytes.append(data)
+        self.order.append(("bytes", data))
         self.sent_event.set()
 
     async def receive(self):
@@ -233,16 +236,154 @@ async def test_downlink_kind_from_device_is_rejected(gateway_session):
     channel.push({"v": 2, "type": "voice.start", "turn_id": "t1"})
     await wait_until(lambda: session.voice is not None)
     channel.push(AudioFrame(KIND_DOWNLINK, 0, 0, 0, b"x").encode())
-    await asyncio.sleep(0.05)
+    error = await channel.wait_sent(lambda m: m.get("type") == "voice.error")
+    assert error["code"] == "invalid_frame"
+    assert error["fatal"] is False
     assert session.voice.frames_received == 0
 
 
-async def test_malformed_binary_does_not_kill_control_channel(gateway_session):
+async def test_malformed_binary_while_listening_reports_once_and_recovers(
+    gateway_session,
+):
     session, channel = gateway_session
-    channel.push(b"\xa1\x01")
     channel.push({"v": 2, "type": "voice.start", "turn_id": "t1"})
     await wait_until(lambda: session.voice is not None)
+    channel.push(b"\xa1\x01")
+    channel.push(b"\xa1\x01\x01\x00" + b"\x00" * 8)  # 缺 payload
+    error = await channel.wait_sent(lambda m: m.get("type") == "voice.error")
+    assert error["code"] == "invalid_frame"
+    assert error["turn_id"] == "t1"
+    assert error["fatal"] is False
+    # 同一轮只回一次，设备灌垃圾不能占满下行锁。
+    await asyncio.sleep(0.05)
+    assert sum(m.get("code") == "invalid_frame" for m in channel.sent) == 1
+
+    channel.push(AudioFrame(KIND_UPLINK, 0, 0, 0, b"x").encode())
+    await wait_until(lambda: session.voice.frames_received == 1)
+
+
+async def test_duplicate_voice_start_same_turn_is_idempotent(gateway_session):
+    session, channel = gateway_session
+    channel.push({"v": 2, "type": "voice.start", "turn_id": "t1"})
+    await wait_until(lambda: session.voice is not None)
+    channel.push(AudioFrame(KIND_UPLINK, 0, 0, 0, b"x").encode())
+    await wait_until(lambda: session.voice.frames_received == 1)
+    channel.push({"v": 2, "type": "voice.start", "turn_id": "t1"})
+    await asyncio.sleep(0.05)
+    assert not any(m.get("code") == "busy" for m in channel.sent)
     assert session.voice.state == "listening"
+    assert session.voice.frames_received == 1
+
+
+async def test_segment_played_is_idempotent_and_late_reports_are_ignored(
+    gateway_session,
+):
+    session, channel = gateway_session
+    channel.push({"v": 2, "type": "voice.start", "turn_id": "t1"})
+    await wait_until(lambda: session.voice is not None)
+    channel.push({"v": 2, "type": "voice.end", "turn_id": "t1"})
+    await wait_until(lambda: session.voice.state == "thinking")
+    assert session.voice.mark_speaking() is True
+
+    for seq in (0, 0, 2, 1):
+        channel.push(
+            {"v": 2, "type": "voice.segment_played", "turn_id": "t1", "segment_seq": seq}
+        )
+    await asyncio.sleep(0.05)
+    assert session.voice._last_segment_seq == 2
+
+    channel.push({"v": 2, "type": "voice.cancel", "turn_id": "t1", "reason": "barge_in"})
+    await channel.wait_sent(lambda m: m.get("type") == "voice.cancel_ack")
+    channel.push(
+        {"v": 2, "type": "voice.segment_played", "turn_id": "t1", "segment_seq": 3}
+    )
+    await asyncio.sleep(0.05)
+    assert not any(m.get("type") == "voice.error" for m in channel.sent)
+
+
+async def test_voice_messages_from_v1_device_get_unsupported_protocol(seeded_device):
+    gateway = DeviceGateway()
+    channel = VoiceChannel()
+    task = asyncio.create_task(gateway.handle(DEVICE_ID, channel))
+    channel.push(
+        {
+            "v": 1,
+            "type": "hello",
+            "device_id": DEVICE_ID,
+            "capabilities": [],
+        }
+    )
+    await channel.wait_sent(lambda m: m.get("type") == "hello_ack")
+    channel.push({"v": 2, "type": "voice.start", "turn_id": "t1"})
+    error = await channel.wait_sent(lambda m: m.get("type") == "voice.error")
+    assert error["code"] == "unsupported_protocol"
+    assert error["fatal"] is True
+    channel.push({"v": 2, "type": "voice.start", "turn_id": "t2"})
+    await asyncio.sleep(0.05)
+    assert (
+        sum(m.get("code") == "unsupported_protocol" for m in channel.sent) == 1
+    )
+    channel.push(None)
+    await asyncio.wait_for(task, timeout=2.0)
+
+
+async def test_voice_session_closed_on_disconnect(gateway_session):
+    session, channel = gateway_session
+    channel.push({"v": 2, "type": "voice.start", "turn_id": "t1"})
+    await wait_until(lambda: session.voice is not None)
+    voice = session.voice
+    channel.push(None)
+    await wait_until(lambda: session.voice is None)
+    assert voice.state == "closed"
+
+
+async def test_send_segment_orders_text_before_audio_under_one_lock(gateway_session):
+    session, channel = gateway_session
+    channel.order.clear()
+    await asyncio.gather(
+        session.send_segment(
+            {"v": 2, "type": "voice.segment", "segment_seq": 0},
+            b"a",
+            turn_seq=0,
+        ),
+        session.send_segment(
+            {"v": 2, "type": "voice.segment", "segment_seq": 1},
+            b"b",
+            turn_seq=0,
+        ),
+    )
+    assert [kind for kind, _ in channel.order] == ["json", "bytes", "json", "bytes"]
+    assert channel.order[0][1]["segment_seq"] == 0
+    assert channel.order[2][1]["segment_seq"] == 1
+
+
+@pytest.mark.parametrize(
+    "payload,turn_seq,flags",
+    [
+        (b"a", -1, 0),
+        (b"a", 0x1_0000_0000, 0),
+        ("text", 0, 0),
+        (b"a", 0, 0x80),
+        (b"x" * (16 * 1024 + 1), 0, 0),
+    ],
+)
+async def test_send_audio_rejects_invalid_arguments(
+    gateway_session, payload, turn_seq, flags
+):
+    session, channel = gateway_session
+    assert await session.send_audio(payload, turn_seq=turn_seq, flags=flags) is False
+    assert channel.sent_bytes == []
+
+
+async def test_voice_audio_path_does_not_log_payload(gateway_session, caplog):
+    session, channel = gateway_session
+    channel.push({"v": 2, "type": "voice.start", "turn_id": "t1"})
+    await wait_until(lambda: session.voice is not None)
+    marker = b"SECRET-AUDIO-MARKER"
+    channel.push(AudioFrame(KIND_DOWNLINK, 0, 0, 0, marker).encode())
+    await channel.wait_sent(lambda m: m.get("type") == "voice.error")
+    assert marker.decode() not in caplog.text
+    assert marker.hex() not in caplog.text
 
 
 async def test_voice_session_generation_and_state():

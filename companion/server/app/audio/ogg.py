@@ -205,8 +205,11 @@ class OggOpusMuxer:
     """把裸 Opus 包封成 Ogg 页。
 
     默认每包一页（实时链路首包延迟最小）；`max_packets_per_page > 1` 时
-    缓冲到指定包数再出页，`flush()` 输出残留包。
+    缓冲到指定包数再出页，`flush()` 输出残留包。`finish()` 追加 EOS 页；
+    单页最多 50 个包（与设计 §5.2 一致，也远低于 255 条 lacing 的限制）。
     """
+
+    MAX_PACKETS_PER_PAGE = 50
 
     def __init__(
         self,
@@ -217,7 +220,7 @@ class OggOpusMuxer:
         pre_skip: int = 312,
         max_packets_per_page: int = 1,
     ) -> None:
-        if max_packets_per_page < 1:
+        if not 1 <= max_packets_per_page <= self.MAX_PACKETS_PER_PAGE:
             raise OggError("invalid_page_size")
         self.sample_rate = sample_rate
         self.channels = channels
@@ -229,6 +232,7 @@ class OggOpusMuxer:
         self._pending: list[tuple[bytes, float]] = []
         self._header_cache = b""
         self._headers_sent = False
+        self._finished = False
 
     def header_bytes(self) -> bytes:
         if self._header_cache:
@@ -251,6 +255,8 @@ class OggOpusMuxer:
         return self._header_cache
 
     def push(self, packet: bytes, *, duration_ms: float | None = None) -> bytes:
+        if self._finished:
+            raise OggError("stream_finished")
         if duration_ms is None:
             duration_ms = opus_packet_duration_ms(packet)
         if duration_ms is None:
@@ -273,6 +279,22 @@ class OggOpusMuxer:
             self._headers_sent = True
         return prefix + self._emit_pending()
 
+    def finish(self) -> bytes:
+        """输出剩余包并封 EOS 页；幂等，之后 `push()` 抛错。"""
+        if self._finished:
+            return b""
+        prefix = b""
+        if not self._headers_sent:
+            prefix = self.header_bytes()
+            self._headers_sent = True
+        body = self._emit_pending() if self._pending else b""
+        eos_page = _build_page(
+            HEADER_TYPE_EOS, self._granule, self.serial, self._sequence, []
+        )
+        self._sequence += 1
+        self._finished = True
+        return prefix + body + eos_page
+
     def _emit_pending(self) -> bytes:
         packets = [packet for packet, _ in self._pending]
         for _, duration_ms in self._pending:
@@ -284,45 +306,127 @@ class OggOpusMuxer:
 
 
 class OggOpusDemuxer:
-    """增量拆 Ogg 页并重组裸 Opus 包。"""
+    """增量拆 Ogg 页并重组裸 Opus 包。
+
+    容错规则：
+    - 页 CRC 错误：跳过该页并抛一次 `OggError`，之后的 `feed()` 继续解析后续页。
+    - 上一页有未完成包、下一页却未置 CONTINUED：丢弃残缺包，不拼接坏数据。
+    - 页丢失后续上 CONTINUED：跳过直到下一个包结束，避免把半截包当完整包。
+    - 收到 BOS 且 serial 改变：视为新的链式流，重置头部/包状态后继续。
+    - 重复 sequence 的页丢弃，避免同一包被送两次。
+    """
 
     def __init__(self) -> None:
         self._buffer = b""
         self._partial = bytearray()
         self._serial: int | None = None
+        self._last_sequence: int | None = None
         self._seen_head = False
         self._seen_tags = False
+        self.crc_errors = 0
+        self.dropped_pages = 0
+        self.eos = False
 
     def reset(self) -> None:
         self._buffer = b""
         self._partial.clear()
         self._serial = None
+        self._last_sequence = None
         self._seen_head = False
         self._seen_tags = False
+        self.crc_errors = 0
+        self.dropped_pages = 0
+        self.eos = False
 
     def feed(self, data: bytes | bytearray | memoryview) -> list[bytes]:
         self._buffer += bytes(data)
         packets: list[bytes] = []
         while True:
-            page, consumed = parse_ogg_page(self._buffer)
+            try:
+                page, consumed = parse_ogg_page(self._buffer)
+            except OggError:
+                # 坏页必须被跳过，否则每次 feed 都会在同一处重复抛错。
+                self.crc_errors += 1
+                self._partial.clear()
+                skipped = _page_total_length(self._buffer)
+                if skipped and self._buffer[:4] == OGG_CAPTURE_PATTERN:
+                    self._buffer = self._buffer[skipped:]
+                else:
+                    # 连页头都不可信：向后寻找下一个捕获模式重新同步。
+                    next_index = self._buffer.find(OGG_CAPTURE_PATTERN, 1)
+                    self._buffer = (
+                        self._buffer[next_index:] if next_index > 0 else b""
+                    )
+                raise
             if page is None:
                 break
             self._buffer = self._buffer[consumed:]
+
             if self._serial is None:
                 self._serial = page.serial
             elif page.serial != self._serial:
-                # 链式 Ogg 或多流复用：只处理第一条流。
-                continue
-            for segment in page.segments:
-                self._partial.extend(segment)
-                if len(segment) < 255:
-                    packet = bytes(self._partial)
+                if page.bos:
+                    self._begin_chain(page.serial)
+                else:
+                    self.dropped_pages += 1
+                    continue
+            elif page.bos and page.sequence == 0:
+                # 同一 serial 上重新开始的链式流（部分复用器会复用 serial）。
+                self._begin_chain(page.serial)
+
+            if page.eos:
+                self.eos = True
+            if self._last_sequence is not None:
+                delta = (page.sequence - self._last_sequence) & 0xFFFFFFFF
+                if delta == 0:
+                    # 重复页：同一包不能送两次。
+                    self.dropped_pages += 1
+                    continue
+                if delta > 1:
+                    # 中间缺页：残缺包不可信，交给 CONTINUED 逻辑重新对齐。
                     self._partial.clear()
-                    if not packet:
-                        continue
-                    if self._is_header(packet):
-                        continue
-                    packets.append(packet)
+                    self.dropped_pages += delta - 1
+            self._last_sequence = page.sequence
+
+            packets.extend(self._consume_page(page))
+        return packets
+
+    def _begin_chain(self, serial: int) -> None:
+        self._partial.clear()
+        self._serial = serial
+        self._last_sequence = None
+        self._seen_head = False
+        self._seen_tags = False
+        self.eos = False
+
+    def _consume_page(self, page: OggPage) -> list[bytes]:
+        packets: list[bytes] = []
+        if page.continued:
+            if not self._partial:
+                # 开头已丢：跳过不完整包，直到某个 segment 以 <255 结束。
+                skipping = True
+            else:
+                skipping = False
+        else:
+            if self._partial:
+                # 上一页声明还有后续，但下一页没续：残缺包不可用。
+                self._partial.clear()
+            skipping = False
+
+        for segment in page.segments:
+            if skipping:
+                if len(segment) < 255:
+                    skipping = False
+                continue
+            self._partial.extend(segment)
+            if len(segment) < 255:
+                packet = bytes(self._partial)
+                self._partial.clear()
+                if not packet:
+                    continue
+                if self._is_header(packet):
+                    continue
+                packets.append(packet)
         return packets
 
     def _is_header(self, packet: bytes) -> bool:
@@ -333,3 +437,15 @@ class OggOpusDemuxer:
             self._seen_tags = True
             return True
         return False
+
+
+def _page_total_length(raw: bytes) -> int:
+    """在报错后估算坏页长度，供 demuxer 跳过；无法确定时返回 0。"""
+    if len(raw) < OGG_HEADER_SIZE:
+        return 0
+    segment_count = raw[26]
+    table_end = OGG_HEADER_SIZE + segment_count
+    if len(raw) < table_end:
+        return 0
+    total = table_end + sum(raw[OGG_HEADER_SIZE:table_end])
+    return total if len(raw) >= total else 0

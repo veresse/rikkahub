@@ -76,3 +76,16 @@ def test_frame_parse_accepts_memoryview():
     assert parsed.seq == 1
     assert parsed.turn_seq == 2
     assert parsed.payload == b"abc"
+
+
+@pytest.mark.parametrize("field", ["seq", "turn_seq"])
+def test_encode_rejects_out_of_range_counters(field):
+    kwargs = {"seq": 1, "turn_seq": 1}
+    kwargs[field] = 0x1_0000_0000
+    with pytest.raises(FrameError):
+        AudioFrame(KIND_UPLINK, 0, payload=b"x", **kwargs).encode()
+
+
+def test_encode_rejects_non_bytes_payload():
+    with pytest.raises(FrameError):
+        AudioFrame(KIND_UPLINK, 0, 1, 1, payload="text").encode()  # type: ignore[arg-type]

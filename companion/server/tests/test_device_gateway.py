@@ -349,7 +349,8 @@ async def test_hello_v2_registers_link_and_ack_contains_server_state(seeded_devi
     assert get_device_link(DEVICE_ID) is None
 
 
-async def test_hello_ack_adjusts_downlink_frame_ms(seeded_device):
+async def test_hello_ack_adjusts_downlink_frame_ms(seeded_device, monkeypatch):
+    monkeypatch.setattr(settings, "VOICE_DOWNLINK_FRAME_MS", 60)
     harness = Harness()
     audio = {
         "uplink": {"codec": "opus", "sample_rate": 16000, "channels": 1, "frame_ms": 60},
@@ -359,6 +360,32 @@ async def test_hello_ack_adjusts_downlink_frame_ms(seeded_device):
 
     assert ack["audio"]["downlink"]["frame_ms"] == 60
     assert "downlink_frame_ms_adjusted" in ack["warnings"]
+    await _stop(task, channel)
+
+
+async def test_hello_ack_uses_server_downlink_frame_ms(seeded_device, monkeypatch):
+    monkeypatch.setattr(settings, "VOICE_DOWNLINK_FRAME_MS", 20)
+    harness = Harness()
+    audio = {
+        "uplink": {"codec": "opus", "sample_rate": 16000, "channels": 1, "frame_ms": 60},
+        "downlink": {"codec": "opus", "sample_rate": 24000, "channels": 1, "frame_ms": 60},
+    }
+    task, channel, ack = await harness.connected(audio=audio)
+
+    assert ack["audio"]["downlink"]["frame_ms"] == 20
+    assert "downlink_frame_ms_adjusted" in ack["warnings"]
+    await _stop(task, channel)
+
+
+async def test_invalid_downlink_frame_ms_setting_warns_and_falls_back(
+    seeded_device, monkeypatch, caplog
+):
+    monkeypatch.setattr(settings, "VOICE_DOWNLINK_FRAME_MS", 40)
+    harness = Harness()
+    task, channel, ack = await harness.connected()
+
+    assert ack["audio"]["downlink"]["frame_ms"] == 60
+    assert "invalid VOICE_DOWNLINK_FRAME_MS" in caplog.text
     await _stop(task, channel)
 
 

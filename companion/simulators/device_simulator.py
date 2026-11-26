@@ -117,7 +117,7 @@ class SimulatedDevice:
         self._actions: dict[str, asyncio.Task] = {}
         self._send_lock = asyncio.Lock()
         self._audio_seq = 0
-        self._audio_event = asyncio.Event()
+        self._audio_cursor = 0
         self._closed = asyncio.Event()
         self._release = asyncio.Event()
         self._closing = False
@@ -291,9 +291,12 @@ class SimulatedDevice:
         )
 
     async def wait_for_audio(self, predicate=None, *, timeout: float = 5.0) -> AudioFrame:
+        """等待并**消费**一帧：下次调用不会重复返回同一帧。"""
         deadline = time.monotonic() + timeout
         while True:
-            for frame in self.downlink_frames:
+            while self._audio_cursor < len(self.downlink_frames):
+                frame = self.downlink_frames[self._audio_cursor]
+                self._audio_cursor += 1
                 if predicate is None or predicate(frame):
                     return frame
             if time.monotonic() >= deadline:
@@ -372,7 +375,6 @@ class SimulatedDevice:
                     except FrameError:
                         continue
                     self.downlink_frames.append(frame)
-                    self._audio_event.set()
                     continue
                 try:
                     message = json.loads(raw)

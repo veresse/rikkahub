@@ -78,11 +78,18 @@ class AudioFrame:
             raise FrameError("unknown_kind")
         if self.flags & ~_ALLOWED_FLAGS:
             raise FrameError("reserved_flags")
-        payload = bytes(self.payload)
+        try:
+            payload = bytes(self.payload)
+        except (TypeError, ValueError) as exc:
+            raise FrameError("invalid_payload") from exc
         if len(payload) > MAX_PAYLOAD_BYTES:
             raise FrameError("payload_too_large")
         if not payload and not (self.flags & FLAG_SILENCE):
             raise FrameError("empty_payload")
+        if not 0 <= int(self.seq) <= 0xFFFFFFFF:
+            raise FrameError("seq_out_of_range")
+        if not 0 <= int(self.turn_seq) <= 0xFFFFFFFF:
+            raise FrameError("turn_seq_out_of_range")
         return (
             bytes((FRAME_MAGIC, FRAME_VERSION, self.kind, self.flags))
             + int(self.seq).to_bytes(4, "big")

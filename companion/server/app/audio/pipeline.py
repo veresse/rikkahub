@@ -29,6 +29,9 @@ class VoiceSession:
         self.on_frame = on_frame
         self.state = IDLE
         self.turn_id: str | None = None
+        # 最近结束/取消的轮次：设备迟到的 segment_played 据此静默忽略，
+        # 而不是误报 invalid_turn（协议要求同一 (turn_id, segment_seq) 幂等）。
+        self.last_turn_id: str | None = None
         # 每次 start/cancel/close 递增；Block B 用它丢弃旧 ASR/TTS/LLM 结果。
         self.generation = 0
         self.frames_received = 0
@@ -40,9 +43,13 @@ class VoiceSession:
         return self.state in ACTIVE_STATES
 
     def start(self, turn_id: str) -> bool:
-        if self.state != IDLE:
-            return False
         if not isinstance(turn_id, str) or not turn_id:
+            return False
+        # 同一 turn_id 的重复 start 视为重传：幂等成功，不重置 generation，
+        # 避免设备丢 ack 后重试把已收帧清空。不同 turn_id 才是 busy。
+        if self.state == LISTENING and self.turn_id == turn_id:
+            return True
+        if self.state != IDLE:
             return False
         self.turn_id = turn_id
         self.generation += 1
@@ -93,6 +100,7 @@ class VoiceSession:
             return
         self.generation += 1
         self.state = IDLE
+        self.last_turn_id = self.turn_id
         self.turn_id = None
 
     def close(self) -> None:
@@ -100,4 +108,5 @@ class VoiceSession:
             return
         self.generation += 1
         self.state = CLOSED
+        self.last_turn_id = self.turn_id
         self.turn_id = None

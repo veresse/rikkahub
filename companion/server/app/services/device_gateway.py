@@ -59,6 +59,10 @@ VALID_CODECS = {"opus"}
 VALID_FRAME_MS = {20, 60}
 VALID_SAMPLE_RATES = {"uplink": {16000}, "downlink": {16000, 24000}}
 
+# voice.error 的 fatal=false：只否定这一条消息，设备保持当前轮次；
+# 其余错误码表示本轮无法继续，设备回 IDLE。
+NON_FATAL_VOICE_ERRORS = {"busy", "invalid_turn", "invalid_frame"}
+
 DEFAULT_AUDIO = {
     "uplink": {"codec": "opus", "sample_rate": 16000, "channels": 1, "frame_ms": 60},
     "downlink": {"codec": "opus", "sample_rate": 24000, "channels": 1, "frame_ms": 60},
@@ -144,6 +148,9 @@ class DeviceSession:
         self._audio_seq = 0
         # 每连接至多一轮语音；由网关在 voice.start 时创建，Block B 接入管线。
         self.voice: VoiceSession | None = None
+        # 畸形帧/协议版本错误每轮只回一次，避免设备灌垃圾时拖慢控制消息。
+        self._invalid_frame_reported = False
+        self._voice_protocol_error_sent = False
         # 上报合并队列：设备高频上报时只保留最新一条，避免阻塞读循环。
         self._report_queue: asyncio.Queue[Any] = asyncio.Queue(maxsize=1)
         self._report_handler: (
@@ -251,43 +258,121 @@ class DeviceSession:
             "ts": now_ms(),
         }
 
-    async def send_audio(
-        self, payload: bytes, *, turn_seq: int, flags: int = 0
-    ) -> bool:
-        """下发一帧下行 TTS；`seq` 由本连接单调分配。
-
-        返回 False 表示链路不可写或参数非法；调用方应结束本轮，不要重试到
-        下一轮（旧音频串入新轮比丢一段更糟）。
-        """
-        if not self.ready or self.closing or self.closed:
-            return False
-        if self.protocol_version < 2:
-            return False
-        if not isinstance(turn_seq, int) or isinstance(turn_seq, bool) or turn_seq < 0:
-            return False
+    @staticmethod
+    def _validate_audio(
+        payload: bytes | bytearray | memoryview, flags: int
+    ) -> bytes | None:
+        """校验下行音频内容与标志；非法返回 None，不抛异常。"""
         if flags & ~(FLAG_LAST | FLAG_SILENCE):
-            return False
-        data = bytes(payload)
+            return None
+        try:
+            data = bytes(payload)
+        except (TypeError, ValueError):
+            return None
         if len(data) > MAX_PAYLOAD_BYTES:
-            return False
+            return None
         if not data and not (flags & FLAG_SILENCE):
-            return False
+            return None
+        return data
 
-        async with self._send_lock:
-            frame = AudioFrame(
+    def _encode_downlink(
+        self, data: bytes, turn_seq: int, flags: int
+    ) -> bytes | None:
+        """调用方必须持有 `_send_lock`：`seq` 在锁内分配才能保证按发送顺序。"""
+        try:
+            encoded = AudioFrame(
                 kind=KIND_DOWNLINK,
                 flags=flags,
                 seq=self._audio_seq,
                 turn_seq=turn_seq,
                 payload=data,
-            )
-            self._audio_seq = (self._audio_seq + 1) & 0xFFFFFFFF
+            ).encode()
+        except FrameError:
+            return None
+        self._audio_seq = (self._audio_seq + 1) & 0xFFFFFFFF
+        return encoded
+
+    def _audio_ready(self, turn_seq: int) -> bool:
+        if not self.ready or self.closing or self.closed:
+            return False
+        if self.protocol_version < 2:
+            return False
+        if not isinstance(turn_seq, int) or isinstance(turn_seq, bool):
+            return False
+        return 0 <= turn_seq <= 0xFFFFFFFF
+
+    async def send_audio(
+        self, payload: bytes, *, turn_seq: int, flags: int = 0
+    ) -> bool:
+        """下发一帧下行 TTS；`seq` 由本连接单调分配。
+
+        这是底层发送原语，不做语音轮次门控：调用方（语音管线）必须保证只在
+        自己持有的轮次内调用。返回 False 表示链路不可写或参数非法；调用方
+        应结束本轮，不要重试到下一轮（旧音频串入新轮比丢一段更糟）。
+        """
+        if not self._audio_ready(turn_seq):
+            return False
+        data = self._validate_audio(payload, flags)
+        if data is None:
+            return False
+
+        async with self._send_lock:
+            encoded = self._encode_downlink(data, turn_seq, flags)
+            if encoded is None:
+                return False
             try:
-                await self.channel.send_bytes(frame.encode())
+                await self.channel.send_bytes(encoded)
                 return True
             except Exception:
                 logger.debug(
                     "device audio send failed: %s", self.device_id, exc_info=True
+                )
+                self.closing = True
+                return False
+
+    async def send_control(self, payload: dict[str, Any]) -> bool:
+        """语音管线下发控制消息的公开入口（与 `send_audio` 共用发送锁）。"""
+        return await self._safe_send(payload)
+
+    async def send_segment(
+        self,
+        segment: dict[str, Any],
+        first_payload: bytes | None,
+        *,
+        turn_seq: int,
+        flags: int = 0,
+    ) -> bool:
+        """在同一发送锁内先发 `voice.segment`，再发该段第一帧。
+
+        协议要求段文本必须先于该段音频到达设备；分两次调用会让其它发送者
+        插到中间。`first_payload=None` 时只发段文本（该段没有音频，不应发生）。
+        """
+        if not self.ready or self.closing or self.closed:
+            return False
+        if self.protocol_version < 2:
+            return False
+        data: bytes | None = None
+        if first_payload is not None:
+            if not self._audio_ready(turn_seq):
+                return False
+            data = self._validate_audio(first_payload, flags)
+            if data is None:
+                return False
+
+        async with self._send_lock:
+            encoded: bytes | None = None
+            if data is not None:
+                encoded = self._encode_downlink(data, turn_seq, flags)
+                if encoded is None:
+                    return False
+            try:
+                await self.channel.send_json(segment)
+                if encoded is not None:
+                    await self.channel.send_bytes(encoded)
+                return True
+            except Exception:
+                logger.debug(
+                    "device segment send failed: %s", self.device_id, exc_info=True
                 )
                 self.closing = True
                 return False
@@ -647,6 +732,11 @@ class DeviceGateway:
 
         downlink_frame_ms = settings.VOICE_DOWNLINK_FRAME_MS
         if downlink_frame_ms not in VALID_FRAME_MS:
+            logger.warning(
+                "invalid VOICE_DOWNLINK_FRAME_MS=%s, falling back to %s",
+                downlink_frame_ms,
+                DEFAULT_AUDIO["downlink"]["frame_ms"],
+            )
             downlink_frame_ms = DEFAULT_AUDIO["downlink"]["frame_ms"]
         if audio["downlink"]["frame_ms"] != downlink_frame_ms:
             audio["downlink"]["frame_ms"] = downlink_frame_ms
@@ -978,7 +1068,7 @@ class DeviceGateway:
             logger.debug(
                 "device audio frame rejected: %s reason=%s", session.device_id, exc
             )
-            await self._send_voice_error(session, "invalid_frame", voice.turn_id)
+            await self._report_invalid_frame(session, voice)
             return
         if frame.kind != KIND_UPLINK:
             logger.debug(
@@ -986,19 +1076,36 @@ class DeviceGateway:
                 session.device_id,
                 frame.kind,
             )
-            await self._send_voice_error(session, "invalid_frame", voice.turn_id)
+            await self._report_invalid_frame(session, voice)
             return
         await voice.accept_frame(frame)
+
+    async def _report_invalid_frame(
+        self, session: DeviceSession, voice: VoiceSession
+    ) -> None:
+        """畸形帧每轮只回一次：设备灌垃圾时不能把下行锁占满。"""
+        if session._invalid_frame_reported:
+            return
+        session._invalid_frame_reported = True
+        await self._send_voice_error(session, "invalid_frame", voice.turn_id)
 
     async def _handle_voice_message(
         self, session: DeviceSession, message: dict[str, Any]
     ) -> None:
         if not session.ready or session.closing or session.closed:
             return
-        if session.protocol_version < 2:
-            return
 
         message_type = message.get("type")
+        if session.protocol_version < 2:
+            # v1 设备只走音频通道。显式回一次 unsupported_protocol，避免固件
+            # 以为 voice.* 已受理；之后同类消息静默丢弃。
+            if not session._voice_protocol_error_sent:
+                session._voice_protocol_error_sent = True
+                await self._send_voice_error(
+                    session, "unsupported_protocol", "", fatal=True
+                )
+            return
+
         turn_id = message.get("turn_id")
         if not isinstance(turn_id, str):
             turn_id = ""
@@ -1012,47 +1119,85 @@ class DeviceGateway:
                 voice = VoiceSession(session.device_id)
                 session.voice = voice
             if not voice.start(turn_id):
+                # busy 非致命：设备应保持它当前的轮次，原轮次不被服务端清零。
                 await self._send_voice_error(session, "busy", turn_id)
+            else:
+                session._invalid_frame_reported = False
             return
 
         voice = session.voice
         if message_type == "voice.end":
-            if voice is None or not voice.active or voice.turn_id != turn_id:
+            if voice is None:
+                await self._send_voice_error(session, "invalid_turn", turn_id)
+                return
+            if voice.turn_id != turn_id:
+                if voice.last_turn_id == turn_id:
+                    return
                 await self._send_voice_error(session, "invalid_turn", turn_id)
                 return
             voice.end_user_speech()
             return
 
         if message_type == "voice.cancel":
-            if voice is None or not voice.active or voice.turn_id != turn_id:
-                await self._send_voice_error(session, "invalid_turn", turn_id)
-                return
             reason = message.get("reason")
             if reason not in ("barge_in", "user_stop"):
                 await self._send_voice_error(session, "invalid_turn", turn_id)
                 return
+            if voice is None:
+                await self._send_voice_error(session, "invalid_turn", turn_id)
+                return
+            if voice.turn_id != turn_id:
+                if voice.last_turn_id == turn_id:
+                    # 设备没收到 ack 后重试：幂等，再发一次即可。
+                    await self._send_cancel_ack(session, turn_id, reason)
+                    return
+                await self._send_voice_error(session, "invalid_turn", turn_id)
+                return
             voice.cancel()
-            await session._safe_send(
-                {
-                    "v": 2,
-                    "type": "voice.cancel_ack",
-                    "turn_id": turn_id,
-                    "reason": reason,
-                    "ts": now_ms(),
-                }
-            )
+            await self._send_cancel_ack(session, turn_id, reason)
             return
 
         if message_type == "voice.segment_played":
-            if voice is None or voice.turn_id != turn_id:
+            if voice is None:
+                # 轮次对象已释放（断线/替换）或从未开始：无权判断，静默忽略。
+                return
+            if voice.turn_id != turn_id:
+                # 迟到的上一轮回执是幂等的，不能报错让设备回 IDLE。
+                if voice.last_turn_id == turn_id:
+                    return
                 await self._send_voice_error(session, "invalid_turn", turn_id)
                 return
-            # 重复的 segment_seq 由 VoiceSession 幂等丢弃；轮次已结束时也静默忽略。
+            # 重复的 segment_seq 由 VoiceSession 幂等丢弃；非末段只推进播放状态。
             voice.segment_played(message.get("segment_seq"))
 
-    async def _send_voice_error(
-        self, session: DeviceSession, code: str, turn_id: str | None
+    async def _send_cancel_ack(
+        self, session: DeviceSession, turn_id: str, reason: str
     ) -> None:
+        await session._safe_send(
+            {
+                "v": 2,
+                "type": "voice.cancel_ack",
+                "turn_id": turn_id,
+                "reason": reason,
+                "ts": now_ms(),
+            }
+        )
+
+    async def _send_voice_error(
+        self,
+        session: DeviceSession,
+        code: str,
+        turn_id: str | None,
+        *,
+        fatal: bool | None = None,
+    ) -> None:
+        """`fatal` 明确告诉设备是否需要回 IDLE。
+
+        非致命（busy / invalid_turn / invalid_frame）只针对某条消息，设备应保持
+        当前状态；致命错误表示本轮无法继续。缺省按错误码推断。
+        """
+        if fatal is None:
+            fatal = code not in NON_FATAL_VOICE_ERRORS
         await session._safe_send(
             {
                 "v": 2,
@@ -1060,6 +1205,7 @@ class DeviceGateway:
                 "turn_id": turn_id or "",
                 "code": code,
                 "message": "",
+                "fatal": fatal,
                 "ts": now_ms(),
             }
         )

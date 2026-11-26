@@ -29,6 +29,22 @@ class DeviceLink(Protocol):
 
     async def get_status(self) -> dict[str, Any]: ...
 
+    # 语音管线用：控制消息与音频帧必须走同一条按序链路。
+    async def send_control(self, payload: dict[str, Any]) -> bool: ...
+
+    async def send_segment(
+        self,
+        segment: dict[str, Any],
+        first_payload: bytes | None,
+        *,
+        turn_seq: int,
+        flags: int = 0,
+    ) -> bool: ...
+
+    async def send_audio(
+        self, payload: bytes, *, turn_seq: int, flags: int = 0
+    ) -> bool: ...
+
 
 _LINKS: dict[str, DeviceLink] = {}
 # 每设备生命周期锁：`DeviceGateway._install()`（复核活跃状态 + 注册链路）与

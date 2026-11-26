@@ -72,7 +72,12 @@ CASES = [
     (
         "lacing continuation ignored",
         OGG,
-        [("                if len(segment) < 255:", "                if True:")],
+        [(
+            "            if len(segment) < 255:\n"
+            "                packet = bytes(self._partial)\n",
+            "            if True:\n"
+            "                packet = bytes(self._partial)\n",
+        )],
         f"{T_OGG}::test_demuxer_supports_continued_packet",
     ),
     (
@@ -109,10 +114,95 @@ CASES = [
         "downlink seq never advances",
         DEV,
         [(
-            "            self._audio_seq = (self._audio_seq + 1) & 0xFFFFFFFF",
-            "            pass",
+            "        self._audio_seq = (self._audio_seq + 1) & 0xFFFFFFFF",
+            "        pass",
         )],
         f"{T_VOICE}::test_send_audio_assigns_sequence_and_downlink_kind",
+    ),
+    (
+        "partial packet spliced across a missing continuation",
+        OGG,
+        [(
+            "            if self._partial:\n"
+            "                # 上一页声明还有后续，但下一页没续：残缺包不可用。\n"
+            "                self._partial.clear()\n",
+            "            if False:\n"
+            "                self._partial.clear()\n",
+        )],
+        f"{T_OGG}::test_demuxer_drops_partial_packet_when_next_page_is_not_continued",
+    ),
+    (
+        "chained stream with a new serial dropped",
+        OGG,
+        [(
+            "                if page.bos:\n"
+            "                    self._begin_chain(page.serial)\n"
+            "                else:\n"
+            "                    self.dropped_pages += 1\n"
+            "                    continue\n",
+            "                if page.bos:\n"
+            "                    self.dropped_pages += 1\n"
+            "                    continue\n"
+            "                else:\n"
+            "                    self.dropped_pages += 1\n"
+            "                    continue\n",
+        )],
+        f"{T_OGG}::test_demuxer_accepts_new_chain_with_a_different_serial",
+    ),
+    (
+        "malformed frame not reported",
+        DEV,
+        [(
+            "            await self._report_invalid_frame(session, voice)\n"
+            "            return\n"
+            "        if frame.kind != KIND_UPLINK:\n",
+            "            return\n"
+            "        if frame.kind != KIND_UPLINK:\n",
+        )],
+        f"{T_VOICE}::test_malformed_binary_while_listening_reports_once_and_recovers",
+    ),
+    (
+        "duplicate voice.start rejected as busy",
+        PIPELINE,
+        [(
+            "        if self.state == LISTENING and self.turn_id == turn_id:\n"
+            "            return True\n",
+            "        if False:\n"
+            "            return True\n",
+        )],
+        f"{T_VOICE}::test_duplicate_voice_start_same_turn_is_idempotent",
+    ),
+    (
+        "late segment_played reported as invalid_turn",
+        DEV,
+        [(
+            "            if voice.turn_id != turn_id:\n"
+            "                # 迟到的上一轮回执是幂等的，不能报错让设备回 IDLE。\n"
+            "                if voice.last_turn_id == turn_id:\n"
+            "                    return\n",
+            "            if voice.turn_id != turn_id:\n",
+        )],
+        f"{T_VOICE}::test_segment_played_is_idempotent_and_late_reports_are_ignored",
+    ),
+    (
+        "teardown skips closing the voice session",
+        DEV,
+        [("            await self.close_voice()\n", "            pass\n")],
+        f"{T_VOICE}::test_voice_session_closed_on_disconnect",
+    ),
+    (
+        "v1 voice messages silently dropped",
+        DEV,
+        [(
+            "            if not session._voice_protocol_error_sent:\n"
+            "                session._voice_protocol_error_sent = True\n"
+            "                await self._send_voice_error(\n"
+            '                    session, "unsupported_protocol", "", fatal=True\n'
+            "                )\n"
+            "            return\n",
+            "            return\n",
+        )],
+        f"{T_VOICE}::test_voice_messages_from_v1_device_get_unsupported_protocol",
     ),
 ]
 
