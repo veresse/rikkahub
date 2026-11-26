@@ -1001,7 +1001,10 @@ class DeviceGateway:
         时，接收方可能看到重复的 `online=false`（at-least-once）。
 
         若期间已有新链路接管（停机标志解除后重新连接），上线事件由新链路负责，
-        这条过期的 offline 直接丢弃，避免把在线设备标成离线。
+        这条过期的 offline 应被丢弃，避免把在线设备标成离线。注意这是 best-effort：
+        检查与 `bus.publish()` 的逐订阅者 `await` 之间仍可能插入新链路的
+        `_install()/_mark_ready()`，旧 offline 可能晚于 online 送达；该窗口在引入
+        待发原因之前就存在，要彻底消除需把检查与投递放进同一把生命周期锁。
         """
         reason = session.pending_offline_reason
         if reason is None:
@@ -1012,7 +1015,8 @@ class DeviceGateway:
         try:
             await self._publish_status(session.device_id, online=False, reason=reason)
         except BaseException:
-            session.pending_offline_reason = reason
+            if session.pending_offline_reason is None:
+                session.pending_offline_reason = reason
             self._sessions.add(session)
             raise
 

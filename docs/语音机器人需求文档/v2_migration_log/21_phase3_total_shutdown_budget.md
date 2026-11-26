@@ -320,3 +320,6 @@ MUTATIONS THAT STAYED GREEN: none
 - **§4 的 `test_lifespan_shutdown_is_bounded` 会把 `ws.app_gateway` 留在停机态**
   （审查 M-1）：新增用例已补 `try/finally` 复位；该用例同时加了 3s `wait_for`，
   避免兜底被改成无界时挂住整个测试会话（审查 M-2）。
+- **§8 / §9 的「超时后……最多丢失最后一次设备下线广播」仅指预算耗尽、连接被
+  uvicorn 以 1012 强制收尾这一路径**；进入应用层重试的 offline 已改为
+  at-least-once（可能重复，不会丢），两者不矛盾，但并排阅读时需要区分场景。

@@ -848,8 +848,11 @@ async def test_pending_offline_not_republished_by_concurrent_teardown(
         nonlocal count
         if not online:
             count += 1
-            entered.set()
-            await release.wait()
+            # 只拦住第一条：重复广播的那条直接落库，让下面的断言命中，
+            # 而不是让两边都卡在 release 上、把红点变成 3s 超时。
+            if count == 1:
+                entered.set()
+                await release.wait()
         await real_publish(device_id, online=online, reason=reason)
 
     monkeypatch.setattr(harness.gateway, "_publish_status", gated_publish)
@@ -864,6 +867,9 @@ async def test_pending_offline_not_republished_by_concurrent_teardown(
         assert count == 1, f"offline 被重复广播：{count}"
     finally:
         release.set()
+        if not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
         shutdown_task.cancel()
         await asyncio.gather(shutdown_task, return_exceptions=True)
 
@@ -998,8 +1004,9 @@ async def test_shutdown_cancelled_after_unregister_still_publishes_offline(
         shutdown_task.cancel()
         await asyncio.gather(shutdown_task, return_exceptions=True)
 
-        assert session in harness.gateway._sessions
-        assert session.pending_offline_reason == "server_shutdown"
+        # 不在这里断言“会话在集合里、原因是 server_shutdown”：取消后 handle
+        # 的 `_teardown()` 是否已经抢先消费掉待发原因，取决于事件循环的调度
+        # 顺序，不属于契约。只锁最终结果：offline 必须发出去且只发一次。
 
         # 恢复真实 close 再跑一次兜底。若只靠 `was_current` 决定广播，这里仍会是
         # 零条 offline——这正是本条回归要锁死的缺陷。

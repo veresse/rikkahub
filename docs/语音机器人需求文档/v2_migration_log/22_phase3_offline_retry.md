@@ -128,6 +128,13 @@ Left contains one more item: False
 | `test_teardown_cancelled_after_unregister_keeps_offline_pending` | uvicorn 第二次取消连接任务后，会话回集合、offline 可补发（I-1） |
 | `test_pending_offline_not_republished_by_concurrent_teardown` | 广播进行中并发 `_teardown()` 只能发一条 offline（本轮新发现的重复缺陷） |
 
+对旧提交 `9ca1bdfe` 复跑时，第一条先因 `DeviceSession` 没有
+`pending_offline_reason` 抛 `AttributeError`，去掉该新字段断言后仍以
+`assert [] == ['server_shutdown']` 变红；第二条以
+`assert <DeviceSession> in set()` 变红，证明 I-1 真实存在。第三条在旧树上
+**通过**——它锁的是本轮第一版实现（广播后才清空待发原因）的重复缺陷，不是
+9ca1bdfe 的回归。日志里按“2 红 1 绿”记录，避免以后误读。
+
 ## 6. Ruling 与接受的风险
 
 | Ruling | 原因 | 代价（如果判断错） |
@@ -214,3 +221,21 @@ app gateway accepts connections during shutdown
    `_teardown()` 回填是否引入重复处理、at-least-once 的文档一致性、新用例是否
    真正锁住旧实现）。
 3. 审查通过后进入音频 Block。
+
+## 10. 第二轮审查（`d4b2df1f`）与微调
+
+独立审查对 `d4b2df1f` 给出 **0 Critical / 0 Important / 4 Minor**，结论
+“Yes”（建议合并前顺手修 M-1/M-2）。核心修复（待发原因、`_teardown` 回填、
+先清空再 `await`、预算不变）被确认成立；4 条都在测试/注释质量：
+
+| ID | 处理 |
+| :--- | :--- |
+| M-1 | 并发用例的 `gated_publish()` 只拦第一条 offline；第二条直接落库，使 “pending offline is never cleared” 变体命中 `assert count == 1` 而不是 3s 超时。`finally` 同时取消未完成的 handle task。 |
+| M-2 | 取消后的中间断言（会话在集合里、原因为 `server_shutdown`）已删除：它们取决于取消的 handle 是否已被调度，不属于契约；只保留最终态（offline 恰好一条、`pending is None`）。 |
+| M-3 | `_publish_pending_offline()` 的注释改为 best-effort，承认“检查与逐订阅者投递之间仍可能插入新链路”；取消写回改为 `if ... is None` 的防御写法。 |
+| M-4 | 日志 21 §10 补一条：§8/§9 的“最多丢失”仅指预算耗尽后的 1012 收尾，重试路径已是 at-least-once。 |
+
+同时修正 §5 的表述：3 个新用例在旧树上是 **2 红 1 绿**，第三条锁的是本轮第一版
+实现的重复缺陷，而不是 `9ca1bdfe` 的回归（旧树实测输出见审查记录）。
+
+本轮不新增用例，数量仍为 231；`round15_shutdown.py` 仍为 14 个变体。
