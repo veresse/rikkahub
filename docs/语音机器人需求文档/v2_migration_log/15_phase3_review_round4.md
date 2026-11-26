@@ -110,8 +110,10 @@ return (
    `_install()` 在生命周期锁内重新查库得到 `is_active=False` → `close(4401)`、不注册、
    不回 ack、广播 `device_revoked`。
 
-删除 `_install()` 的复核时该用例红（`get_device_link()` 变为非 None），只删预检则仍绿，
-说明这层覆盖是有效的。
+删除 `_install()` 的复核时该用例红（`get_device_link()` 变为非 None）；只删预检时
+用例不会以断言失败收场，而是 `pause_on_get=2` 落进 `_install()` 持锁的 `get()`，
+与测试线程的 `DELETE` 争同一把生命周期锁，5.87s 内 `TimeoutError`（已加 `wait_for`
+上界）。这说明用例对预检位置有强依赖，覆盖的确实是锁内复核（详见日志 16）。
 
 ### 3.4 Minor：`_persist_hello()` 改条件 UPDATE
 
@@ -244,7 +246,7 @@ $ & "...\companion-venv\Scripts\python.exe" -m pytest -q companion/tests/test_ph
 16 passed in 12.89s
 
 $ & "...\companion-venv\Scripts\python.exe" -m pytest -q companion/server/tests/test_device_gateway.py companion/server/tests/test_app_gateway.py
-52 passed in 1.35s
+55 passed in 1.26s      # 35 + 20（提交 f2affdbc 时的实际数量）
 
 $ & "...\companion-venv\Scripts\python.exe" -m pytest -q companion/server/tests/test_app_gateway.py
 20 passed in 0.39s

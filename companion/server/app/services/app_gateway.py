@@ -20,7 +20,11 @@ from typing import Any, Protocol
 
 from companion.server.app.services.action_orchestrator import get_device_scheduler
 from companion.server.app.services.clock import now_ms
-from companion.server.app.services.device_registry import ActionResult, get_device_link
+from companion.server.app.services.device_registry import (
+    ActionResult,
+    device_link_is_online,
+    get_device_link,
+)
 from companion.server.app.services.events import EventBus, get_event_bus
 from companion.shared.catalog import CatalogError, get_action, resolve_params
 
@@ -274,12 +278,12 @@ class AppGateway:
             await session.send_json(_ack(request_id, False, "device_offline"))
             return
 
-        # closing 期间链路已在冲刷最后一条上报（撤销 / 替换 / 写失败），
-        # 指令不会再被下发；直接回 device_offline，避免 App 拿到 ok=true
-        # 之后再收到 failed/device_offline 的终态。急停例外：仍要让调度器
-        # 终止本地在途/排队动作，否则任务要等超时才结算。
-        if getattr(link, "closing", False):
-            if message_type == "remote.action.stop":
+        # closing（撤销 / 替换 / 写失败）或尚未完成握手（ack 未发出）时，
+        # 指令都不会被下发；直接回 device_offline，避免 App 拿到 ok=true
+        # 之后再收到 failed/device_offline 的终态。急停例外：closing 时仍要让
+        # 调度器终止本地在途/排队动作，否则任务要等超时才结算。
+        if not device_link_is_online(link):
+            if getattr(link, "closing", False) and message_type == "remote.action.stop":
                 try:
                     scheduler = get_device_scheduler(device_id, link)
                     await scheduler.stop(message.get("reason", "user_stop"))

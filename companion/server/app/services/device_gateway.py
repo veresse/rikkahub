@@ -490,8 +490,10 @@ class DeviceGateway:
             if not await self._install(session):
                 return
             # 注册早于 ack，但 ack 之前链路一律不可下发（见 DeviceSession.ready）；
-            # 只有 ack 真正发出后才广播上线并允许控制。
+            # ack 返回后立即置 ready：设备已拿到 session_id，接下来由 closing/closed
+            # 继续兜住撤销与替换窗口。
             await self._send_hello_ack(session, hello)
+            session.ready = True
             await self._mark_ready(session)
             await self._read_loop(session)
         except asyncio.CancelledError:
@@ -681,7 +683,15 @@ class DeviceGateway:
             if get_device_link(session.device_id) is not session:
                 # 期间被更新的连接替换：上线事件由新连接负责，避免认领错链路。
                 return
-            session.ready = True
+            if session.closed or session.closing:
+                # ack 发送期间被撤销/替换/写失败关闭：链路已不可用，不能再上线。
+                return
+            if not await self._device_is_active(session.device_id):
+                # 撤销已提交但还没拿到生命周期锁关闭链路（`DELETE` 在等同一把锁）：
+                # 这里补一次权威复核，避免广播 `online=true` 后立刻发 offline。
+                # offline 事件交给 `_teardown()` 统一发，避免重复。
+                await session.close(4401, "device_revoked")
+                return
             await self._publish_status(session.device_id, online=True)
 
     async def _teardown(self, session: DeviceSession) -> None:

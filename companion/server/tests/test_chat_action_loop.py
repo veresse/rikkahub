@@ -247,6 +247,33 @@ async def test_offline_device_gets_note_and_no_tools(session, monkeypatch):
     assert _events(events, "tool_result") == []
 
 
+async def test_registered_but_not_ready_link_gets_no_tools(session, monkeypatch):
+    """链路已注册但 `hello_ack` 尚未发出：LLM 不应拿到 robot.* 工具。
+
+    设备在注册表里不等于可控制；orchestrator 必须用 `device_link_is_online()`
+    而不是 `link is not None`，否则模型会拿到每次调用都失败的 `robot.*` 工具。
+    """
+    await seed(session)
+    link = FakeLink()
+    link.ready = False
+    register_device_link(DEVICE_ID, link)
+    fake = ScriptedDeepSeek([[content("我还没准备好。")]])
+    _install(monkeypatch, fake)
+
+    events = [
+        e
+        async for e in ChatOrchestrator.stream_chat(session, CONVERSATION_ID, "点点头")
+    ]
+
+    assert fake.calls[0]["tools"] is None
+    system_contents = [
+        m["content"] for m in fake.calls[0]["messages"] if m.get("role") == "system"
+    ]
+    assert any("离线" in text for text in system_contents)
+    assert _events(events, "tool_result") == []
+    assert link.commands == []
+
+
 async def test_unbound_device_gets_unbound_note(session, monkeypatch):
     await seed(session, with_device=False)
     fake = ScriptedDeepSeek([[content("还没有绑定机器人哦。")]])

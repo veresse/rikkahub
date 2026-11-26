@@ -46,6 +46,14 @@ _LIFECYCLE_LOCKS: "weakref.WeakKeyDictionary[Any, dict[str, asyncio.Lock]]" = (
 
 def device_lifecycle_lock(device_id: str) -> asyncio.Lock:
     loop = asyncio.get_running_loop()
+    # 被竞争过的 `asyncio.Lock` 会强引用其循环，而 value（dict）又强引用 lock，
+    # 形成「value → key(loop)」环，WeakKeyDictionary 无法自动回收。这里顺手剔除
+    # 已关闭的循环，避免测试/多循环场景下残留。
+    stale = [
+        lp for lp in list(_LIFECYCLE_LOCKS) if lp is not loop and lp.is_closed()
+    ]
+    for closed_loop in stale:
+        del _LIFECYCLE_LOCKS[closed_loop]
     locks = _LIFECYCLE_LOCKS.get(loop)
     if locks is None:
         locks = {}
@@ -74,10 +82,6 @@ def unregister_device_link(device_id: str, link: DeviceLink | None = None) -> No
 
 def get_device_link(device_id: str) -> DeviceLink | None:
     return _LINKS.get(device_id)
-
-
-def is_device_online(device_id: str) -> bool:
-    return device_link_is_online(get_device_link(device_id))
 
 
 def device_link_is_online(link: DeviceLink | None) -> bool:

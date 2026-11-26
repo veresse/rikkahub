@@ -414,6 +414,39 @@ async def test_link_is_not_controllable_before_hello_ack(seeded_device):
     await _stop(task, channel)
 
 
+async def test_revoke_while_ack_blocked_does_not_broadcast_online(
+    seeded_device, client, auth_headers
+):
+    """ack 发送期间撤销：ack 写成功后也不得再广播 online=true。
+
+    `_mark_ready()` 只检查「链路仍是 current」是不够的：撤销路由会关闭链路但
+    不在注册表里删除它，因此必须在锁内复核 closed/closing 与 is_active。
+    """
+    harness = Harness()
+    channel = SlowAckChannel()
+    task = await harness.start(channel)
+    channel.push(hello())
+    await asyncio.wait_for(channel.ack_started.wait(), timeout=3.0)
+
+    try:
+        resp = await asyncio.wait_for(
+            client.delete(f"/api/devices/{DEVICE_ID}", headers=auth_headers),
+            timeout=5.0,
+        )
+    finally:
+        channel.ack_release.set()
+    assert resp.status_code == 200, resp.text
+
+    await asyncio.wait_for(task, timeout=3.0)
+    online = [
+        e
+        for e in harness.events
+        if e.get("type") == "device.status" and e.get("online") is True
+    ]
+    assert online == [], harness.events
+    assert get_device_link(DEVICE_ID) is None
+
+
 async def test_action_result_resolves_pending_command(seeded_device):
     harness = Harness()
     task, channel, ack = await harness.connected()
@@ -873,10 +906,17 @@ async def test_revoke_after_precheck_is_caught_by_install_lock(
 
     await asyncio.wait_for(factory.entered.wait(), timeout=3.0)
     # 预检已经取到 active=True 的快照但还没判断；撤销在此提交。
-    resp = await client.delete(f"/api/devices/{DEVICE_ID}", headers=auth_headers)
+    # 若预检被删，pause 会落进 `_install()` 持锁的 get，DELETE 会等同一把锁；
+    # 用 wait_for 让这种死锁以失败而不是挂起结束。
+    try:
+        resp = await asyncio.wait_for(
+            client.delete(f"/api/devices/{DEVICE_ID}", headers=auth_headers),
+            timeout=5.0,
+        )
+    finally:
+        factory.resume.set()
     assert resp.status_code == 200, resp.text
     assert get_device_link(DEVICE_ID) is None
-    factory.resume.set()
 
     await wait_until(
         lambda: task.done()

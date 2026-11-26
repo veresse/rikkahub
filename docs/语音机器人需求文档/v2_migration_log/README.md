@@ -35,3 +35,4 @@
 | 13 | Phase 3 二次审查修复 | ✅ 已完成 | 撤销窗口 `closing` 门控、已停用设备不回写运行态、写失败不再毒化冲刷、CLI 失败退出码、文档矛盾；190 passed |
 | 14 | Phase 3 三次审查修复 | ✅ 已完成 | 撤销与在途落库/迟到 hello 的竞态、`closing` 对外视为离线、已撤销设备不再广播运行态、回归用例有界失败；193 passed |
 | 15 | Phase 3 四次审查修复 | ✅ 已完成 | `hello_ack` 前 `ready` 门控与上线广播后移、统一在线判定（LLM/事件/App）、`_install()` 锁内复核回归、hello 落库条件更新、`closing` 急停结算本地动作；198 passed |
+| 16 | Phase 3 五次审查修复 | ✅ 已完成 | ack 阻塞期间撤销不再广播上线、App 网关同时拦未 ready、orchestrator 在线判定回归、争锁死锁有界失败、移除重复在线函数；201 passed |

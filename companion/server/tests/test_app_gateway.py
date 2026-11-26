@@ -485,6 +485,25 @@ async def test_closing_link_is_offline_without_dispatching_commands():
     await _stop(task, channel)
 
 
+async def test_not_ready_link_is_offline_without_dispatching_commands():
+    """链路已注册但 hello_ack 未发出：App 遥控必须直接拿到 device_offline。"""
+
+    class NotReadyLink(FakeLink):
+        ready = False
+
+    link = NotReadyLink()
+    register_device_link(DEVICE_ID, link)
+    harness = Harness()
+    task, channel = await harness.connect()
+
+    ack = await harness.remote(channel, {"type": "remote.action.play", "name": "nod"})
+    assert ack["ok"] is False
+    assert ack["error"] == "device_offline"
+    assert link.commands == []
+
+    await _stop(task, channel)
+
+
 async def test_closing_link_still_settles_local_stop(monkeypatch):
     """closing 拒绝下发，但急停仍要让调度器终止本地的在途/排队动作。"""
 
