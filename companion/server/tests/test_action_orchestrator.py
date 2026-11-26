@@ -372,6 +372,25 @@ async def test_device_reported_result_suppresses_late_stop_terminal():
         mod.invalidate_device_scheduler("dev-race")
 
 
+async def test_mark_action_reported_reports_tri_state():
+    import companion.server.app.services.action_orchestrator as mod
+
+    scheduler = _DeviceScheduler("dev-mark", FakeLink())
+    mod._SCHEDULERS["dev-mark"] = scheduler
+    job = mod._Job(
+        command={"action_id": "mark-1"},
+        future=asyncio.get_running_loop().create_future(),
+    )
+    scheduler.current = job
+    try:
+        assert mod.mark_action_reported("dev-mark", "mark-1") is True
+        assert mod.mark_action_reported("dev-mark", "mark-1") is False
+        assert mod.mark_action_reported("dev-mark", "other") is None
+        assert mod.mark_action_reported("no-scheduler", "mark-1") is None
+    finally:
+        mod.invalidate_device_scheduler("dev-mark")
+
+
 async def test_expired_queued_command_is_dropped_with_terminal_event(monkeypatch):
     import companion.server.app.services.action_orchestrator as mod
     from companion.server.app.services.events import get_event_bus

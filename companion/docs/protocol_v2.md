@@ -462,7 +462,8 @@ App 携带 `Authorization: Bearer <app_token>` 发起请求，响应为 `text/ev
   因此 `action.result.source` 恒为 `llm` 或 `app`。
 - 反向窗口同样去重：设备先回报结果、服务端随后才执行急停/断连时，网关会在解析 future 的同一
   事件循环 tick 内把该 `action_id` 标记为「已回报」，调度器不再补发 `failed/stopped`
-  或 `failed/device_offline`。
+  或 `failed/device_offline`；服务端结算时还会同步终止设备侧 pending，即使调度器随后被移除，
+  迟到的设备回执也无法再次广播。
 - `device.report` 由每设备单一 writer 按 FIFO 串行落库与广播；正常下线与服务关闭都会先投递
   停止哨兵、等 writer 写完最后一条再关闭链路，避免旧上报晚于新上报提交而覆盖最新状态。
 - 聊天 SSE 被客户端断开/停止时，只中止**本轮**在途的 `robot.*` 命令并下发

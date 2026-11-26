@@ -61,10 +61,10 @@ def reset_device_links() -> None:
 async def resolve_device_for_conversation(db: AsyncSession, conversation_id: str):
     """找会话绑定的设备；没有会话级绑定时回退到角色级绑定。
 
-    解析顺序固定为：**在线会话级 → 在线角色级 → 已撤销会话级**。前两步
-    只在 `is_active=True` 的设备中查找，避免「会话设备被撤销后遮蔽角色级
-    在线设备」；第三步返回已撤销的会话级设备，仅用于让调用方区分
-    「从没绑定过（unbound）」和「绑定过但已被撤销（inactive）」。
+    解析顺序固定为：**未撤销会话级 → 未撤销角色级 → 已撤销会话级 → 已撤销角色级**。
+    `is_active` 只表示绑定未撤销，是否在线由调用方通过 `get_device_link()` 判定。
+    后两步返回已撤销设备，仅用于让调用方区分「从没绑定过（unbound）」和
+    「绑定过但已被撤销（inactive）」。角色级撤销回退不会遮蔽前面的可用设备。
     """
     from companion.server.app.models.conversation import ConversationModel
     from companion.server.app.models.device import DeviceModel
@@ -96,7 +96,15 @@ async def resolve_device_for_conversation(db: AsyncSession, conversation_id: str
     if device is not None:
         return device
 
-    return await _first(
+    device = await _first(
         DeviceModel.bound_conversation_id == conversation_id,
+        DeviceModel.is_active.is_(False),
+    )
+    if device is not None:
+        return device
+
+    return await _first(
+        DeviceModel.bound_conversation_id.is_(None),
+        DeviceModel.bound_assistant_id == conversation.assistant_id,
         DeviceModel.is_active.is_(False),
     )

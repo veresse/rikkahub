@@ -380,10 +380,11 @@ async def test_stop_writer_flushes_reports_in_order(seeded_device):
     started = asyncio.Event()
 
     async def slow_handler(_session, report: dict) -> None:
-        order.append(report["volume"])
         if report["volume"] == 1:
             started.set()
             await asyncio.sleep(0.05)
+        # 提交发生在 sleep 之后：旧实现会先 flush 掉 2，再让 writer 提交 1。
+        order.append(report["volume"])
 
     session._report_handler = slow_handler
     session.queue_report({"volume": 1})
@@ -418,6 +419,193 @@ async def test_shutdown_flushes_queued_report(seeded_device):
     assert persisted == [77]
 
     await asyncio.wait_for(task, timeout=2.0)
+
+
+async def test_stop_writer_retries_inflight_report_after_timeout(
+    seeded_device, monkeypatch
+):
+    """writer 卡在 handler 时被取消，已出队的上报仍必须补写。"""
+    import companion.server.app.services.device_gateway as mod
+
+    monkeypatch.setattr(mod, "REPORT_STOP_QUEUE_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr(mod, "REPORT_STOP_DRAIN_TIMEOUT_SECONDS", 0.05)
+
+    harness = Harness()
+    task, channel, _ = await harness.connected()
+    session = get_device_link(DEVICE_ID)
+    assert session is not None
+
+    attempts = 0
+    persisted: list[int] = []
+    started = asyncio.Event()
+
+    async def handler(_session, report: dict) -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            started.set()
+            await asyncio.sleep(5)
+        persisted.append(report["volume"])
+
+    session._report_handler = handler
+    session.queue_report({"volume": 88})
+    await asyncio.wait_for(started.wait(), timeout=1.0)
+
+    await session.stop_writer()
+
+    assert persisted == [88]
+    assert attempts == 2
+    await _stop(task, channel)
+
+
+class SlowStopChannel(FakeChannel):
+    """让 action.stop 的 send_json 阻塞，制造「stop 已广播、stop 帧未发完」窗口。"""
+
+    def __init__(self):
+        super().__init__()
+        self.stop_started = asyncio.Event()
+        self.stop_release = asyncio.Event()
+
+    async def send_json(self, payload: dict) -> None:
+        if payload.get("type") == "action.stop":
+            self.stop_started.set()
+            await self.stop_release.wait()
+        await super().send_json(payload)
+
+
+async def test_device_result_during_stop_send_is_not_rebroadcast(seeded_device):
+    """服务端先急停、设备回执在 action.stop 发送期间到达时，只保留一条终态。"""
+    import companion.server.app.services.action_orchestrator as mod
+    from companion.server.app.services.events import get_event_bus
+
+    harness = Harness()
+    channel = SlowStopChannel()
+    task = await harness.start(channel)
+    channel.push(hello())
+    await channel.wait_sent(lambda m: m.get("type") == "hello_ack")
+    link = get_device_link(DEVICE_ID)
+    scheduler = mod._DeviceScheduler(DEVICE_ID, link)
+    mod._SCHEDULERS[DEVICE_ID] = scheduler
+
+    # 调度器终态走全局总线；设备网关事件走 harness.bus。
+    terminal_events: list[dict] = []
+
+    async def collect(event: dict) -> None:
+        terminal_events.append(event)
+
+    global_bus = get_event_bus()
+    global_bus.subscribe(collect)
+    try:
+        await scheduler.enqueue(
+            {
+                "v": 2,
+                "type": "action.play",
+                "action_id": "stop-race",
+                "name": "nod",
+                "source": "app",
+            }
+        )
+        await channel.wait_sent(lambda m: m.get("action_id") == "stop-race")
+
+        stop_task = asyncio.create_task(scheduler.stop("user_stop"))
+        await asyncio.wait_for(channel.stop_started.wait(), timeout=1.0)
+
+        # stop 的终态已经广播，但 action.stop 帧还没发完；设备此刻回报原动作。
+        channel.push(
+            {
+                "v": 2,
+                "type": "action.result",
+                "action_id": "stop-race",
+                "status": "done",
+            }
+        )
+        channel.push({"v": 2, "type": "device.report", "volume": 41})
+        await wait_until(
+            lambda: next(
+                (e for e in harness.events if e.get("type") == "device.report"), None
+            )
+        )
+        await asyncio.sleep(0.05)
+
+        results = [
+            e
+            for e in terminal_events + harness.events
+            if e.get("type") == "action.result"
+            and e.get("action_id") == "stop-race"
+        ]
+        assert [r["status"] for r in results] == ["failed"]
+        assert results[0]["detail"] == "stopped"
+
+        channel.stop_release.set()
+        await asyncio.wait_for(stop_task, timeout=2.0)
+    finally:
+        global_bus.unsubscribe(collect)
+        channel.stop_release.set()
+        mod.invalidate_device_scheduler(DEVICE_ID)
+        await _stop(task, channel)
+
+
+async def test_device_result_after_scheduler_invalidation_is_not_rebroadcast(
+    seeded_device,
+):
+    """设备断连结算后，迟到的 action.result 不得在调度器被移除后再广播。"""
+    import companion.server.app.services.action_orchestrator as mod
+    from companion.server.app.services.events import get_event_bus
+
+    harness = Harness()
+    task, channel, _ = await harness.connected()
+    link = get_device_link(DEVICE_ID)
+    scheduler = mod._DeviceScheduler(DEVICE_ID, link)
+    mod._SCHEDULERS[DEVICE_ID] = scheduler
+
+    terminal_events: list[dict] = []
+
+    async def collect(event: dict) -> None:
+        terminal_events.append(event)
+
+    global_bus = get_event_bus()
+    global_bus.subscribe(collect)
+    try:
+        await scheduler.enqueue(
+            {
+                "v": 2,
+                "type": "action.play",
+                "action_id": "inv-race",
+                "name": "nod",
+                "source": "app",
+            }
+        )
+        await channel.wait_sent(lambda m: m.get("action_id") == "inv-race")
+
+        mod.invalidate_device_scheduler(DEVICE_ID)
+        channel.push(
+            {
+                "v": 2,
+                "type": "action.result",
+                "action_id": "inv-race",
+                "status": "done",
+            }
+        )
+        channel.push({"v": 2, "type": "device.report", "volume": 42})
+        await wait_until(
+            lambda: next(
+                (e for e in harness.events if e.get("type") == "device.report"), None
+            )
+        )
+        await asyncio.sleep(0.05)
+
+        results = [
+            e
+            for e in terminal_events + harness.events
+            if e.get("type") == "action.result"
+            and e.get("action_id") == "inv-race"
+        ]
+        assert [r["status"] for r in results] == ["failed"]
+        assert results[0]["detail"] == "device_offline"
+    finally:
+        global_bus.unsubscribe(collect)
+        mod.invalidate_device_scheduler(DEVICE_ID)
+        await _stop(task, channel)
 
 
 async def test_device_report_updates_snapshot_and_publishes_event(seeded_device):

@@ -54,6 +54,10 @@ DEFAULT_AUDIO = {
 # writer 的停止哨兵
 _WRITER_STOP = object()
 
+# writer 停止预算：队列满时最多等 writer 取走当前条目，再等它写完剩余上报。
+REPORT_STOP_QUEUE_TIMEOUT_SECONDS = 1.0
+REPORT_STOP_DRAIN_TIMEOUT_SECONDS = 1.0
+
 
 class WSChannel(Protocol):
     """WebSocket 的最小抽象，测试用 FakeChannel 实现。"""
@@ -114,6 +118,8 @@ class DeviceSession:
         ) = None
         self._writer: asyncio.Task | None = None
         self._writer_stopping = False
+        # writer 已取出、正在 await handler 的上报；超时取消后用于补写。
+        self._inflight: dict[str, Any] | None = None
 
     @staticmethod
     def _initial_report(device: DeviceModel) -> dict[str, Any]:
@@ -226,33 +232,43 @@ class DeviceSession:
             except asyncio.QueueFull:
                 pass
 
+    async def _run_report_handler(self, report: dict[str, Any]) -> None:
+        if report is _WRITER_STOP or self._report_handler is None:
+            return
+        try:
+            await self._report_handler(self, report)
+        except Exception:
+            logger.exception("device report handler failed: %s", self.device_id)
+
     async def _writer_loop(self) -> None:
         while True:
             report = await self._report_queue.get()
             if report is _WRITER_STOP:
                 return
-            if self._report_handler is None:
-                continue
+            self._inflight = report
             try:
-                await self._report_handler(self, report)
+                await self._run_report_handler(report)
             except asyncio.CancelledError:
+                # 保留 `_inflight`，由 `_flush_reports()` 在取消后补写。
                 raise
-            except Exception:
-                logger.exception("device report handler failed: %s", self.device_id)
+            self._inflight = None
 
     async def _flush_reports(self) -> None:
-        """把合并队列里剩下的上报处理完；用于正常下线前保住最后一条状态。"""
+        """把 in-flight 与合并队列里剩下的上报处理完。
+
+        用于正常下线前保住最后一条状态。被取消的 writer 可能已经取出上报却
+        没写完，因此先补处理 `_inflight`；上报是绝对快照，重试幂等。
+        """
+        report = self._inflight
+        self._inflight = None
+        if report is not None:
+            await self._run_report_handler(report)
         while True:
             try:
                 report = self._report_queue.get_nowait()
             except asyncio.QueueEmpty:
                 return
-            if report is _WRITER_STOP or self._report_handler is None:
-                continue
-            try:
-                await self._report_handler(self, report)
-            except Exception:
-                logger.exception("device report flush failed: %s", self.device_id)
+            await self._run_report_handler(report)
 
     async def stop_writer(self) -> None:
         """优雅停止 writer：按 FIFO 冲刷最后一条上报后退出。
@@ -270,12 +286,18 @@ class DeviceSession:
 
         # 队列容量为 1；等 writer 取走当前条目后再放哨兵。
         try:
-            await asyncio.wait_for(self._report_queue.put(_WRITER_STOP), timeout=1.0)
+            await asyncio.wait_for(
+                self._report_queue.put(_WRITER_STOP),
+                timeout=REPORT_STOP_QUEUE_TIMEOUT_SECONDS,
+            )
         except asyncio.TimeoutError:
             pass
 
         try:
-            await asyncio.wait_for(asyncio.shield(writer), timeout=1.0)
+            await asyncio.wait_for(
+                asyncio.shield(writer),
+                timeout=REPORT_STOP_DRAIN_TIMEOUT_SECONDS,
+            )
             return
         except asyncio.TimeoutError:
             writer.cancel()
@@ -323,6 +345,14 @@ class DeviceSession:
         for future in list(self._pending.values()):
             if not future.done():
                 future.set_result(result)
+
+    def settle_pending(self, action_id: str, status: str, detail: str) -> None:
+        """服务端已生成终态时，终止设备侧等待，避免迟到回执再被广播。"""
+        future = self._pending.get(action_id)
+        if future is not None and not future.done():
+            future.set_result(
+                ActionResult(status=status, detail=detail, action_id=action_id)
+            )
 
     def apply_report(self, report: dict[str, Any]) -> dict[str, Any]:
         volume = _finite(report.get("volume"))
@@ -415,6 +445,8 @@ class DeviceGateway:
         except Exception:
             logger.exception("device gateway error: %s", device_id)
             if session is not None:
+                # 先冲刷最后一条上报，再关闭；close() 会 cancel writer。
+                await session.stop_writer()
                 await session.close(1011, "internal_error")
             else:
                 await self._close(channel, 1011, "internal_error")
@@ -586,11 +618,14 @@ class DeviceGateway:
         `_handle_report` 的「已不是当前链路」检查而被丢弃。
         """
         for session in list(self._sessions):
-            await session.stop_writer()
-            if get_device_link(session.device_id) is session:
-                unregister_device_link(session.device_id, link=session)
-                invalidate_device_scheduler(session.device_id)
-            await session.close(1011, "server_shutdown")
+            # 与 `_teardown` 串行，避免一方在另一方 flush 期间 unregister 导致
+            # 最后一条上报被 `_handle_report` 的链路检查丢弃。
+            async with self._device_lock(session.device_id):
+                await session.stop_writer()
+                if get_device_link(session.device_id) is session:
+                    unregister_device_link(session.device_id, link=session)
+                    invalidate_device_scheduler(session.device_id)
+                await session.close(1011, "server_shutdown")
         self._sessions.clear()
 
     async def _read_loop(self, session: DeviceSession) -> None:
@@ -630,7 +665,10 @@ class DeviceGateway:
                 # 会话下发的；迟到回执只更新设备内部状态，不再打扰 App。
                 return
             # 同步标记，堵住「设备先回报、服务端随后急停/断连」的重复终态窗口。
-            mark_action_reported(session.device_id, action_id)
+            # `False` 表示服务端已广播过终态（例如 stop 正在发送 action.stop
+            # 时设备回执才到），此时必须丢弃设备回执，不能再广播第二条。
+            if mark_action_reported(session.device_id, action_id) is False:
+                return
             publish_async(
                 self.bus,
                 {

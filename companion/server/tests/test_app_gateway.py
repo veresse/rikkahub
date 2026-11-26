@@ -113,13 +113,16 @@ class Harness:
 
 
 @pytest.fixture(autouse=True)
-def _clean_state():
+async def _clean_state():
     reset_device_links()
     reset_action_schedulers()
     get_event_bus().clear()
     yield
     reset_device_links()
     reset_action_schedulers()
+    # 让被 cancel 的 worker / link.send 有机会真正结束，避免跨测试悬挂。
+    await asyncio.sleep(0)
+    await asyncio.sleep(0)
     get_event_bus().clear()
 
 

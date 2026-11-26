@@ -26,9 +26,13 @@ async def lifespan(app: FastAPI):
     # 服务启动时执行 Alembic 迁移到 head
     await init_db()
     yield
-    await ws.device_gateway.shutdown()
-    await ws.app_gateway.shutdown()
-    await drain_background_tasks()
+    try:
+        await ws.device_gateway.shutdown()
+        # 设备下线可能异步广播 failed/device_offline 终态，先等它送达 App，
+        # 再关闭 App 通道。
+        await drain_background_tasks()
+    finally:
+        await ws.app_gateway.shutdown()
 
 
 app = FastAPI(

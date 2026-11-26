@@ -260,9 +260,15 @@ class _DeviceScheduler:
             return
         job.emitted = True
         command = job.command
+        action_id = command.get("action_id")
+        # 同步终止设备侧等待：即使调度器随后被 invalidate 移除，迟到的设备
+        # `action.result` 也无法再从 `_pending` 里冒出来重复广播。
+        if isinstance(action_id, str) and action_id:
+            settle = getattr(self.link, "settle_pending", None)
+            if callable(settle):
+                settle(action_id, status, detail)
         if command.get("source") != "app":
             return
-        action_id = command.get("action_id")
         if not isinstance(action_id, str) or not action_id:
             return
         event = {
@@ -334,18 +340,25 @@ def invalidate_device_scheduler(device_id: str) -> None:
         _stop_scheduler(scheduler, "device_offline")
 
 
-def mark_action_reported(device_id: str, action_id: str) -> bool:
+def mark_action_reported(device_id: str, action_id: str) -> bool | None:
     """设备已经回报该 `action_id` 的终态，调度器不得再生成第二条终态。
 
     必须在 `DeviceSession.resolve_result()` 解析 future 的同一事件循环 tick
     内同步调用。否则急停/断连可能在 worker 恢复前看到仍是 `current` 的 job，
     再广播一次 `failed/stopped`，违反协议「同一 action_id 只出现一次」。
+
+    返回值：
+    - `True`：本次首次标记，设备回执应当广播；
+    - `False`：该 job 已有服务端终态（`emitted=True`），设备回执必须丢弃；
+    - `None`：没有匹配的调度器（直接调用 `DeviceSession.send` 的测试/内部路径）。
     """
     scheduler = _SCHEDULERS.get(device_id)
     if scheduler is None or scheduler.current is None:
-        return False
+        return None
     job = scheduler.current
     if job.command.get("action_id") != action_id:
+        return None
+    if job.emitted:
         return False
     job.emitted = True
     return True

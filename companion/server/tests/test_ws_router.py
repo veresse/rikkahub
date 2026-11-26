@@ -157,9 +157,26 @@ async def test_starlette_channel_rejects_oversized_text(monkeypatch):
     assert ws.closed == (4429, "message_too_large")
 
 
-async def test_transport_limit_is_above_application_limit():
-    """uvicorn 必须先放过超限帧，应用层才能用 4429 关闭。"""
-    assert settings.WS_TRANSPORT_MAX_MESSAGE_BYTES > settings.WS_MAX_MESSAGE_BYTES
+async def test_starlette_channel_rejects_oversized_bytes(monkeypatch):
+    monkeypatch.setattr(settings, "WS_MAX_MESSAGE_BYTES", 8)
+    ws = FakeWebSocket()
+    channel = StarletteChannel(ws)
+
+    ws.push_bytes(b"\x00" * 9)
+    assert await channel.receive() is None
+    assert ws.closed == (4429, "message_too_large")
+
+
+def test_ws_transport_limit_invariant_is_enforced():
+    from pydantic import ValidationError
+
+    from companion.server.app.config import Settings
+
+    valid = Settings(WS_MAX_MESSAGE_BYTES=1024, WS_TRANSPORT_MAX_MESSAGE_BYTES=2048)
+    assert valid.WS_TRANSPORT_MAX_MESSAGE_BYTES > valid.WS_MAX_MESSAGE_BYTES
+
+    with pytest.raises(ValidationError):
+        Settings(WS_MAX_MESSAGE_BYTES=2048, WS_TRANSPORT_MAX_MESSAGE_BYTES=1024)
 
 
 async def _wait_accepted(ws: FakeWebSocket, timeout: float = 2.0) -> bool:

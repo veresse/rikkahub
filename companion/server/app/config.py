@@ -2,7 +2,7 @@ import os
 import secrets
 from pathlib import Path
 
-from pydantic import Field
+from pydantic import Field, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -105,6 +105,16 @@ class Settings(BaseSettings):
         self.DATA_DIR.mkdir(parents=True, exist_ok=True)
         db_path = self.DATA_DIR / self.DATABASE_NAME
         return f"sqlite:///{db_path.as_posix()}"
+
+    @model_validator(mode="after")
+    def _validate_ws_limits(self):
+        # uvicorn 必须先放过超限帧，应用层才能用自定义 4429 关闭。
+        if self.WS_TRANSPORT_MAX_MESSAGE_BYTES <= self.WS_MAX_MESSAGE_BYTES:
+            raise ValueError(
+                "WS_TRANSPORT_MAX_MESSAGE_BYTES must be greater than "
+                "WS_MAX_MESSAGE_BYTES"
+            )
+        return self
 
     model_config = SettingsConfigDict(
         env_file=".env",

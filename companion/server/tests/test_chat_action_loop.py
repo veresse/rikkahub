@@ -319,6 +319,48 @@ async def test_revoked_device_gets_inactive_note(session, monkeypatch):
     assert all("没有绑定" not in text for text in system_contents)
 
 
+async def test_revoked_assistant_device_gets_inactive_note(session, monkeypatch):
+    """角色级设备被撤销、且无其它可用设备时，原因应为 inactive 而非 unbound。"""
+    await seed(session, with_device=False)
+    revoked_id = "dev-action-loop-revoked-asst"
+    session.add(
+        DeviceModel(
+            id=revoked_id,
+            name="已撤销角色级机器人",
+            token_hash="d" * 64,
+            protocol_version=2,
+            capabilities_json=["action"],
+            bound_assistant_id=ASSISTANT_ID,
+            bound_conversation_id=None,
+            last_seen_at=1,
+            is_active=False,
+        )
+    )
+    await session.commit()
+
+    fake = ScriptedDeepSeek([[content("设备已经撤销啦。")]])
+    _install(monkeypatch, fake)
+    try:
+        _ = [
+            e
+            async for e in ChatOrchestrator.stream_chat(
+                session, CONVERSATION_ID, "点点头"
+            )
+        ]
+
+        assert fake.calls[0]["tools"] is None
+        system_contents = [
+            m["content"]
+            for m in fake.calls[0]["messages"]
+            if m.get("role") == "system"
+        ]
+        assert any("撤销" in text for text in system_contents)
+        assert all("没有绑定" not in text for text in system_contents)
+    finally:
+        await session.execute(delete(DeviceModel).where(DeviceModel.id == revoked_id))
+        await session.commit()
+
+
 async def test_revoked_conversation_device_falls_back_to_active_assistant_device(
     session, monkeypatch
 ):

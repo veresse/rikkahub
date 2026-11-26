@@ -42,7 +42,12 @@ class StarletteChannel:
         if message.get("type") == "websocket.disconnect":
             return None
         if message.get("bytes") is not None:
-            return message["bytes"]
+            data = message["bytes"]
+            if len(data) > settings.WS_MAX_MESSAGE_BYTES:
+                logger.warning("websocket message too large, closing")
+                await self.close(4429, "message_too_large")
+                return None
+            return data
         text = message.get("text") or ""
         if len(text.encode("utf-8")) > settings.WS_MAX_MESSAGE_BYTES:
             logger.warning("websocket message too large, closing")
