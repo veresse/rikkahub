@@ -194,13 +194,13 @@ CASES = [
         "v1 voice messages silently dropped",
         DEV,
         [(
-            "            if not session._voice_protocol_error_sent:\n"
-            "                session._voice_protocol_error_sent = True\n"
-            "                await self._send_voice_error(\n"
-            '                    session, "unsupported_protocol", "", fatal=True\n'
-            "                )\n"
-            "            return\n",
-            "            return\n",
+            "        if session._voice_protocol_error_sent:\n"
+            "            return\n"
+            "        session._voice_protocol_error_sent = True\n"
+            "        await self._send_voice_error(\n"
+            '            session, "unsupported_protocol", "", fatal=True\n'
+            "        )\n",
+            "        return\n",
         )],
         f"{T_VOICE}::test_voice_messages_from_v1_device_get_unsupported_protocol",
     ),

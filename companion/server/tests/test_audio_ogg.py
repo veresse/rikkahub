@@ -4,6 +4,7 @@ from companion.server.app.audio.ogg import (
     OggError,
     OggOpusDemuxer,
     OggOpusMuxer,
+    build_opus_tags,
     ogg_crc32,
     opus_packet_duration_ms,
 )
@@ -211,6 +212,29 @@ def test_demuxer_drops_duplicate_page():
     assert demuxer.feed(header + page) == [PACKET_20MS]
     assert demuxer.feed(page) == []
     assert demuxer.dropped_pages == 1
+
+
+def test_demuxer_drops_reordered_backward_page():
+    muxer = OggOpusMuxer(serial=7)
+    header = muxer.header_bytes()
+    page2 = muxer.push(PACKET_20MS)
+    page3 = muxer.push(PACKET_10MS)
+    page4 = muxer.push(PACKET_60MS)
+    demuxer = OggOpusDemuxer()
+    # 2 → 4 → 3：回退的 page3 必须丢弃，不能把旧包再送一遍，也不能把
+    # dropped_pages 累加成一个巨大的“缺页”数。
+    assert demuxer.feed(header + page2 + page4 + page3) == [
+        PACKET_20MS,
+        PACKET_60MS,
+    ]
+    # 缺 page3 记 1，回退的 page3 再记 1。
+    assert demuxer.dropped_pages == 2
+
+
+def test_demuxer_skips_opus_tags_even_without_opus_head():
+    tags = build_opus_tags()
+    stream = _raw_page([tags], sequence=1)
+    assert OggOpusDemuxer().feed(stream) == []
 
 
 def test_muxer_finish_emits_eos_page():

@@ -75,6 +75,21 @@ class Settings(BaseSettings):
     DASHSCOPE_ASR_MODEL: str = "fun-asr-realtime"
     DASHSCOPE_TTS_MODEL: str = "qwen-audio-3.0-tts-flash"
     DASHSCOPE_TTS_VOICE: str = "cherry"  # 默认温柔男声预设
+    # TTS 容器：ogg（DashScope 流式 Opus）或 raw（每块当一包）；真机烟测后再定。
+    DASHSCOPE_TTS_CONTAINER: str = "ogg"
+
+    # 语音管线（Block B）。VOICE_PROVIDER=mock|unavailable；dashscope 留到 Block C。
+    # 默认 unavailable：未配置云 Key 时语音入口明确回 asr_unavailable，不会静默占用。
+    VOICE_ENABLED: bool = True
+    VOICE_PROVIDER: str = "unavailable"
+    VOICE_IDLE_TIMEOUT_SECONDS: float = 300
+    VOICE_MAX_TURN_SECONDS: float = 60
+    VOICE_ASR_FINAL_GRACE_SECONDS: float = 0.3
+    VOICE_TTS_FIRST_PACKET_TIMEOUT_SECONDS: float = 5
+    VOICE_SEGMENT_IDLE_TIMEOUT_SECONDS: float = 15
+    VOICE_PLAYBACK_DONE_TIMEOUT_SECONDS: float = 10
+    VOICE_DOWNLINK_BUFFER_SECONDS: float = 5
+
     # 下行 TTS 帧长；与设备 hello 请求不同时以本值为准并附 warning。
     VOICE_DOWNLINK_FRAME_MS: int = 60
 

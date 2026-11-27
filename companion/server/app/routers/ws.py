@@ -13,6 +13,7 @@ from typing import Any
 
 from fastapi import APIRouter, WebSocket
 
+from companion.server.app.audio.binding import build_voice_runtime
 from companion.server.app.config import settings
 from companion.server.app.database import AsyncSessionLocal
 from companion.server.app.security.ws_auth import authenticate_ws, parse_bearer_header
@@ -23,6 +24,7 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter()
 device_gateway = DeviceGateway()
+device_gateway.set_voice_runtime(build_voice_runtime(bus=device_gateway.bus))
 app_gateway = AppGateway()
 
 

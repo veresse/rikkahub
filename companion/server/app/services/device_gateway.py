@@ -117,6 +117,7 @@ class DeviceSession:
         *,
         protocol_version: int,
         capabilities: list[str],
+        voice_runtime: Any | None = None,
     ) -> None:
         self.device_id = device.id
         self.session_id = session_id
@@ -148,6 +149,11 @@ class DeviceSession:
         self._audio_seq = 0
         # 每连接至多一轮语音；由网关在 voice.start 时创建，Block B 接入管线。
         self.voice: VoiceSession | None = None
+        # 共享语音运行时（None 时保持 Block A 的同步门控语义）。
+        self.voice_runtime = voice_runtime
+        # `begin()` 是异步的（解析会话/开 ASR），不能在读循环里 await；
+        # 关闭时取消并回收，避免断线后残留任务。
+        self._voice_begin_task: asyncio.Task | None = None
         # 畸形帧/协议版本错误每轮只回一次，避免设备灌垃圾时拖慢控制消息。
         self._invalid_frame_reported = False
         self._voice_protocol_error_sent = False
@@ -379,10 +385,16 @@ class DeviceSession:
 
     async def close_voice(self) -> None:
         voice = self.voice
-        if voice is None:
-            return
-        voice.close()
         self.voice = None
+        begin = self._voice_begin_task
+        self._voice_begin_task = None
+        if begin is not None and not begin.done():
+            begin.cancel()
+            await asyncio.gather(begin, return_exceptions=True)
+        if voice is not None:
+            # shutdown() 内部先同步置 CLOSED，再有界等待清理任务；
+            # 断线/替换时不会向已关闭的链路继续发送。
+            await voice.shutdown()
 
     # ---- 上报写出 ----
 
@@ -598,11 +610,17 @@ class DeviceGateway:
         self,
         bus: EventBus | None = None,
         session_factory=AsyncSessionLocal,
+        voice_runtime: Any | None = None,
     ) -> None:
         self.bus = bus or get_event_bus()
         self._session_factory = session_factory
+        self._voice_runtime = voice_runtime
         self._sessions: set[DeviceSession] = set()
         self._shutting_down = False
+
+    def set_voice_runtime(self, runtime: Any | None) -> None:
+        """启动时注入语音运行时；None 表示关闭语音管线。"""
+        self._voice_runtime = runtime
 
     def open_for_connections(self) -> None:
         """应用（重新）启动时允许注册新链路。
@@ -653,6 +671,7 @@ class DeviceGateway:
                 self.bus,
                 protocol_version=protocol_version,
                 capabilities=capabilities,
+                voice_runtime=self._voice_runtime,
             )
             await self._persist_hello(device_id, hello, protocol_version, capabilities)
             if not await self._install(session):
@@ -1026,6 +1045,11 @@ class DeviceGateway:
             return
 
         if message_type == "voice.event":
+            if session.protocol_version < 2:
+                # `voice.event` 也是 voice.*：v1 设备同样回一次
+                # unsupported_protocol，不能绕过协议门控直接广播给 App。
+                await self._reject_v1_voice(session)
+                return
             publish_async(
                 self.bus,
                 {
@@ -1089,6 +1113,15 @@ class DeviceGateway:
         session._invalid_frame_reported = True
         await self._send_voice_error(session, "invalid_frame", voice.turn_id)
 
+    async def _reject_v1_voice(self, session: DeviceSession) -> None:
+        """v1 设备发送任意 voice.*：回一次 unsupported_protocol，之后静默。"""
+        if session._voice_protocol_error_sent:
+            return
+        session._voice_protocol_error_sent = True
+        await self._send_voice_error(
+            session, "unsupported_protocol", "", fatal=True
+        )
+
     async def _handle_voice_message(
         self, session: DeviceSession, message: dict[str, Any]
     ) -> None:
@@ -1099,11 +1132,7 @@ class DeviceGateway:
         if session.protocol_version < 2:
             # v1 设备只走音频通道。显式回一次 unsupported_protocol，避免固件
             # 以为 voice.* 已受理；之后同类消息静默丢弃。
-            if not session._voice_protocol_error_sent:
-                session._voice_protocol_error_sent = True
-                await self._send_voice_error(
-                    session, "unsupported_protocol", "", fatal=True
-                )
+            await self._reject_v1_voice(session)
             return
 
         turn_id = message.get("turn_id")
@@ -1116,13 +1145,24 @@ class DeviceGateway:
                 return
             voice = session.voice
             if voice is None or voice.state == "closed":
-                voice = VoiceSession(session.device_id)
+                runtime = session.voice_runtime
+                voice = VoiceSession(
+                    session.device_id,
+                    runtime=runtime,
+                    sink=session if runtime is not None else None,
+                )
                 session.voice = voice
             if not voice.start(turn_id):
                 # busy 非致命：设备应保持它当前的轮次，原轮次不被服务端清零。
                 await self._send_voice_error(session, "busy", turn_id)
             else:
                 session._invalid_frame_reported = False
+                if session.voice_runtime is not None:
+                    # 解析会话/打开 ASR 可能 await DB；不能阻塞读循环。
+                    # 同一 turn_id 的重传由 begin() 内部的幂等判断直接返回。
+                    session._voice_begin_task = asyncio.create_task(
+                        voice.begin()
+                    )
             return
 
         voice = session.voice
@@ -1153,13 +1193,21 @@ class DeviceGateway:
                     return
                 await self._send_voice_error(session, "invalid_turn", turn_id)
                 return
-            voice.cancel()
+            if session.voice_runtime is not None:
+                # 保留设备上报的原因（barge_in/user_stop）；Block B 的
+                # action.stop(barge_in) 由被取消的聊天生成器发出。
+                voice.cancel_turn(reason)
+            else:
+                voice.cancel()
             await self._send_cancel_ack(session, turn_id, reason)
             return
 
         if message_type == "voice.segment_played":
             if voice is None:
-                # 轮次对象已释放（断线/替换）或从未开始：无权判断，静默忽略。
+                # 从未开始过本轮：设备无权回执任何段，按 invalid_turn 否定这条
+                # 消息（fatal=false）。断线/替换时 `_handle_voice_message` 已在
+                # 开头返回，不会走到这里。
+                await self._send_voice_error(session, "invalid_turn", turn_id)
                 return
             if voice.turn_id != turn_id:
                 # 迟到的上一轮回执是幂等的，不能报错让设备回 IDLE。

@@ -579,3 +579,84 @@ async def test_link_failure_emits_terminal_internal_error():
     finally:
         bus.unsubscribe(collect)
         mod.invalidate_device_scheduler("dev-broken")
+
+
+class BlockingLink(FakeLink):
+    """action.play 会阻塞到测试放行；action.stop 立即返回。"""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.release = asyncio.Event()
+
+    async def send(self, command: dict) -> ActionResult:
+        self.commands.append(command)
+        if command.get("type") == "action.play":
+            await self.release.wait()
+        return ActionResult(status="done")
+
+
+async def test_cancel_reason_is_forwarded_to_action_stop():
+    link = BlockingLink()
+    register_device_link("dev-1", link)
+    orch = ActionOrchestrator()
+    turn = ActionTurnState(turn_id="turn-1", cancel_reason="barge_in")
+
+    task = asyncio.create_task(
+        orch.execute_tool("robot.action", {"name": "nod"}, "dev-1", turn)
+    )
+    await asyncio.sleep(0.05)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    await asyncio.sleep(0.02)
+
+    stops = [c for c in link.commands if c["type"] == "action.stop"]
+    assert len(stops) == 1
+    assert stops[0]["reason"] == "barge_in"
+    link.release.set()
+
+
+async def test_default_cancel_reason_stays_server_cancel():
+    link = BlockingLink()
+    register_device_link("dev-1", link)
+    orch = ActionOrchestrator()
+
+    task = asyncio.create_task(
+        orch.execute_tool("robot.action", {"name": "nod"}, "dev-1", _turn())
+    )
+    await asyncio.sleep(0.05)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    await asyncio.sleep(0.02)
+
+    stops = [c for c in link.commands if c["type"] == "action.stop"]
+    assert len(stops) == 1
+    assert stops[0]["reason"] == "server_cancel"
+    link.release.set()
+
+
+async def test_cancel_while_queued_does_not_stop_the_running_action():
+    link = BlockingLink()
+    register_device_link("dev-1", link)
+    orch = ActionOrchestrator()
+
+    running = asyncio.create_task(
+        orch.execute_tool("robot.action", {"name": "nod"}, "dev-1", _turn())
+    )
+    await asyncio.sleep(0.05)
+    queued = asyncio.create_task(
+        orch.execute_tool("robot.action", {"name": "shake"}, "dev-1", _turn())
+    )
+    await asyncio.sleep(0.02)
+    queued.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await queued
+    await asyncio.sleep(0.02)
+
+    assert [c for c in link.commands if c["type"] == "action.stop"] == []
+
+    running.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await running
+    link.release.set()

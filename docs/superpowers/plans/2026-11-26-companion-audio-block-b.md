@@ -46,20 +46,20 @@
     - `feed(delta: str) -> list[str]`：返回已经可以送去 TTS 的完整句子（保留标点）。
     - `flush() -> list[str]`：返回剩余文本（去掉首尾空白后非空才返回）。
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 覆盖：`。！？!?；;\n` 分句；不拆英文缩写（`Mr.` 这类至少不产生 1 字符段）；`min_chars` 合并短句；`max_chars` 硬切；跨 chunk 分句；`flush()` 只返回一次；空输入返回空列表；纯标点不产出。
 
-- [ ] **Step 2: 运行确认失败**
+- [x] **Step 2: 运行确认失败**
 
 Run: `... -m pytest companion/server/tests/test_audio_sentences.py -q`
 Expected: FAIL（模块不存在）。
 
-- [ ] **Step 3: 实现**
+- [x] **Step 3: 实现**
 
 逐字符扫描缓冲；句末标点后若缓冲长度 ≥ `min_chars` 则切出；缓冲超过 `max_chars` 时在最近的逗号/空格切，找不到就硬切；不丢弃字符。`flush()` 清空缓冲。
 
-- [ ] **Step 4: 运行确认通过并提交**
+- [x] **Step 4: 运行确认通过并提交**
 
 Run: `... -m pytest companion/server/tests/test_audio_sentences.py -q`
 Expected: PASS。
@@ -87,23 +87,23 @@ git commit -m "feat(companion): add the streaming sentence segmenter"
   - `class MockTtsProvider(packets_per_segment=4, delay=0.0, fail_at=None, error="tts_unavailable")`：用 `OggOpusMuxer` 产出 Ogg Opus；`fail_at` 指定第几个 segment 抛错；`delay` 模拟首包/段间延迟；提供 `synthesized: list[str]`。
   - `class UnavailableAsrProvider(UnavailableTtsProvider)`：`open()` 立即产出 `error`；供未配置真实 provider 时使用。
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 覆盖：Mock ASR 收到 Ogg 页后按页数发 partial、`finish()` 发 final、error 路径、`received_bytes` 增长；Mock TTS 输出可被 `OggOpusDemuxer` 还原、`packets_per_segment` 数量正确、`fail_at` 抛错、取消后停止产出；Unavailable 立即 error。
 
-- [ ] **Step 2: 运行确认失败**
+- [x] **Step 2: 运行确认失败**
 
 Run: `... -m pytest companion/server/tests/test_audio_providers.py -q`
 Expected: FAIL。
 
-- [ ] **Step 3: 实现并确认通过**
+- [x] **Step 3: 实现并确认通过**
 
 Mock 只用 `framing`/`ogg` 的公开接口；不得记录文本到日志。`MockTtsProvider` 的假 Opus 包用固定 20ms TOC（`b"\x78" + b"\x00" * 9`），保证 `opus_packet_duration_ms` 可解析。
 
 Run: `... -m pytest companion/server/tests/test_audio_providers.py -q`
 Expected: PASS。
 
-- [ ] **Step 4: 提交**
+- [x] **Step 4: 提交**
 
 ```bash
 git add companion/server/app/audio/providers.py companion/server/tests/test_audio_providers.py
@@ -130,7 +130,7 @@ git commit -m "feat(companion): add mock ASR and TTS providers"
   - `Sink` 协议：`send_control(payload)`、`send_segment(segment, first_payload, *, turn_seq, flags=0)`、`send_audio(payload, *, turn_seq, flags=0)`。
   - `SegmentStart` 必须与该段第一帧通过 `send_segment()` 原子发送（Block A 已提供，锁内先 JSON 后 bytes）。
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 用 `RecordingSink` 记录 `control` 与 `audio` 调用顺序。覆盖：
 1. `SegmentStart` 一定先于该段 `AudioPacket`。
@@ -141,13 +141,13 @@ git commit -m "feat(companion): add mock ASR and TTS providers"
 6. sink 返回 False → worker 抛 `DownlinkClosed` 并停止；`stop()` 后 `enqueue` 返回 False。
 7. 节流：两包 20ms，发送间隔 ≥ 10ms（留余量，避免 CI 抖动）。
 
-- [ ] **Step 2: 运行确认失败 → 实现 → 通过**
+- [x] **Step 2: 运行确认失败 → 实现 → 通过**
 
 Run: `... -m pytest companion/server/tests/test_audio_downlink.py -q`
 
 实现要点：单 worker 任务；`asyncio.Queue(maxsize=frame_capacity)`；`_last_audio_at`/`next_send_at` 节流；`stop()` 取消 worker 并清空队列，阻塞中的 `enqueue` 立即返回 False（用关闭事件 + `put` 超时或队列替换）；所有 await 都有取消保护。
 
-- [ ] **Step 3: 提交**
+- [x] **Step 3: 提交**
 
 ```bash
 git add companion/server/app/audio/downlink.py companion/server/tests/test_audio_downlink.py
@@ -177,7 +177,7 @@ git commit -m "feat(companion): add the throttled downlink sender"
   - `VoiceSession._emit(event, **fields)`：向 `bus` 发 `voice.event`（`device_id/turn_id/ts` 自动附加）。
   - `VoiceSession.conversation_id`、`last_finish_reason`。
 
-- [ ] **Step 1: 写失败测试（Mock runtime）**
+- [x] **Step 1: 写失败测试（Mock runtime）**
 
 复用 `VoiceRuntime` + `RecordingSink`（实现 `send_control/send_audio/get_status`）。覆盖：
 1. `begin()` 未绑定 → `voice.error(unbound, fatal=true)` + `turn_end(error)` + IDLE。
@@ -193,12 +193,12 @@ git commit -m "feat(companion): add the throttled downlink sender"
 11. 没有 runtime 的 `VoiceSession` 仍保持 A 语义（现有 21 例必须全绿）。
 12. 事件里的 `text` 不进入日志（caplog 断言无句子正文）。
 
-- [ ] **Step 2: 运行确认失败**
+- [x] **Step 2: 运行确认失败**
 
 Run: `... -m pytest companion/server/tests/test_audio_pipeline.py companion/server/tests/test_voice_transport.py -q`
 Expected: 新文件 FAIL，旧 21 例 PASS。
 
-- [ ] **Step 3: 实现**
+- [x] **Step 3: 实现**
 
 要点：
 - `begin()` 由网关 `create_task` 调用；ASR 未就绪时上行帧进入**有界**待发列表（上限按 5s 帧数，丢最旧），`asr` 就绪后按序 flush；`generation` 变化后丢弃。
@@ -210,12 +210,12 @@ Expected: 新文件 FAIL，旧 21 例 PASS。
 - 计时器任务统一登记在 `self._timers`，每个等待后先校验 `generation` 与 `turn_id`。
 - `_emit` 只允许白名单字段；不记录 `text` 到 logger。
 
-- [ ] **Step 4: 运行确认通过**
+- [x] **Step 4: 运行确认通过**
 
 Run: `... -m pytest companion/server/tests/test_audio_pipeline.py companion/server/tests/test_voice_transport.py -q`
 Expected: 全 PASS。
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add companion/server/app/audio/pipeline.py companion/server/app/audio/runtime.py companion/server/tests/test_audio_pipeline.py
@@ -240,20 +240,20 @@ git commit -m "feat(companion): implement the mock voice pipeline"
   - `ActionTurnState.cancel_reason: str = "server_cancel"`；`_Job.cancel_reason`；`_DeviceScheduler.submit(..., cancel_reason=...)` 的取消/超时路径用 `job.cancel_reason` 发 `action.stop`。
   - `ActionOrchestrator.execute_tool` 把 `turn.cancel_reason` 传给 `_submit`。
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 1. `test_chat_cancel.py`：脚本化 client 产出 1 段 content 后挂起；取消消费任务；断言 DB 有用户节点与助手节点、`messages[0]["interrupted"] is True`、`tokenUsage` 缺失也不报错；会话 `updated_at` 更新；再取消一次不重复落库。
 2. 正常结束不写 `interrupted`。
 3. `cancel_reason="barge_in"`：在 `submit()` 等待回执期间取消 → 设备收到 `action.stop` 且 `reason == "barge_in"`；默认路径仍为 `server_cancel`；无在途动作时不发 `action.stop`。
 4. 落库抛异常时取消路径仍返回（用 monkeypatch 让 commit 抛错，断言不挂起）。
 
-- [ ] **Step 2: 运行确认失败 → 实现 → 通过**
+- [x] **Step 2: 运行确认失败 → 实现 → 通过**
 
 Run: `... -m pytest companion/server/tests/test_chat_cancel.py companion/server/tests/test_action_orchestrator.py -q`
 
 实现要点：把现有落库段抽成 `_save_turn()`（正常/取消共用）；取消分支放在 `try/except BaseException` 外层，确保 `CancelledError` 先落库再抛出；`stream_chat` 的 `lock.locked()` 分支不变（语音 busy 由 pipeline 预检）。
 
-- [ ] **Step 3: 提交**
+- [x] **Step 3: 提交**
 
 ```bash
 git add companion/server/app/services/orchestrator.py companion/server/app/services/action_orchestrator.py companion/server/tests/test_chat_cancel.py companion/server/tests/test_action_orchestrator.py
@@ -282,20 +282,20 @@ git commit -m "feat(companion): persist interrupted turns and pass the cancel re
   - `DeviceGateway(voice_runtime=...)` / `set_voice_runtime(runtime)`。
   - 配置：`VOICE_ENABLED=True`、`VOICE_PROVIDER="unavailable"`、`VOICE_IDLE_TIMEOUT_SECONDS=300`、`VOICE_MAX_TURN_SECONDS=60`、`VOICE_ASR_FINAL_GRACE_SECONDS=0.3`、`VOICE_TTS_FIRST_PACKET_TIMEOUT_SECONDS=5`、`VOICE_SEGMENT_IDLE_TIMEOUT_SECONDS=15`、`VOICE_PLAYBACK_DONE_TIMEOUT_SECONDS=10`、`VOICE_DOWNLINK_BUFFER_SECONDS=5`、`DASHSCOPE_TTS_CONTAINER="ogg"`。
 
-- [ ] **Step 1: 写失败测试**
+- [x] **Step 1: 写失败测试**
 
 1. binding：会话级优先；角色级取最近更新；无会话时新建且标题含设备名；都没有返回 None；撤销设备不回退。
 2. gateway：`voice.start` 后 `begin()` 失败（unbound/busy）会发 `voice.error` 并回 IDLE；正常 start 建 runtime 会话；`voice.cancel` 发 ack 且 generation 递增；`close()`/替换连接会取消语音任务且不泄漏（`asyncio.all_tasks()` 不增长）。
 3. `build_voice_runtime(VOICE_ENABLED=False) is None`；`VOICE_PROVIDER=unavailable` 时 `voice.start` 收到 `asr_unavailable`。
 4. `send_control` 与 `send_audio` 共用发送锁（顺序断言）。
 
-- [ ] **Step 2: 运行确认失败 → 实现 → 通过**
+- [x] **Step 2: 运行确认失败 → 实现 → 通过**
 
 Run: `... -m pytest companion/server/tests/test_audio_binding.py companion/server/tests/test_voice_transport.py companion/server/tests/test_device_gateway.py -q`
 
 实现要点：`voice.start` 只做同步 `start()`，随后 `create_task(voice.begin())`，不阻塞读循环；`voice.end` 调 `end_user_speech()`；`voice.cancel` 调 `cancel_turn(reason)` 后发 ack；`voice.segment_played` 调同步 `segment_played()`。`close_voice()` 改为 `await voice.close()`。`routers/ws.py` 在模块初始化时 `build_voice_runtime()` 并注入。
 
-- [ ] **Step 3: 提交**
+- [x] **Step 3: 提交**
 
 ```bash
 git add companion/server/app/audio/binding.py companion/server/app/audio/runtime.py companion/server/app/services/device_gateway.py companion/server/app/routers/ws.py companion/server/app/config.py companion/server/tests/test_audio_binding.py companion/server/tests/test_voice_transport.py companion/server/tests/test_device_gateway.py
@@ -318,7 +318,7 @@ git commit -m "feat(companion): wire the voice runtime into the device gateway"
   - `SimulatedDevice.audio_turn_id` / `last_segment_seq`：按 `voice.segment` 记录当前轮。
   - e2e 辅助 `install_mock_voice(...)`：向 `ws.device_gateway` 注入带 Mock provider 的 runtime（测试进程内）。
 
-- [ ] **Step 1: 写 e2e 失败用例**
+- [x] **Step 1: 写 e2e 失败用例**
 
 新增 5 例（真实 TCP/WS）：
 1. 正常轮次：绑定会话 → `voice.start` → 2 帧 → `voice.end` → 收到 `voice.segment`/下行帧 → 自动 `segment_played` → App 收到 `turn_end(finish_reason=stop)`，DB 有本轮消息。
@@ -327,24 +327,24 @@ git commit -m "feat(companion): wire the voice runtime into the device gateway"
 4. 未绑定：`voice.start` → `voice.error(unbound)`，LLM 未被调用。
 5. 断线清理：轮次进行中断开设备 WS → 服务端语音任务结束、DB 落库 `interrupted`、App 收到 offline。
 
-- [ ] **Step 2: 运行确认失败**
+- [x] **Step 2: 运行确认失败**
 
 Run: `... -m pytest companion/tests/test_phase3_e2e.py -q -k "voice"`
 Expected: FAIL。
 
-- [ ] **Step 3: 实现模拟器与注入，确认通过**
+- [x] **Step 3: 实现模拟器与注入，确认通过**
 
 模拟器只在内存保存帧/事件；自动回执按 `segment_seq` 顺序、可配置延迟；不打印文本/音频。
 
 Run: `... -m pytest companion/tests/test_phase3_e2e.py -q -k "voice" companion/tests/test_phase3_e2e.py::test_device_v2_handshake_contract -q`
 
-- [ ] **Step 4: 协议文档与契约测试**
+- [x] **Step 4: 协议文档与契约测试**
 
 补充：`voice.event` 由服务端主动发布给 App 的字段（`conversation_id/interrupted/finish_reason`）、`voice.segment_played` 末段结束轮次、取消后 `action.stop(barge_in)` 只发一次。`test_protocol_v2_doc.py` 增加对应断言。
 
 Run: `... -m pytest companion/tests/test_protocol_v2_doc.py -q`
 
-- [ ] **Step 5: 提交**
+- [x] **Step 5: 提交**
 
 ```bash
 git add companion/simulators/device_simulator.py companion/tests/test_phase3_e2e.py companion/docs/protocol_v2.md companion/tests/test_protocol_v2_doc.py
@@ -360,7 +360,7 @@ git commit -m "test(companion): cover the voice pipeline end to end"
 - Create: `docs/语音机器人需求文档/v2_migration_log/25_audio_block_b_pipeline.md`
 - Modify: `docs/语音机器人需求文档/v2_migration_log/README.md`
 
-- [ ] **Step 1: 针对性回归**
+- [x] **Step 1: 针对性回归**
 
 ```powershell
 $py="C:\Users\ctr\AppData\Local\Temp\opencode\companion-venv\Scripts\python.exe"
@@ -368,12 +368,12 @@ $py="C:\Users\ctr\AppData\Local\Temp\opencode\companion-venv\Scripts\python.exe"
 & $py -m pytest companion/tests/test_phase3_e2e.py -q
 ```
 
-- [ ] **Step 2: 全量测试**
+- [x] **Step 2: 全量测试**
 
 Run: `& $py -m pytest -q`
 Expected: 0 failed。
 
-- [ ] **Step 3: 变异脚本（≥10 个，全部 exit=1、无挂起）**
+- [x] **Step 3: 变异脚本（≥10 个，全部 exit=1、无挂起）**
 
 候选：
 1. `sentences.py` `flush()` 不返回剩余文本。
@@ -392,11 +392,11 @@ Expected: 0 failed。
 Run: `& $py companion/tests/mutation/audio_block_b.py`
 Expected: `12/12 exit=1`，`hangs: none`。
 
-- [ ] **Step 4: 写日志 25 并更新索引**
+- [x] **Step 4: 写日志 25 并更新索引**
 
 日志包含：改动文件、真实命令输出摘要、偏差/Ruling、已知风险（无真实 ASR/TTS/真机）、下一步 Block C。不包含音频 payload、Key、Token、ASR/TTS 全文。README 补 25。
 
-- [ ] **Step 5: 检查并提交**
+- [x] **Step 5: 检查并提交**
 
 ```bash
 git status --porcelain

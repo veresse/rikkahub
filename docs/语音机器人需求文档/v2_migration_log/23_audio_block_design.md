@@ -93,7 +93,9 @@ Device WS ──binary──> DeviceGateway._on_message()
 - 同一设备同时只允许一轮。同一 `turn_id` 的重复 `voice.start` 是幂等重传（不返回 `busy`、
   不清空已收帧）；不同 `turn_id` 的 `voice.start` 回 `voice.error(code="busy", fatal=false)`，
   原轮次不变。轮次不匹配的 `voice.end`/`cancel`/`segment_played` 回
-  `voice.error(code="invalid_turn", fatal=false)`；属于刚结束/取消的上一轮的迟到消息静默忽略。
+  `voice.error(code="invalid_turn", fatal=false)`；属于刚结束/取消的上一轮的迟到
+  `voice.end`/`segment_played` 静默忽略。迟到 `voice.cancel` 例外：ack 丢失时设备
+  会用同一 `turn_id` 重试，服务端幂等重放 `cancel_ack`。
 - `voice.start` 之前的二进制上行帧丢弃（设备此时麦克风应关闭）。
 - `voice.end` 后到达的上行帧丢弃；`voice.cancel` 后到达的上行帧丢弃。
 - 设备重复 `voice.segment_played` 幂等：同一 `(turn_id, segment_seq)` 只处理一次。

@@ -27,6 +27,7 @@ import websockets
 from websockets.exceptions import ConnectionClosed
 
 from companion.server.app.audio.framing import (
+    KIND_DOWNLINK,
     KIND_UPLINK,
     AudioFrame,
     FrameError,
@@ -76,6 +77,8 @@ class SimulatedDevice:
         auto_complete: bool = True,
         report_interval: float | None = None,
         hello_timeout: float = 5.0,
+        auto_segment_played: bool = False,
+        segment_played_delay: float = 0.0,
     ) -> None:
         self.base_url = base_url.rstrip("/")
         self.device_id = device_id
@@ -90,6 +93,10 @@ class SimulatedDevice:
         self.auto_complete = auto_complete
         self.report_interval = report_interval
         self.hello_timeout = hello_timeout
+        # 语音自动回执：收到一段音频的末帧后回 voice.segment_played，
+        # 让无头 e2e 不必手工模拟播放完成。
+        self.auto_segment_played = auto_segment_played
+        self.segment_played_delay = max(0.0, segment_played_delay)
 
         # 虚拟硬件状态
         self.volume = 70
@@ -110,6 +117,11 @@ class SimulatedDevice:
         self.close_code: int | None = None
         self.close_reason: str = ""
         self.last_poses: dict[str, tuple[float, float]] = {}
+        # 当前/最近一段语音的轮次信息（只保存在内存，不落盘）。
+        self.audio_turn_id: str | None = None
+        self.last_segment_seq: int | None = None
+        self._pending_segment_ack: tuple[str, int] | None = None
+        self._ack_tasks: set[asyncio.Task] = set()
 
         self.ws: Any = None
         self._receiver: asyncio.Task | None = None
@@ -204,6 +216,11 @@ class SimulatedDevice:
                 self._receiver.cancel()
                 await asyncio.gather(self._receiver, return_exceptions=True)
             self._receiver = None
+        if self._ack_tasks:
+            for task in list(self._ack_tasks):
+                task.cancel()
+            await asyncio.gather(*self._ack_tasks, return_exceptions=True)
+            self._ack_tasks.clear()
         self._closed.set()
 
     async def wait_closed(self, timeout: float | None = 5.0) -> "SimulatedDevice":
@@ -290,6 +307,26 @@ class SimulatedDevice:
             }
         )
 
+    def _schedule_segment_played(
+        self, pending: tuple[str, int] | None = None
+    ) -> None:
+        """在“末帧已收到”后回执；只排一次同一段。"""
+        target = pending if pending is not None else self._pending_segment_ack
+        if target is None:
+            return
+        if pending is None:
+            self._pending_segment_ack = None
+        turn_id, segment_seq = target
+
+        async def _run() -> None:
+            if self.segment_played_delay:
+                await asyncio.sleep(self.segment_played_delay)
+            await self.segment_played(turn_id, segment_seq)
+
+        task = asyncio.create_task(_run())
+        self._ack_tasks.add(task)
+        task.add_done_callback(self._ack_tasks.discard)
+
     async def wait_for_audio(self, predicate=None, *, timeout: float = 5.0) -> AudioFrame:
         """等待并**消费**一帧：下次调用不会重复返回同一帧。"""
         deadline = time.monotonic() + timeout
@@ -375,6 +412,12 @@ class SimulatedDevice:
                     except FrameError:
                         continue
                     self.downlink_frames.append(frame)
+                    if (
+                        self.auto_segment_played
+                        and frame.kind == KIND_DOWNLINK
+                        and frame.last
+                    ):
+                        self._schedule_segment_played()
                     continue
                 try:
                     message = json.loads(raw)
@@ -418,8 +461,23 @@ class SimulatedDevice:
             self.voice_messages.append(message)
             if message_type == "voice.segment":
                 self.state = "speaking"
+                turn_id = message.get("turn_id")
+                segment_seq = message.get("segment_seq")
+                if isinstance(turn_id, str) and turn_id and isinstance(
+                    segment_seq, int
+                ) and not isinstance(segment_seq, bool):
+                    self.audio_turn_id = turn_id
+                    self.last_segment_seq = segment_seq
+                    if self.auto_segment_played:
+                        # 新段开始意味着上一段的音频已全部收到：先回执上一段。
+                        previous = self._pending_segment_ack
+                        self._pending_segment_ack = (turn_id, segment_seq)
+                        if previous is not None:
+                            self._schedule_segment_played(previous)
             elif message_type in {"voice.cancel_ack", "voice.error"}:
                 self.state = "idle"
+                # 取消/错误后不再补发本轮的播放回执。
+                self._pending_segment_ack = None
             return
 
         action_id = message.get("action_id")

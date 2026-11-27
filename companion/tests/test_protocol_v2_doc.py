@@ -57,6 +57,20 @@ def test_protocol_declares_voice_flow_rules():
     assert "turn_seq" in doc
 
 
+def test_protocol_declares_block_b_voice_semantics():
+    doc = read_protocol()
+    # voice.event 是服务端 → App 的广播，不是设备消息。
+    assert "由服务端通过 `/app/ws` 发布" in doc
+    assert "**不会**下发给设备" in doc
+    # 末段回执才结束轮次；播放回执超时有明确终态。
+    assert "`last=true` 的末段回执才结束" in doc
+    assert "playback_timeout" in doc
+    # 取消只停一次在途动作。
+    assert "至多下发一次" in doc
+    assert "`conversation_id`" in doc
+    assert "`interrupted`" in doc
+
+
 def test_protocol_declares_all_app_messages():
     doc = read_protocol()
     for message_type in [

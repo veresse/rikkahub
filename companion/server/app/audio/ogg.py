@@ -313,7 +313,8 @@ class OggOpusDemuxer:
     - 上一页有未完成包、下一页却未置 CONTINUED：丢弃残缺包，不拼接坏数据。
     - 页丢失后续上 CONTINUED：跳过直到下一个包结束，避免把半截包当完整包。
     - 收到 BOS 且 serial 改变：视为新的链式流，重置头部/包状态后继续。
-    - 重复 sequence 的页丢弃，避免同一包被送两次。
+    - 重复或回退 sequence 的页丢弃，避免同一包被送两次或乱序污染。
+    - OpusTags 即使前序 OpusHead 丢失也只当头部跳过，不能作为音频返回。
     """
 
     def __init__(self) -> None:
@@ -382,6 +383,11 @@ class OggOpusDemuxer:
                     # 重复页：同一包不能送两次。
                     self.dropped_pages += 1
                     continue
+                if delta > 0x7FFFFFFF:
+                    # 回退/乱序页：不能当作“中间缺页”消费，否则既污染
+                    # dropped_pages 计数，又会把旧包送进下一轮。
+                    self.dropped_pages += 1
+                    continue
                 if delta > 1:
                     # 中间缺页：残缺包不可信，交给 CONTINUED 逻辑重新对齐。
                     self._partial.clear()
@@ -430,10 +436,12 @@ class OggOpusDemuxer:
         return packets
 
     def _is_header(self, packet: bytes) -> bool:
-        if not self._seen_head and packet.startswith(OPUS_HEAD_MAGIC):
+        if packet.startswith(OPUS_HEAD_MAGIC):
             self._seen_head = True
             return True
-        if self._seen_head and not self._seen_tags and packet.startswith(OPUS_TAGS_MAGIC):
+        # OpusHead 页可能先丢；OpusTags 仍然是头部元数据，不能当音频送给
+        # 下游解码器。
+        if not self._seen_tags and packet.startswith(OPUS_TAGS_MAGIC):
             self._seen_tags = True
             return True
         return False

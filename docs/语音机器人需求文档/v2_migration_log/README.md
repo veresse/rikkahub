@@ -43,4 +43,5 @@
 | 21 | Phase 3 停机总预算 | ✅ 已完成 | 10s + 2s + 2s + 20s 四层预算、lifespan 有界兜底、中窗 `force_exit` 轮询、取消可重试与逐台 offline、真实 TCP 1011 e2e、mutation 入库；228 passed |
 | 22 | Phase 3 停机（三）：offline 补偿 | ✅ 已完成 | 取消越过 unregister 后靠 `pending_offline_reason` 补发、`_teardown()` 取消回填、offline at-least-once、测试隔离与 mutation 超时区分；231 passed |
 | 23 | 音频 Block 设计（ASR/TTS/barge-in） | ✅ 设计已批准 | 协议补齐、纯 Python Ogg、VoiceSession/打断/落库/超时方案；子块 A→B→C |
-| 24 | 音频 Block A：协议 / 帧 / Ogg / 传输 | ✅ 已完成（待审查） | 12B 帧、Ogg mux/demux、`send_bytes/send_audio`、VoiceSession 门控、模拟器二进制、协议 §4.8/§5.4；278 passed、mutation 10/10 |
+| 24 | 音频 Block A：协议 / 帧 / Ogg / 传输 | ✅ 已完成（已审查修复） | 12B 帧、Ogg mux/demux、`send_bytes/send_audio`、VoiceSession 门控、模拟器二进制、协议 §4.8/§5.4；364 passed、mutation 17/17 |
+| 25 | 音频 Block B：Mock 管线 / 打断 / 落库 / 网关接线 | ✅ 已完成（七轮审查修复） | 流式分句、Mock ASR/TTS、下行节流、完整轮次、barge-in、取消落库、运行时注入、6 例真实 WS 语音 e2e；旧轮清理隔离、每轮 `turn_key` 幂等落库、落库锁内重算下标、取消预算、barge-in 后可立即重开、GeneratorExit 先释放锁、speaker 按轮隔离等修复；403 passed、mutation 15/15 |

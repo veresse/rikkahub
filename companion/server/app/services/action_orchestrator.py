@@ -38,6 +38,9 @@ class ActionTurnState:
     turn_id: str
     max_actions: int = 3
     used_actions: int = 0
+    # 本轮被取消时下发给设备的 action.stop 原因：SSE 为 server_cancel，
+    # 语音 barge-in 为 barge_in。只影响本轮在途动作，不做全局急停。
+    cancel_reason: str = "server_cancel"
 
     def consume(self) -> bool:
         if self.used_actions >= self.max_actions:
@@ -53,6 +56,7 @@ class _Job:
     # 排队陈旧判定（不是执行超时）；超过该时刻仍未下发就丢弃。
     deadline: float | None = None
     sent: bool = False
+    cancel_reason: str = "server_cancel"
     started: asyncio.Event = field(default_factory=asyncio.Event, repr=False)
     emitted: bool = False
 
@@ -125,7 +129,7 @@ class _DeviceScheduler:
                         )
                     except asyncio.TimeoutError:
                         self._terminate(job, "failed", "timeout")
-                        await self._send_stop("server_cancel")
+                        await self._send_stop(job.cancel_reason)
                         continue
                     except asyncio.CancelledError:
                         raise
@@ -148,7 +152,12 @@ class _DeviceScheduler:
                 self._ensure_worker()
 
     async def submit(
-        self, command: dict[str, Any], *, timeout_ms: int, override: bool = False
+        self,
+        command: dict[str, Any],
+        *,
+        timeout_ms: int,
+        override: bool = False,
+        cancel_reason: str = "server_cancel",
     ) -> ActionResult:
         if not self._allow_rate():
             return ActionResult(status="failed", detail="rate_limited")
@@ -158,7 +167,11 @@ class _DeviceScheduler:
         if len(self.queue) >= MAX_PENDING_COMMANDS:
             return ActionResult(status="failed", detail="queue_full")
 
-        job = _Job(command=command, future=asyncio.get_running_loop().create_future())
+        job = _Job(
+            command=command,
+            future=asyncio.get_running_loop().create_future(),
+            cancel_reason=cancel_reason,
+        )
         self.queue.append(job)
         self._ensure_worker()
 
@@ -173,7 +186,7 @@ class _DeviceScheduler:
             was_running = job.sent and self.current is job
             self._abort(job)
             if was_running:
-                await asyncio.shield(self._send_stop("server_cancel"))
+                await asyncio.shield(self._send_stop(job.cancel_reason))
             raise
 
         try:
@@ -183,13 +196,13 @@ class _DeviceScheduler:
             was_running = job.sent and self.current is job
             self._abort(job)
             if was_running:
-                await self._send_stop("server_cancel")
+                await self._send_stop(job.cancel_reason)
             return ActionResult(status="timeout", detail="timeout")
         except asyncio.CancelledError:
             was_running = job.sent and self.current is job
             self._abort(job)
             if was_running:
-                await asyncio.shield(self._send_stop("server_cancel"))
+                await asyncio.shield(self._send_stop(job.cancel_reason))
             raise
 
     async def enqueue(
@@ -437,13 +450,19 @@ class ActionOrchestrator:
         *,
         timeout_ms: int,
         override: bool = False,
+        cancel_reason: str = "server_cancel",
     ) -> dict[str, Any]:
         link = self._link(device_id)
         if link is None:
             return self._fail("device_offline")
         action_id = command["action_id"]
         scheduler = self._scheduler(device_id, link)
-        result = await scheduler.submit(command, timeout_ms=timeout_ms, override=override)
+        result = await scheduler.submit(
+            command,
+            timeout_ms=timeout_ms,
+            override=override,
+            cancel_reason=cancel_reason,
+        )
         return self._ok(action_id, result)
 
     async def execute_tool(
@@ -527,7 +546,12 @@ class ActionOrchestrator:
             "ts": _now_ms(),
         }
         timeout_ms = int(action["max_duration_ms"]) + settings.ACTION_RESULT_TIMEOUT_EXTRA_MS
-        return await self._submit(device_id, command, timeout_ms=timeout_ms)
+        return await self._submit(
+            device_id,
+            command,
+            timeout_ms=timeout_ms,
+            cancel_reason=turn.cancel_reason,
+        )
 
     async def _move_head(
         self, device_id: str, args: dict[str, Any], turn: ActionTurnState
@@ -559,7 +583,13 @@ class ActionOrchestrator:
             "ts": _now_ms(),
         }
         timeout_ms = max(DEFAULT_COMMAND_TIMEOUT_MS, speed + 1000)
-        return await self._submit(device_id, command, timeout_ms=timeout_ms, override=True)
+        return await self._submit(
+            device_id,
+            command,
+            timeout_ms=timeout_ms,
+            override=True,
+            cancel_reason=turn.cancel_reason,
+        )
 
     async def _set_volume(
         self, device_id: str, args: dict[str, Any], turn: ActionTurnState
@@ -579,7 +609,11 @@ class ActionOrchestrator:
             "ts": _now_ms(),
         }
         return await self._submit(
-            device_id, command, timeout_ms=DEFAULT_COMMAND_TIMEOUT_MS, override=True
+            device_id,
+            command,
+            timeout_ms=DEFAULT_COMMAND_TIMEOUT_MS,
+            override=True,
+            cancel_reason=turn.cancel_reason,
         )
 
     async def _set_idle(
@@ -599,7 +633,12 @@ class ActionOrchestrator:
             "turn_id": turn.turn_id,
             "ts": _now_ms(),
         }
-        return await self._submit(device_id, command, timeout_ms=DEFAULT_COMMAND_TIMEOUT_MS)
+        return await self._submit(
+            device_id,
+            command,
+            timeout_ms=DEFAULT_COMMAND_TIMEOUT_MS,
+            cancel_reason=turn.cancel_reason,
+        )
 
     async def stop(self, device_id: str, reason: str = "user_stop") -> dict[str, Any]:
         link = self._link(device_id)

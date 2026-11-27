@@ -16,6 +16,8 @@ from companion.server.app.audio.framing import (
     AudioFrame,
 )
 from companion.server.app.audio.pipeline import VoiceSession
+from companion.server.app.audio.providers import UnavailableAsrProvider
+from companion.server.app.audio.runtime import VoiceRuntime
 from companion.server.app.database import AsyncSessionLocal
 from companion.server.app.models.device import DeviceModel
 from companion.server.app.services.device_gateway import DeviceGateway
@@ -41,11 +43,15 @@ class VoiceChannel:
     async def send_json(self, payload: dict[str, Any]) -> None:
         self.sent.append(payload)
         self.order.append(("json", payload))
+        # 显式让出事件循环：这样“JSON 先于 bytes 且不被别的段插入”的断言
+        # 才能真正检验 `_send_lock`，而不是靠两个协程恰好顺序执行。
+        await asyncio.sleep(0)
         self.sent_event.set()
 
     async def send_bytes(self, data: bytes) -> None:
         self.sent_bytes.append(data)
         self.order.append(("bytes", data))
+        await asyncio.sleep(0)
         self.sent_event.set()
 
     async def receive(self):
@@ -193,6 +199,8 @@ async def test_voice_start_twice_returns_busy(gateway_session):
     error = await channel.wait_sent(lambda m: m.get("type") == "voice.error")
     assert error["code"] == "busy"
     assert error["turn_id"] == "t2"
+    # 已有活跃轮次时拒绝另一个 voice.start 的 busy 是非致命的：设备保持 t1。
+    assert error["fatal"] is False
 
 
 async def test_voice_cancel_returns_ack_and_returns_idle(gateway_session):
@@ -301,6 +309,58 @@ async def test_segment_played_is_idempotent_and_late_reports_are_ignored(
     assert not any(m.get("type") == "voice.error" for m in channel.sent)
 
 
+async def test_late_cancel_for_finished_turn_is_acked_again(gateway_session):
+    session, channel = gateway_session
+    channel.push({"v": 2, "type": "voice.start", "turn_id": "t1"})
+    await wait_until(lambda: session.voice is not None)
+    channel.push({"v": 2, "type": "voice.cancel", "turn_id": "t1", "reason": "user_stop"})
+    await channel.wait_sent(lambda m: m.get("type") == "voice.cancel_ack")
+    # ack 丢失后设备重试：重放同一个 cancel 必须幂等再 ack，不能报错。
+    channel.push({"v": 2, "type": "voice.cancel", "turn_id": "t1", "reason": "user_stop"})
+    await asyncio.sleep(0.05)
+    acks = [m for m in channel.sent if m.get("type") == "voice.cancel_ack"]
+    assert len(acks) == 2
+    assert all(m["turn_id"] == "t1" for m in acks)
+    assert not any(m.get("type") == "voice.error" for m in channel.sent)
+
+
+async def test_segment_played_without_a_turn_is_invalid_turn(gateway_session):
+    _, channel = gateway_session
+    channel.push(
+        {"v": 2, "type": "voice.segment_played", "turn_id": "missing", "segment_seq": 0}
+    )
+    error = await channel.wait_sent(lambda m: m.get("type") == "voice.error")
+    assert error["code"] == "invalid_turn"
+    assert error["fatal"] is False
+
+
+async def test_v1_voice_event_gets_unsupported_protocol(seeded_device):
+    gateway = DeviceGateway()
+    channel = VoiceChannel()
+    task = asyncio.create_task(gateway.handle(DEVICE_ID, channel))
+    channel.push(
+        {
+            "v": 1,
+            "type": "hello",
+            "device_id": DEVICE_ID,
+            "capabilities": [],
+        }
+    )
+    await channel.wait_sent(lambda m: m.get("type") == "hello_ack")
+    channel.push(
+        {"v": 2, "type": "voice.event", "event": "asr_final", "turn_id": "t1", "text": "hi"}
+    )
+    error = await channel.wait_sent(lambda m: m.get("type") == "voice.error")
+    assert error["code"] == "unsupported_protocol"
+    assert error["fatal"] is True
+    # 后续其它 voice.* 不再重复报错。
+    channel.push({"v": 2, "type": "voice.start", "turn_id": "t2"})
+    await asyncio.sleep(0.05)
+    assert sum(m.get("code") == "unsupported_protocol" for m in channel.sent) == 1
+    channel.push(None)
+    await asyncio.wait_for(task, timeout=2.0)
+
+
 async def test_voice_messages_from_v1_device_get_unsupported_protocol(seeded_device):
     gateway = DeviceGateway()
     channel = VoiceChannel()
@@ -398,3 +458,179 @@ async def test_voice_session_generation_and_state():
     session.close()
     assert session.state == "closed"
     assert session.start("t3") is False
+
+
+async def test_send_control_never_interleaves_with_a_segment(
+    gateway_session,
+):
+    session, channel = gateway_session
+    channel.order.clear()
+    # 段先启动：没有共享发送锁时，control 会插到 segment 的 JSON 与 bytes 之间。
+    await asyncio.gather(
+        session.send_segment(
+            {"v": 2, "type": "voice.segment", "segment_seq": 0},
+            b"a",
+            turn_seq=0,
+        ),
+        session.send_control(
+            {"v": 2, "type": "voice.cancel_ack", "turn_id": "t1", "reason": "barge_in"}
+        ),
+    )
+    assert [kind for kind, _ in channel.order] == ["json", "bytes", "json"]
+    assert channel.order[0][1]["type"] == "voice.segment"
+    assert channel.order[2][1]["type"] == "voice.cancel_ack"
+
+
+async def test_runtime_pipeline_reports_unbound(seeded_device):
+    async def resolve(_device_id: str) -> str | None:
+        return None
+
+    runtime = VoiceRuntime(
+        asr=UnavailableAsrProvider(), resolve_conversation=resolve
+    )
+    gateway = DeviceGateway(voice_runtime=runtime)
+    channel = VoiceChannel()
+    task = asyncio.create_task(gateway.handle(DEVICE_ID, channel))
+    channel.push(await _hello())
+    await channel.wait_sent(lambda m: m.get("type") == "hello_ack")
+    session = get_device_link(DEVICE_ID)
+    assert session is not None
+    await wait_until(lambda: session.ready)
+
+    try:
+        channel.push({"v": 2, "type": "voice.start", "turn_id": "t1"})
+        error = await channel.wait_sent(
+            lambda m: m.get("type") == "voice.error"
+        )
+        assert error["code"] == "unbound"
+        assert error["fatal"] is True
+        await wait_until(lambda: session.voice.state == "idle")
+        assert session.voice.turn_id is None
+    finally:
+        channel.push(None)
+        await asyncio.wait_for(task, timeout=2.0)
+
+
+async def test_runtime_without_asr_reports_asr_unavailable(seeded_device):
+    async def resolve(_device_id: str) -> str | None:
+        return "conv-voice-transport"
+
+    runtime = VoiceRuntime(asr=None, resolve_conversation=resolve)
+    gateway = DeviceGateway(voice_runtime=runtime)
+    channel = VoiceChannel()
+    task = asyncio.create_task(gateway.handle(DEVICE_ID, channel))
+    channel.push(await _hello())
+    await channel.wait_sent(lambda m: m.get("type") == "hello_ack")
+    session = get_device_link(DEVICE_ID)
+    assert session is not None
+    await wait_until(lambda: session.ready)
+
+    try:
+        channel.push({"v": 2, "type": "voice.start", "turn_id": "t1"})
+        error = await channel.wait_sent(
+            lambda m: m.get("type") == "voice.error"
+        )
+        assert error["code"] == "asr_unavailable"
+        assert error["fatal"] is True
+        await wait_until(lambda: session.voice.state == "idle")
+    finally:
+        channel.push(None)
+        await asyncio.wait_for(task, timeout=2.0)
+
+
+class _HangingAsrStream:
+    """保持 events() 打开直到 close()，用于断线清理断言。"""
+
+    def __init__(self) -> None:
+        self.closed = False
+        self.finished = False
+        self._queue: asyncio.Queue = asyncio.Queue()
+
+    async def send(self, ogg_bytes: bytes) -> None:
+        return None
+
+    async def finish(self) -> None:
+        self.finished = True
+        self._queue.put_nowait(None)
+
+    async def close(self) -> None:
+        self.closed = True
+        self._queue.put_nowait(None)
+
+    async def events(self):
+        while True:
+            item = await self._queue.get()
+            if item is None:
+                return
+            yield item
+
+
+async def test_disconnect_shuts_down_voice_and_asr(seeded_device):
+    stream = _HangingAsrStream()
+
+    class _AsrProvider:
+        def open(self, **_kwargs):
+            return stream
+
+    async def resolve(_device_id: str) -> str | None:
+        return "conv-voice-transport"
+
+    runtime = VoiceRuntime(asr=_AsrProvider(), resolve_conversation=resolve)
+    gateway = DeviceGateway(voice_runtime=runtime)
+    channel = VoiceChannel()
+    task = asyncio.create_task(gateway.handle(DEVICE_ID, channel))
+    channel.push(await _hello())
+    await channel.wait_sent(lambda m: m.get("type") == "hello_ack")
+    session = get_device_link(DEVICE_ID)
+    assert session is not None
+    await wait_until(lambda: session.ready)
+
+    channel.push({"v": 2, "type": "voice.start", "turn_id": "t1"})
+    await wait_until(lambda: session.voice is not None and session.voice._asr is not None)
+    voice = session.voice
+    assert voice is not None
+
+    channel.push(None)
+    await asyncio.wait_for(task, timeout=2.0)
+
+    await wait_until(lambda: stream.closed)
+    assert voice.state == "closed"
+    assert session.voice is None
+
+
+async def test_runtime_cancel_bumps_generation_and_acks(seeded_device):
+    release = asyncio.Event()
+
+    async def resolve(_device_id: str) -> str | None:
+        await release.wait()
+        return None
+
+    runtime = VoiceRuntime(
+        asr=UnavailableAsrProvider(), resolve_conversation=resolve
+    )
+    gateway = DeviceGateway(voice_runtime=runtime)
+    channel = VoiceChannel()
+    task = asyncio.create_task(gateway.handle(DEVICE_ID, channel))
+    channel.push(await _hello())
+    await channel.wait_sent(lambda m: m.get("type") == "hello_ack")
+    session = get_device_link(DEVICE_ID)
+    assert session is not None
+    await wait_until(lambda: session.ready)
+
+    try:
+        channel.push({"v": 2, "type": "voice.start", "turn_id": "t1"})
+        await wait_until(lambda: session.voice is not None)
+        generation = session.voice.generation
+        channel.push(
+            {"v": 2, "type": "voice.cancel", "turn_id": "t1", "reason": "barge_in"}
+        )
+        ack = await channel.wait_sent(
+            lambda m: m.get("type") == "voice.cancel_ack"
+        )
+        assert ack["reason"] == "barge_in"
+        assert session.voice.generation > generation
+        assert session.voice.state == "idle"
+    finally:
+        release.set()
+        channel.push(None)
+        await asyncio.wait_for(task, timeout=2.0)

@@ -290,15 +290,18 @@
 idle_timeout, invalid_turn, invalid_frame, unsupported_protocol, internal_error}`。
 
 - `fatal=true`（`unbound`、`no_speech`、`asr_unavailable`、`tts_unavailable`、
-  `idle_timeout`、`unsupported_protocol`、`internal_error`）：本轮无法继续，设备回 `IDLE`。
-- `fatal=false`（`busy`、`invalid_turn`、`invalid_frame`）：只否定触发它的这条消息，
-  设备保持当前状态；服务端的原轮次也不变（重复 `voice.start` 的 `busy` 是唯一例外：
-  同一 `turn_id` 的重传按幂等成功处理，不返回 `busy`）。
+  `idle_timeout`、`unsupported_protocol`、`internal_error`，以及**对话锁被 App 生成
+  占用时的 `busy`**）：本轮无法继续，设备回 `IDLE`。
+- `fatal=false`（同一设备已有活跃语音轮次时拒绝另一个 `voice.start` 的 `busy`、
+  `invalid_turn`、`invalid_frame`）：只否定触发它的这条消息，设备保持当前状态；
+  服务端的原轮次也不变（重复 `voice.start` 的 `busy` 是唯一例外：同一 `turn_id`
+  的重传按幂等成功处理，不返回 `busy`）。
 - `voice.segment` 必须在同一轮的下行音频帧之前发送；服务端保证每轮只有一个下行发送器，
   不会出现“音频先于段文本”。
 - 下行帧的 `flags.bit0` 表示**本轮**最后一帧，不是每段最后一帧；段边界由 `voice.segment` 标识。
 - `voice.cancel_ack` 由语音管线立即发送；barge-in 的 `action.stop(barge_in)` 由被取消的
-  聊天生成器在停止本轮在途动作时发送，二者不重复。
+  聊天生成器在停止本轮在途动作时发送，二者不重复；同一次取消**至多下发一次**
+  `action.stop(barge_in)`，重复的 `voice.cancel` 只重放 `cancel_ack`。
 
 ---
 
@@ -343,7 +346,9 @@ idle_timeout, invalid_turn, invalid_frame, unsupported_protocol, internal_error}
 - 触发时机：连接成功后、音量变化、动作完成、校准保存、状态机切换、每 30 秒心跳上报。
 - 服务端以此更新 `devices.last_report_json` 作为 `robot.get_status` 的快照来源。
 
-### 5.3 `voice.event`（可选，用于 App 展示 ASR 文本）
+### 5.3 `voice.event`（服务端 → App，可选，用于展示 ASR 文本与轮次状态）
+
+`voice.event` 由服务端通过 `/app/ws` 发布给所有在线 App，**不会**下发给设备。
 
 ```json
 {"v": 2, "type": "voice.event", "event": "asr_final", "turn_id": "uuid", "text": "今天天气怎么样"}
@@ -352,6 +357,7 @@ idle_timeout, invalid_turn, invalid_frame, unsupported_protocol, internal_error}
 - `event` ∈ `{"turn_start","asr_partial","asr_final","tts_segment_start","tts_segment_end","turn_end"}`。
 - `turn_start` 带 `turn_id` 与可选 `conversation_id`；`turn_end` 带 `turn_id`、`interrupted` 与
   `finish_reason`（`stop/interrupted/error/timeout/playback_timeout`）。
+- `tts_segment_start` 带 `turn_id/segment_seq/text`；`tts_segment_end` 带 `turn_id/segment_seq`。
 - 默认不下发原始音频；`text` 允许 App 展示与纠正。
 
 ### 5.4 语音上行消息
@@ -373,13 +379,18 @@ idle_timeout, invalid_turn, invalid_frame, unsupported_protocol, internal_error}
 - 同一设备同时只允许一轮。同一 `turn_id` 的重复 `voice.start` 是幂等重传（不返回
   `busy`、不清空已收帧）；不同 `turn_id` 的 `voice.start` 回 `voice.error(busy, fatal=false)`，
   原轮次不变。轮次不匹配的 `voice.end`/`voice.cancel`/`voice.segment_played` 回
-  `voice.error(invalid_turn, fatal=false)`；但属于上一轮（刚结束/取消）的迟到消息静默忽略，
-  避免设备因重传被误判。
+  `voice.error(invalid_turn, fatal=false)`；属于上一轮（刚结束/取消）的迟到 `voice.end`
+  与 `voice.segment_played` 静默忽略，避免设备因重传被误判。**迟到 `voice.cancel` 是
+  例外**：`cancel_ack` 丢失时设备会用同一 `turn_id` 重试，服务端幂等重放
+  `voice.cancel_ack`（不报错、不改状态）。
 - `voice.start` 之前的二进制上行帧丢弃（设备此时麦克风应关闭）；`voice.end`/`voice.cancel`
   之后的帧同样丢弃，直到下一轮 `voice.start`。
 - 同一轮内 `turn_seq` 必须严格递增；服务端丢弃重复或回退帧，不因缺口断开连接。
 - 同一 `(turn_id, segment_seq)` 的 `voice.segment_played` 幂等，只处理一次；乱序/重复的
-  `segment_seq` 丢弃，不回错误。
+  `segment_seq` 丢弃，不回错误。只有 `voice.segment` 中 `last=true` 的末段回执才结束
+  轮次；中间段回执只推进进度，服务端继续等待。末段回执在 `playback_done_timeout`
+  内未到达时以 `voice.error(internal_error, fatal=true)` + `turn_end(playback_timeout)`
+  结束，设备据此回 `IDLE`。
 - 半双工：服务端在 `THINKING/SPEAKING` 期间忽略上行音频帧；设备在 `SPEAKING` 期间暂停采集。
 - `protocol_version = 1` 的设备发送任意 `voice.*` 时，服务端回一次
   `voice.error(unsupported_protocol, fatal=true)` 后忽略后续语音消息。

@@ -35,7 +35,7 @@ barge-in 的 `action.stop` 去重（Block B/C）。
 | `companion/server/tests/test_audio_framing.py` | 17 例帧测试 |
 | `companion/server/tests/test_audio_ogg.py` | 23 例 Ogg 测试（含页丢失/续包/换流/坏页恢复） |
 | `companion/server/tests/test_voice_transport.py` | 25 例传输/门控测试 |
-| `companion/tests/mutation/audio_block_a.py` | 16 个变异用例 |
+| `companion/tests/mutation/audio_block_a.py` | 17 个变异用例 |
 
 ### 修改
 
@@ -83,7 +83,7 @@ kind 非 `0x01/0x02`、flags 保留位非 0、空 payload 且无静音位、payl
 - `voice.error` 增加 `fatal`：`unbound/no_speech/asr_unavailable/tts_unavailable/
   idle_timeout/unsupported_protocol/internal_error` 为致命（设备回 IDLE）；
   `busy/invalid_turn/invalid_frame` 非致命（保持当前状态）。对话锁被 App 占用时
-  Block B 会显式发 `busy, fatal=true`。
+  Block B 会显式发 `busy, fatal=true`；协议 §4.8 已同步这一例外。
 - 畸形帧每轮只回一次 `invalid_frame`，避免设备灌垃圾占满下行锁。
 - 同一 `turn_id` 的重复 `voice.start` 幂等；不同 `turn_id` 才回 `busy`。
 - 刚结束/取消轮次的迟到 `voice.end/cancel/segment_played` 静默忽略；同一
@@ -106,7 +106,7 @@ kind 非 `0x01/0x02`、flags 保留位非 0、空 payload 且无静音位、payl
 | `pytest companion/tests/test_phase3_e2e.py -q -k audio` | 2 passed |
 | `pytest companion/tests/test_phase3_e2e.py companion/tests/test_protocol_v2_doc.py -q` | 27 passed |
 | `pytest -q` | **302 passed in 22.05s** |
-| `python companion/tests/mutation/audio_block_a.py` | **16/16 exit=1，none hung** |
+| `python companion/tests/mutation/audio_block_a.py` | **17/17 exit=1，none hung** |
 
 变异覆盖：magic、保留位、空 payload、seq 端序、Ogg CRC、lacing 续包、granule
 单位、`turn_seq` 回退、`voice.start` 前收帧、下行 seq 递增，以及审查后新增的
@@ -205,4 +205,29 @@ payload 不落日志。
 | `90c9e95c` | 传输与 VoiceSession 门控 |
 | `28e60a98` | 协议、模拟器、2 例 e2e |
 | `6d9154c1` | 变异脚本、日志 24、README |
-| （本次） | 审查修复：fatal/幂等/原子发送/demuxer 鲁棒性/测试补齐 |
+| `5e9669cb` | 审查修复：fatal/幂等/原子发送/demuxer 鲁棒性/测试补齐 |
+| （本次） | Block B 期间复审修复（见 §10） |
+
+## 10. Block B 期间复审修复
+
+第二次独立审查（针对 `5e9669cb`）结论 COMMENT：1 MAJOR + 6 MINOR。逐条处理：
+
+| # | 级别 | 问题 | 处理 |
+| :--- | :--- | :--- | :--- |
+| 1 | MAJOR | 协议 §4.8 把 `busy` 一律写成非致命，与设计“App 占用对话锁时 `busy` 致命”矛盾 | 协议 §4.8 增加例外；`test_voice_start_twice_returns_busy` 断言 `fatal is False`；Block B 管线测试覆盖 `busy, fatal=true` |
+| 2 | MINOR | demuxer 把回退 sequence 当“缺页”消费，乱序包仍被送出，`dropped_pages` 爆表 | `delta > 0x7FFFFFFF` 直接丢弃；新增乱序页测试（断言只出 2、4 两包） |
+| 3 | MINOR | OpusHead 页丢失后 OpusTags 被当音频返回 | `_is_header()` 在未见 Tags 时始终跳过 `OpusTags`；新增无 Head 测试 |
+| 4 | MINOR | “段文本先于音频”测试无让出点，删掉锁也能过 | `VoiceChannel.send_json/send_bytes` 增加 `await asyncio.sleep(0)`；去掉 `_send_lock` 后顺序断言会失败 |
+| 5 | MINOR | 迟到 `voice.cancel` 重发 ack 与协议“静默忽略”矛盾；无轮次 `segment_played` 无响应 | 协议/设计明确 cancel 幂等重放为例外；`segment_played` 在无轮次时回 `invalid_turn(fatal=false)`；各加测试 |
+| 6 | MINOR | v1 设备的 `voice.event` 绕过 `unsupported_protocol` 门控 | 抽出 `_reject_v1_voice()`，`voice.event` 分支先做 v1 检查；新增 v1 `voice.event` 测试 |
+| 7 | NIT | 日志把 17 个变异写成 16 | 本文件 §2/§4 已改为 17 |
+
+验证命令（仓库根，venv 解释器）：
+
+| 命令 | 结果 |
+| :--- | :--- |
+| `pytest companion/server/tests/test_audio_ogg.py companion/server/tests/test_voice_transport.py -q` | **53 passed** |
+| `pytest ... test_audio_pipeline.py test_device_gateway.py -q` | **120 passed** |
+| `pytest -q` | **364 passed in 23.19s** |
+| `python companion/tests/mutation/audio_block_a.py` | **17/17 exit=1，none stayed green，none hung** |
+| 去锁检查：把 `send_segment()` 的 `async with self._send_lock` 改成 `if True` | `test_send_segment_orders_text_before_audio_under_one_lock` **失败**（已恢复） |

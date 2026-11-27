@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import subprocess
@@ -110,6 +111,31 @@ class ScriptedDeepSeek:
             yield chunk
 
 
+class GatedDeepSeek(ScriptedDeepSeek):
+    """先吐若干句，再卡在 gate：用于在生成中途制造断线/取消。"""
+
+    def __init__(self, chunks: list[dict]) -> None:
+        super().__init__([])
+        self.chunks = chunks
+        self.gate = asyncio.Event()
+        self.reached_gate = asyncio.Event()
+
+    async def stream_chat(
+        self, messages, model=None, temperature=None, top_p=None, tools=None
+    ):
+        self.calls.append(
+            {
+                "messages": json.loads(json.dumps(messages, default=str)),
+                "tools": tools,
+            }
+        )
+        for chunk in self.chunks:
+            yield chunk
+        self.reached_gate.set()
+        await self.gate.wait()
+        yield {"type": "done", "finish_reason": "stop"}
+
+
 def content(text: str) -> dict:
     return {"type": "content", "delta": text}
 
@@ -198,6 +224,8 @@ class E2EContext:
         capabilities=None,
         time_scale: float = 0.01,
         auto_complete: bool = True,
+        auto_segment_played: bool = False,
+        segment_played_delay: float = 0.0,
         assistant_id: str | None = None,
         conversation_id: str | None = None,
         connect: bool = True,
@@ -235,6 +263,8 @@ class E2EContext:
             capabilities=caps,
             time_scale=time_scale,
             auto_complete=auto_complete,
+            auto_segment_played=auto_segment_played,
+            segment_played_delay=segment_played_delay,
         )
         self.devices.append(device)
         self.device_ids.append(paired["device_id"])
@@ -874,7 +904,114 @@ async def test_logs_do_not_leak_tokens_or_passwords(e2e, caplog, monkeypatch):
     assert ADMIN_PASSWORD not in logged
 
 
-async def test_device_audio_frames_are_gated_by_voice_start(e2e):
+@contextlib.asynccontextmanager
+async def install_mock_voice(
+    *,
+    asr_text: str = "今天天气怎么样",
+    tts=None,
+    resolve=None,
+    busy=None,
+):
+    """把带 Mock provider 的语音运行时注入真实服务进程（仅测试内有效）。"""
+    from companion.server.app.audio.binding import resolve_conversation_for_device
+    from companion.server.app.audio.providers import MockAsrProvider, MockTtsProvider
+    from companion.server.app.audio.runtime import VoiceConfig, VoiceRuntime
+    from companion.server.app.database import AsyncSessionLocal
+    from companion.server.app.models.device import DeviceModel
+    from companion.server.app.routers import ws as ws_router
+    from companion.server.app.services.orchestrator import (
+        ChatOrchestrator,
+        get_conversation_lock,
+    )
+
+    async def default_resolve(device_id: str) -> str | None:
+        async with AsyncSessionLocal() as db:
+            device = await db.get(DeviceModel, device_id)
+            if device is None:
+                return None
+            return await resolve_conversation_for_device(db, device)
+
+    async def chat_factory(
+        conversation_id: str, text: str, *, cancel_reason: str = "barge_in"
+    ):
+        async with AsyncSessionLocal() as db:
+            async for chunk in ChatOrchestrator.stream_chat(
+                db,
+                conversation_id,
+                text,
+                cancel_reason=cancel_reason,
+            ):
+                yield chunk
+
+    gateway = ws_router.device_gateway
+    runtime = VoiceRuntime(
+        bus=gateway.bus,
+        asr=MockAsrProvider([{"final": asr_text}]),
+        tts=tts or MockTtsProvider(packets_per_segment=2),
+        resolve_conversation=resolve or default_resolve,
+        conversation_busy=busy
+        or (lambda cid: get_conversation_lock(cid).locked()),
+        chat_factory=chat_factory,
+        config=VoiceConfig(
+            playback_done_timeout=3.0,
+            idle_timeout=30.0,
+            max_turn=20.0,
+        ),
+    )
+    previous = gateway._voice_runtime
+    gateway.set_voice_runtime(runtime)
+    try:
+        yield runtime
+    finally:
+        gateway.set_voice_runtime(previous)
+
+
+async def conversation_nodes(conversation_id: str):
+    from sqlalchemy import select
+
+    from companion.server.app.database import AsyncSessionLocal
+    from companion.server.app.models.message_node import MessageNodeModel
+
+    async with AsyncSessionLocal() as db:
+        result = await db.execute(
+            select(MessageNodeModel)
+            .where(MessageNodeModel.conversation_id == conversation_id)
+            .order_by(MessageNodeModel.node_index)
+        )
+        return list(result.scalars())
+
+
+async def wait_conversation_nodes(conversation_id: str, predicate, timeout=5.0):
+    async def _poll():
+        while True:
+            nodes = await conversation_nodes(conversation_id)
+            if predicate(nodes):
+                return nodes
+            await asyncio.sleep(0.05)
+
+    return await asyncio.wait_for(_poll(), timeout)
+
+
+@pytest.fixture
+async def transport_only_voice():
+    """Block A 传输用例：临时关闭 Block B 运行时，保持纯门控语义。
+
+    Task 7 会用带 Mock provider 的完整语音 e2e 取代这两条用例。
+    """
+    from companion.server.app.routers import ws as ws_router
+
+    gateway = ws_router.device_gateway
+    previous = gateway._voice_runtime
+    gateway.set_voice_runtime(None)
+    try:
+        yield
+    finally:
+        gateway.set_voice_runtime(previous)
+
+
+async def test_device_audio_frames_are_gated_by_voice_start(
+    e2e, transport_only_voice
+):
     device = await e2e.new_device()
     link = get_device_link(device.device_id)
     assert link is not None
@@ -898,7 +1035,9 @@ async def test_device_audio_frames_are_gated_by_voice_start(e2e):
     await wait_until(lambda: link.voice.state == "idle")
 
 
-async def test_server_downlink_audio_reaches_the_simulator(e2e):
+async def test_server_downlink_audio_reaches_the_simulator(
+    e2e, transport_only_voice
+):
     device = await e2e.new_device()
     await device.start_voice("turn-b")
     link = get_device_link(device.device_id)
@@ -910,3 +1049,341 @@ async def test_server_downlink_audio_reaches_the_simulator(e2e):
     assert frame.kind == KIND_DOWNLINK
     assert frame.payload == b"\x78\x03"
     assert frame.last is True
+
+
+# ---------------------------------------------------------------------------
+# Block B：完整语音轮次（Mock provider + 真实 WS）
+# ---------------------------------------------------------------------------
+
+
+def _assistant_messages(nodes):
+    return [
+        message
+        for node in nodes
+        for message in node.messages
+        if message.get("role") == "ASSISTANT"
+    ]
+
+
+async def test_voice_turn_is_persisted_end_to_end(e2e, monkeypatch):
+    import companion.server.app.services.orchestrator as orchestrator_module
+
+    fake = ScriptedDeepSeek(
+        [[content("今天晴，适合散步。"), {"type": "done", "finish_reason": "stop"}]]
+    )
+    monkeypatch.setattr(orchestrator_module, "DeepSeekClient", lambda: fake)
+
+    async with install_mock_voice(asr_text="今天天气怎么样"):
+        assistant_id = await e2e.new_assistant("E2E 语音角色")
+        conversation_id = await e2e.new_conversation(assistant_id, "E2E 语音")
+        device = await e2e.new_device(
+            name="E2E 语音机",
+            assistant_id=assistant_id,
+            conversation_id=conversation_id,
+            auto_segment_played=True,
+        )
+        await e2e.connect_app()
+
+        assert await device.start_voice("turn-voice-ok") is True
+        assert await device.send_audio(b"\x78\x01", turn_seq=0) is True
+        assert await device.send_audio(b"\x78\x02", turn_seq=1) is True
+        assert await device.end_voice("turn-voice-ok") is True
+
+        segment = await device.wait_for(
+            lambda m: m.get("type") == "voice.segment", timeout=8.0
+        )
+        assert segment["turn_id"] == "turn-voice-ok"
+        assert segment["text"]
+        assert await device.wait_for_audio(lambda f: f.last, timeout=8.0)
+
+        end = await e2e.app.wait_for(
+            lambda e: e.get("type") == "voice.event"
+            and e.get("event") == "turn_end"
+            and e.get("turn_id") == "turn-voice-ok",
+            timeout=8.0,
+        )
+        assert end["finish_reason"] == "stop"
+        assert end["interrupted"] is False
+
+        nodes = await wait_conversation_nodes(
+            conversation_id,
+            lambda ns: bool(_assistant_messages(ns)),
+        )
+        user_texts = [
+            part.get("text")
+            for node in nodes
+            for message in node.messages
+            if message.get("role") == "USER"
+            for part in message.get("parts", [])
+        ]
+        assistant_texts = [
+            part.get("text")
+            for message in _assistant_messages(nodes)
+            for part in message.get("parts", [])
+        ]
+        assert "今天天气怎么样" in user_texts
+        assert "今天晴，适合散步。" in assistant_texts
+        assert all(
+            message.get("interrupted") is not True
+            for message in _assistant_messages(nodes)
+        )
+        assert fake.calls, "语音轮次必须真正调用 LLM"
+
+
+async def test_voice_barge_in_stops_the_turn_and_actions(e2e, monkeypatch):
+    import companion.server.app.services.orchestrator as orchestrator_module
+
+    fake = ScriptedDeepSeek(
+        [
+            [
+                content("好的，我点点头。"),
+                tool_call(
+                    "call_voice", "robot.action", '{"name": "nod", "intensity": 3}'
+                ),
+            ]
+        ]
+    )
+    monkeypatch.setattr(orchestrator_module, "DeepSeekClient", lambda: fake)
+
+    async with install_mock_voice(asr_text="点点头"):
+        assistant_id = await e2e.new_assistant("E2E 打断角色")
+        conversation_id = await e2e.new_conversation(assistant_id, "E2E 打断")
+        device = await e2e.new_device(
+            name="E2E 打断机",
+            assistant_id=assistant_id,
+            conversation_id=conversation_id,
+            auto_complete=False,
+            auto_segment_played=True,
+        )
+        await e2e.connect_app()
+
+        assert await device.start_voice("turn-barge") is True
+        assert await device.send_audio(b"\x78\x11", turn_seq=0) is True
+        assert await device.end_voice("turn-barge") is True
+
+        play = await device.wait_for(
+            lambda m: m.get("type") == "action.play", timeout=8.0
+        )
+        assert play["name"] == "nod"
+
+        assert await device.cancel_voice("turn-barge", "barge_in") is True
+        ack = await device.wait_for(
+            lambda m: m.get("type") == "voice.cancel_ack", timeout=3.0
+        )
+        assert ack["turn_id"] == "turn-barge"
+        assert ack["reason"] == "barge_in"
+
+        stop = await device.wait_for(
+            lambda m: m.get("type") == "action.stop", timeout=5.0
+        )
+        assert stop["reason"] == "barge_in"
+        # 同一次取消只能下发一次 stop，重复取消也不得再发。
+        assert await device.cancel_voice("turn-barge", "barge_in") is True
+        await asyncio.sleep(0.2)
+        assert len(device.commands_of_type("action.stop")) == 1
+
+        end = await e2e.app.wait_for(
+            lambda e: e.get("type") == "voice.event"
+            and e.get("event") == "turn_end"
+            and e.get("turn_id") == "turn-barge",
+            timeout=8.0,
+        )
+        assert end["interrupted"] is True
+        assert end["finish_reason"] == "interrupted"
+
+        nodes = await wait_conversation_nodes(
+            conversation_id,
+            lambda ns: any(
+                message.get("interrupted") is True
+                for message in _assistant_messages(ns)
+            ),
+        )
+        interrupted = [
+            message
+            for message in _assistant_messages(nodes)
+            if message.get("interrupted") is True
+        ]
+        text = "".join(
+            part.get("text") or ""
+            for part in interrupted[0].get("parts", [])
+        )
+        assert "好的" in text
+
+
+async def test_voice_start_right_after_barge_in_is_not_busy(e2e, monkeypatch):
+    """barge-in 后立刻开启下一轮：取消落库不得占用会话锁导致 fatal busy。"""
+    import companion.server.app.services.orchestrator as orchestrator_module
+    from companion.server.app.services.orchestrator import (
+        ChatOrchestrator,
+        get_conversation_lock,
+    )
+
+    fake = GatedDeepSeek([content("第一句话。第二句话。")])
+    monkeypatch.setattr(orchestrator_module, "DeepSeekClient", lambda: fake)
+
+    original_save = ChatOrchestrator._save_turn
+    cancel_save_started = threading.Event()
+
+    async def slow_cancel_save(cls, db, **kwargs):
+        if kwargs.get("interrupted"):
+            cancel_save_started.set()
+            # 放大取消落库窗口；此时会话锁必须是自由的，否则新一轮会 busy。
+            await asyncio.sleep(0.3)
+        return await original_save(db, **kwargs)
+
+    monkeypatch.setattr(
+        ChatOrchestrator, "_save_turn", classmethod(slow_cancel_save)
+    )
+
+    async with install_mock_voice(asr_text="你好"):
+        assistant_id = await e2e.new_assistant("E2E 打断重开角色")
+        conversation_id = await e2e.new_conversation(assistant_id, "E2E 打断重开")
+        device = await e2e.new_device(
+            name="E2E 打断重开机",
+            assistant_id=assistant_id,
+            conversation_id=conversation_id,
+            auto_complete=False,
+            auto_segment_played=True,
+        )
+        await e2e.connect_app()
+
+        assert await device.start_voice("turn-1") is True
+        assert await device.send_audio(b"\x78\x11", turn_seq=0) is True
+        assert await device.end_voice("turn-1") is True
+        await device.wait_for(
+            lambda m: m.get("type") == "voice.segment", timeout=8.0
+        )
+
+        assert await device.cancel_voice("turn-1", "barge_in") is True
+        ack = await device.wait_for(
+            lambda m: m.get("type") == "voice.cancel_ack", timeout=3.0
+        )
+        assert ack["turn_id"] == "turn-1"
+
+        deadline = time.monotonic() + 5.0
+        while not cancel_save_started.is_set() and time.monotonic() < deadline:
+            await asyncio.sleep(0.01)
+        assert cancel_save_started.is_set()
+        # 取消落库正在进行，但会话锁不得被它占用。
+        assert not get_conversation_lock(conversation_id).locked()
+
+        assert await device.start_voice("turn-2") is True
+        await asyncio.sleep(0.15)
+        errors = [
+            message
+            for message in device.commands_of_type("voice.error")
+            if message.get("turn_id") == "turn-2"
+        ]
+        assert errors == []
+        # 让第二轮正常收尾，避免测试结束时悬挂生成。
+        fake.gate.set()
+        assert await device.send_audio(b"\x78\x12", turn_seq=0) is True
+        assert await device.end_voice("turn-2") is True
+        end = await e2e.app.wait_for(
+            lambda e: e.get("type") == "voice.event"
+            and e.get("event") == "turn_end"
+            and e.get("turn_id") == "turn-2",
+            timeout=8.0,
+        )
+        # fatal busy 也会收尾成 turn_end；必须确认第二轮是正常停止而不是被中断。
+        assert end["finish_reason"] == "stop"
+        assert end["interrupted"] is False
+
+
+async def test_voice_start_reports_busy_while_app_generates(e2e, monkeypatch):
+    import companion.server.app.services.orchestrator as orchestrator_module
+    from companion.server.app.services.orchestrator import get_conversation_lock
+
+    fake = ScriptedDeepSeek([])
+    monkeypatch.setattr(orchestrator_module, "DeepSeekClient", lambda: fake)
+
+    async with install_mock_voice():
+        assistant_id = await e2e.new_assistant("E2E 忙碌角色")
+        conversation_id = await e2e.new_conversation(assistant_id, "E2E 忙碌")
+        device = await e2e.new_device(
+            name="E2E 忙碌机",
+            assistant_id=assistant_id,
+            conversation_id=conversation_id,
+        )
+
+        lock = get_conversation_lock(conversation_id)
+        await lock.acquire()
+        try:
+            assert await device.start_voice("turn-busy") is True
+            error = await device.wait_for(
+                lambda m: m.get("type") == "voice.error", timeout=5.0
+            )
+            assert error["code"] == "busy"
+            assert error["fatal"] is True
+            assert error["turn_id"] == "turn-busy"
+            assert not fake.calls, "busy 时不得开始新一轮生成"
+        finally:
+            lock.release()
+
+
+async def test_voice_start_without_binding_is_rejected(e2e, monkeypatch):
+    import companion.server.app.services.orchestrator as orchestrator_module
+
+    fake = ScriptedDeepSeek([])
+    monkeypatch.setattr(orchestrator_module, "DeepSeekClient", lambda: fake)
+
+    async with install_mock_voice():
+        device = await e2e.new_device(name="E2E 未绑定机")
+
+        assert await device.start_voice("turn-unbound") is True
+        error = await device.wait_for(
+            lambda m: m.get("type") == "voice.error", timeout=5.0
+        )
+        assert error["code"] == "unbound"
+        assert error["fatal"] is True
+        assert not fake.calls
+
+
+async def test_voice_disconnect_persists_interrupted_turn(e2e, monkeypatch):
+    import companion.server.app.services.orchestrator as orchestrator_module
+
+    fake = GatedDeepSeek([content("第一句话。第二句话。")])
+    monkeypatch.setattr(orchestrator_module, "DeepSeekClient", lambda: fake)
+
+    async with install_mock_voice(asr_text="讲个故事"):
+        assistant_id = await e2e.new_assistant("E2E 断线角色")
+        conversation_id = await e2e.new_conversation(assistant_id, "E2E 断线")
+        device = await e2e.new_device(
+            name="E2E 断线机",
+            assistant_id=assistant_id,
+            conversation_id=conversation_id,
+        )
+        await e2e.connect_app()
+
+        assert await device.start_voice("turn-drop") is True
+        assert await device.send_audio(b"\x78\x21", turn_seq=0) is True
+        assert await device.end_voice("turn-drop") is True
+        await device.wait_for(
+            lambda m: m.get("type") == "voice.segment", timeout=8.0
+        )
+        # 生成仍卡在 gate（done 尚未发出），此时断线才能产生“部分回复”。
+        await asyncio.wait_for(fake.reached_gate.wait(), timeout=5.0)
+
+        await device.close()
+
+        offline = await e2e.app.wait_for(
+            lambda e: e.get("type") == "device.status"
+            and e.get("device_id") == device.device_id
+            and e.get("online") is False,
+            timeout=8.0,
+        )
+        assert offline["reason"] == ""
+
+        nodes = await wait_conversation_nodes(
+            conversation_id,
+            lambda ns: any(
+                message.get("interrupted") is True
+                for message in _assistant_messages(ns)
+            ),
+        )
+        interrupted = [
+            message
+            for message in _assistant_messages(nodes)
+            if message.get("interrupted") is True
+        ]
+        assert interrupted, "断线后必须把已生成内容标成 interrupted"
