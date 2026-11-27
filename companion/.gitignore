@@ -6,7 +6,7 @@ __pycache__/
 env/
 venv/
 .venv/
-data/
+/server/data/
 *.db
 *.sqlite3
 *.zip

@@ -46,3 +46,4 @@
 | 24 | 音频 Block A：协议 / 帧 / Ogg / 传输 | ✅ 已完成（已审查修复） | 12B 帧、Ogg mux/demux、`send_bytes/send_audio`、VoiceSession 门控、模拟器二进制、协议 §4.8/§5.4；364 passed、mutation 17/17 |
 | 25 | 音频 Block B：Mock 管线 / 打断 / 落库 / 网关接线 | ✅ 已完成（八轮审查修复） | 流式分句、Mock ASR/TTS、下行节流、完整轮次、barge-in、取消落库、运行时注入、6 例真实 WS 语音 e2e；旧轮清理隔离、每轮 `turn_key` 幂等落库、落库锁内重算下标、取消预算、barge-in 后可立即重开、GeneratorExit 先释放锁、speaker 按轮隔离等修复；403 passed、mutation 15/15 |
 | 26 | 音频 Block C：真实 DashScope 适配器 | ✅ 已完成（三轮审查修复；真实云/真机待办） | ASR WebSocket `fun-asr-realtime`、TTS HTTP SSE `qwen-audio-3.0-tts-flash`、URL/配置/区域、缺 Key 降级、烟测脚本；本地假 WS/SSE 覆盖握手/上行/final/finish 超时/断线/close 竞态/连接异常与完整轮次；**448 passed**、mutation 15/15 + 9/9；真实云与真机未验证 |
+| 27 | Phase 4-4A：Android 工程/登录/加密会话 | ✅ 已完成（两轮审查修复；真机待办） | 独立单模块工程、强制 TLS + debug 本地明文、Keystore AES-GCM 会话、401 清退、429 `Retry-After` 倒计时；App **53 例** + 服务端 4 例；**452 passed**、debug/release 构建成功；端口/点段/IPv4 加固、`device_name`、截止时刻倒计时、Mutex、按 Token 去重（修二次登录 401 失聪）等 11 项 + P1 回归修复；真机/HTTPS 未验证 |

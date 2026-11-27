@@ -6,6 +6,7 @@
 
 from __future__ import annotations
 
+import math
 import time
 from collections import defaultdict, deque
 from threading import Lock
@@ -37,6 +38,25 @@ def current_count(key: str, window_seconds: float, *, now: float | None = None) 
 
 def is_limited(key: str, limit: int, window_seconds: float, *, now: float | None = None) -> bool:
     return current_count(key, window_seconds, now=now) >= limit
+
+
+def retry_after_seconds(
+    key: str, window_seconds: float, *, now: float | None = None
+) -> int:
+    """窗口内最早一条记录过期还需多少秒；窗口为空返回 0。
+
+    用于 `Retry-After`：客户端按这个值倒计时，归零后重试才可能成功。
+    """
+    current = time.monotonic() if now is None else now
+    with _LOCK:
+        bucket = _EVENTS.get(key)
+        if not bucket:
+            return 0
+        _prune(bucket, window_seconds, current)
+        if not bucket:
+            return 0
+        remaining = window_seconds - (current - bucket[0])
+    return max(1, math.ceil(remaining))
 
 
 def record(key: str, window_seconds: float, *, now: float | None = None) -> int:

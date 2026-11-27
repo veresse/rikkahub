@@ -15,7 +15,12 @@ from companion.server.app.database import get_db
 from companion.server.app.models.app_token import AppTokenModel
 from companion.server.app.security.dependencies import AuthContext, require_app_token
 from companion.server.app.security.password import verify_password
-from companion.server.app.security.rate_limit import clear, is_limited, record
+from companion.server.app.security.rate_limit import (
+    clear,
+    is_limited,
+    record,
+    retry_after_seconds,
+)
 from companion.server.app.security.tokens import generate_token, hash_token
 
 router = APIRouter(prefix="/auth", tags=["auth"])
@@ -66,7 +71,14 @@ async def login(req: LoginRequest, request: Request, db: AsyncSession = Depends(
 
     rate_key = f"login:{_client_ip(request)}:{req.username}"
     if is_limited(rate_key, settings.LOGIN_RATE_LIMIT, settings.LOGIN_RATE_WINDOW_SECONDS):
-        raise HTTPException(status_code=429, detail="rate_limited")
+        retry_after = retry_after_seconds(
+            rate_key, settings.LOGIN_RATE_WINDOW_SECONDS
+        )
+        raise HTTPException(
+            status_code=429,
+            detail="rate_limited",
+            headers={"Retry-After": str(retry_after)},
+        )
 
     username_ok = hmac.compare_digest(req.username, settings.ADMIN_USERNAME)
     password_ok = _verify_admin_password(req.password)
