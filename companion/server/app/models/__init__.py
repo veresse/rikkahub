@@ -5,6 +5,7 @@ from companion.server.app.models.memory import MemoryModel
 from companion.server.app.models.device import DeviceModel
 from companion.server.app.models.app_token import AppTokenModel
 from companion.server.app.models.pairing_code import PairingCodeModel
+from companion.server.app.models.app_setting import AppSettingModel
 
 __all__ = [
     "AssistantModel",
@@ -14,4 +15,5 @@ __all__ = [
     "DeviceModel",
     "AppTokenModel",
     "PairingCodeModel",
+    "AppSettingModel",
 ]

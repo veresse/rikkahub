@@ -117,6 +117,59 @@ async def test_list_and_revoke_tokens(client, auth_headers):
     assert after.status_code == 401
 
 
+async def test_list_tokens_hides_revoked_and_expired(client, auth_headers):
+    from sqlalchemy import delete
+
+    from companion.server.app.database import AsyncSessionLocal
+    from companion.server.app.models.app_token import AppTokenModel
+
+    second = await client.post(
+        "/api/auth/login",
+        json={
+            "username": "admin",
+            "password": "test-admin-password",
+            "device_name": "hidden-phone",
+        },
+    )
+    token_id = second.json()["token_id"]
+    revoke = await client.post(
+        f"/api/auth/tokens/{token_id}/revoke", headers=auth_headers
+    )
+    assert revoke.status_code == 200
+
+    listing = (await client.get("/api/auth/tokens", headers=auth_headers)).json()
+    assert all(t["id"] != token_id for t in listing)
+
+    # 重复撤销不能再报成功（App 会误显示一次空操作）。
+    again = await client.post(
+        f"/api/auth/tokens/{token_id}/revoke", headers=auth_headers
+    )
+    assert again.status_code == 404
+    assert again.json()["detail"] == "token_not_found"
+
+    expired_id = "token-expired-for-list-test"
+    async with AsyncSessionLocal() as db:
+        await db.execute(delete(AppTokenModel).where(AppTokenModel.id == expired_id))
+        db.add(
+            AppTokenModel(
+                id=expired_id,
+                username="admin",
+                device_name="expired-phone",
+                token_hash="expired-list-test-hash",
+                created_at=1,
+                expires_at=1,
+            )
+        )
+        await db.commit()
+    try:
+        listing = (await client.get("/api/auth/tokens", headers=auth_headers)).json()
+        assert all(t["id"] != expired_id for t in listing)
+    finally:
+        async with AsyncSessionLocal() as db:
+            await db.execute(delete(AppTokenModel).where(AppTokenModel.id == expired_id))
+            await db.commit()
+
+
 async def test_password_hash_mode(client, monkeypatch):
     from companion.server.app.security.password import hash_password
 

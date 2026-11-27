@@ -33,6 +33,9 @@ private fun encodeRoute(route: AppRoute): String = json.encodeToString(
         type = when (route) {
             AppRoute.Assistants -> "assistants"
             AppRoute.Devices -> "devices"
+            AppRoute.Settings -> "settings"
+            AppRoute.Backup -> "backup"
+            AppRoute.Assets -> "assets"
             is AppRoute.Conversations -> "conversations"
             is AppRoute.Chat -> "chat"
             is AppRoute.Memories -> "memories"
@@ -42,6 +45,9 @@ private fun encodeRoute(route: AppRoute): String = json.encodeToString(
         a = when (route) {
             AppRoute.Assistants -> null
             AppRoute.Devices -> null
+            AppRoute.Settings -> null
+            AppRoute.Backup -> null
+            AppRoute.Assets -> null
             is AppRoute.Conversations -> route.assistantId
             is AppRoute.Chat -> route.conversationId
             is AppRoute.Memories -> route.assistantId
@@ -51,6 +57,9 @@ private fun encodeRoute(route: AppRoute): String = json.encodeToString(
         b = when (route) {
             AppRoute.Assistants -> null
             AppRoute.Devices -> null
+            AppRoute.Settings -> null
+            AppRoute.Backup -> null
+            AppRoute.Assets -> null
             is AppRoute.Conversations -> route.assistantName
             is AppRoute.Chat -> route.assistantId
             is AppRoute.Memories -> route.assistantName
@@ -69,6 +78,9 @@ private fun decodeRoute(encoded: String): AppRoute {
         ?: return AppRoute.Assistants
     return when (record.type) {
         "devices" -> AppRoute.Devices
+        "settings" -> AppRoute.Settings
+        "backup" -> AppRoute.Backup
+        "assets" -> AppRoute.Assets
 
         "remote" -> AppRoute.Remote(
             deviceId = record.a.orEmpty(),

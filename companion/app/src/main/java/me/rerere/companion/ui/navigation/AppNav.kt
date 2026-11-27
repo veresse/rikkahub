@@ -21,6 +21,10 @@ import me.rerere.companion.feature.assistants.AssistantEditScreen
 import me.rerere.companion.feature.assistants.AssistantEditViewModel
 import me.rerere.companion.feature.assistants.AssistantsScreen
 import me.rerere.companion.feature.assistants.AssistantsViewModel
+import me.rerere.companion.feature.assets.AssetsScreen
+import me.rerere.companion.feature.assets.AssetsViewModel
+import me.rerere.companion.feature.backup.BackupScreen
+import me.rerere.companion.feature.backup.BackupViewModel
 import me.rerere.companion.feature.chat.ChatScreen
 import me.rerere.companion.feature.chat.ChatViewModel
 import me.rerere.companion.feature.chat.ConversationsEvent
@@ -35,6 +39,8 @@ import me.rerere.companion.feature.login.LoginScreen
 import me.rerere.companion.feature.login.LoginViewModel
 import me.rerere.companion.feature.remote.RemoteScreen
 import me.rerere.companion.feature.remote.RemoteViewModel
+import me.rerere.companion.feature.settings.SettingsScreen
+import me.rerere.companion.feature.settings.SettingsViewModel
 
 /** 返回节流窗口：同一次连点不弹两级，也不在弹回根页后立刻退出应用。 */
 private const val ROOT_BACK_BLOCK_MILLIS = 400L
@@ -164,7 +170,7 @@ fun AppNav(container: AppContainer) {
                 onEdit = { id -> pushRoute(AppRoute.AssistantEdit(assistantId = id)) },
                 onDelete = assistantsViewModel::delete,
                 onDevices = { pushRoute(AppRoute.Devices) },
-                onLogout = container::logout,
+                onSettings = { pushRoute(AppRoute.Settings) },
             )
         }
 
@@ -222,6 +228,135 @@ fun AppNav(container: AppContainer) {
                         popRoute()
                     }
                 },
+            )
+        }
+
+        AppRoute.Settings -> {
+            val settingsViewModel: SettingsViewModel = viewModel(
+                viewModelStoreOwner = navigationViewModel.ownerFor(route),
+                key = "settings",
+                factory = viewModelFactory {
+                    initializer {
+                        SettingsViewModel(
+                            settingsRepository = container.settingsRepository,
+                            tokenRepository = container.tokenRepository,
+                            sessionManager = container.sessionManager,
+                            isOnline = { container.isOnline.value },
+                        )
+                    }
+                },
+            )
+            val state by settingsViewModel.state.collectAsStateWithLifecycle()
+            // 保存/撤销在途时禁止返回：弹栈会取消请求，结果不确定。
+            val goBack = {
+                val latest = settingsViewModel.state.value
+                if (!latest.saving && latest.revokingId == null &&
+                    backStack.lastOrNull() == route
+                ) {
+                    popRoute()
+                }
+            }
+            BackHandler { goBack() }
+            SettingsScreen(
+                state = state,
+                events = settingsViewModel.events,
+                online = online,
+                currentTokenId = current.tokenId,
+                onBack = goBack,
+                onRefresh = settingsViewModel::load,
+                onLogout = container::logout,
+                onDeepseekBaseUrlChange = settingsViewModel::setDeepseekBaseUrl,
+                onDeepseekModelChange = settingsViewModel::setDeepseekModel,
+                onDeepseekKeyDraftChange = settingsViewModel::setDeepseekKeyDraft,
+                onSaveDeepseek = settingsViewModel::saveDeepseek,
+                onClearDeepseekKey = settingsViewModel::clearDeepseekKey,
+                onDashscopeKeyDraftChange = settingsViewModel::setDashscopeKeyDraft,
+                onDashscopeRegionChange = settingsViewModel::setDashscopeRegion,
+                onDashscopeAsrModelChange = settingsViewModel::setDashscopeAsrModel,
+                onDashscopeTtsModelChange = settingsViewModel::setDashscopeTtsModel,
+                onDashscopeTtsVoiceChange = settingsViewModel::setDashscopeTtsVoice,
+                onVoiceEnabledChange = settingsViewModel::setVoiceEnabled,
+                onVoiceProviderChange = settingsViewModel::setVoiceProvider,
+                onSaveVoice = settingsViewModel::saveVoice,
+                onClearDashscopeKey = settingsViewModel::clearDashscopeKey,
+                onSearchEnabledChange = settingsViewModel::setSearchEnabled,
+                onOpenBackup = { pushRoute(AppRoute.Backup) },
+                onOpenAssets = { pushRoute(AppRoute.Assets) },
+                onRefreshTokens = settingsViewModel::refreshTokens,
+                onRevokeToken = settingsViewModel::revokeToken,
+            )
+        }
+
+        AppRoute.Backup -> {
+            val backupViewModel: BackupViewModel = viewModel(
+                viewModelStoreOwner = navigationViewModel.ownerFor(route),
+                key = "backup",
+                factory = viewModelFactory {
+                    initializer {
+                        BackupViewModel(
+                            repository = container.backupRepository,
+                            isOnline = { container.isOnline.value },
+                        )
+                    }
+                },
+            )
+            val state by backupViewModel.state.collectAsStateWithLifecycle()
+            // 预览/导入/导出在途时禁止返回：弹栈会取消请求，结果不确定。
+            val goBack = {
+                val latest = backupViewModel.state.value
+                if (!latest.previewing && !latest.importing && !latest.exporting &&
+                    backStack.lastOrNull() == route
+                ) {
+                    popRoute()
+                    // 导入可能改动了服务端数据；返回后让角色列表重新拉一次。
+                    assistantsViewModel.refresh()
+                }
+            }
+            BackHandler { goBack() }
+            BackupScreen(
+                state = state,
+                online = online,
+                onPreview = backupViewModel::preview,
+                onExport = backupViewModel::exportTo,
+                onConfirm = backupViewModel::confirm,
+                onDismissError = backupViewModel::dismissError,
+                onBack = goBack,
+            )
+        }
+
+        AppRoute.Assets -> {
+            val assetsViewModel: AssetsViewModel = viewModel(
+                viewModelStoreOwner = navigationViewModel.ownerFor(route),
+                key = "assets",
+                factory = viewModelFactory {
+                    initializer {
+                        AssetsViewModel(
+                            repository = container.assetRepository,
+                            isOnline = { container.isOnline.value },
+                        )
+                    }
+                },
+            )
+            val state by assetsViewModel.state.collectAsStateWithLifecycle()
+            // 首帧随 active 变化重拉；加载完成（active 可能仍为 null）后再拉占位图。
+            LaunchedEffect(state.active?.id, state.loading, online) {
+                if (online && !state.loading) assetsViewModel.loadPreviewImage()
+            }
+            val goBack = {
+                if (!assetsViewModel.state.value.busy && backStack.lastOrNull() == route) {
+                    popRoute()
+                }
+            }
+            BackHandler { goBack() }
+            AssetsScreen(
+                state = state,
+                online = online,
+                onPreview = assetsViewModel::preview,
+                onConfirm = assetsViewModel::confirm,
+                onRollback = assetsViewModel::rollback,
+                onRefresh = assetsViewModel::load,
+                onDismissError = assetsViewModel::dismissError,
+                onBack = goBack,
             )
         }
 

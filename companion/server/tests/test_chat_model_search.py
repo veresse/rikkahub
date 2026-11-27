@@ -120,3 +120,30 @@ async def test_web_search_modes(session, monkeypatch, mode, text, expected_calls
     ]
 
     assert len(calls) == expected_calls
+
+
+async def test_global_search_switch_off_skips_provider(session, monkeypatch):
+    await seed(session, mode="on", enable_web_search=True)
+    calls: list[str] = []
+
+    async def fake_search(query: str):
+        calls.append(query)
+        return [{"title": "should not appear", "url": "https://e.test"}]
+
+    monkeypatch.setattr(search_module.SearchProvider, "search", fake_search)
+    monkeypatch.setattr(orchestrator_module.settings, "SEARCH_ENABLED", False)
+
+    events = [
+        e
+        async for e in ChatOrchestrator.stream_chat(
+            session, CONVERSATION_ID, "讲个故事", client=RecordingClient()
+        )
+    ]
+
+    assert calls == []
+    # 关闭全局搜索后既不能发起检索，也不能留下搜索状态/系统提示。
+    assert not any(
+        e.get("type") == "status" and e.get("status") in {"searching", "search_done"}
+        for e in events
+    )
+    assert "【联网实时搜索结果】" not in str(events)

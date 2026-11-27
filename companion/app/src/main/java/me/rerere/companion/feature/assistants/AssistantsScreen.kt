@@ -59,7 +59,7 @@ fun AssistantsScreen(
     onEdit: (String) -> Unit,
     onDelete: (String) -> Unit,
     onDevices: () -> Unit,
-    onLogout: () -> Unit,
+    onSettings: () -> Unit,
 ) {
     val snackbarHostState = remember { SnackbarHostState() }
     LaunchedEffect(events) {
@@ -81,11 +81,11 @@ fun AssistantsScreen(
                         TextButton(onClick = onDevices) {
                             Text("设备")
                         }
+                        TextButton(onClick = onSettings) {
+                            Text("设置")
+                        }
                         TextButton(onClick = onRefresh, enabled = online && !state.loading) {
                             Text("刷新")
-                        }
-                        TextButton(onClick = onLogout) {
-                            Text("退出")
                         }
                     },
                 )

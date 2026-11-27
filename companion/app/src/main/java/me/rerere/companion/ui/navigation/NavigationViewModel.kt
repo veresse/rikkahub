@@ -49,6 +49,9 @@ private class RouteViewModelStoreOwner : ViewModelStoreOwner {
 fun AppRoute.viewModelKey(): String = when (this) {
     AppRoute.Assistants -> "assistants"
     AppRoute.Devices -> "devices"
+    AppRoute.Settings -> "settings"
+    AppRoute.Backup -> "backup"
+    AppRoute.Assets -> "assets"
     is AppRoute.Conversations -> "conversations:$assistantId"
     is AppRoute.Chat -> "chat:$conversationId"
     is AppRoute.Memories -> "memories:$assistantId"

@@ -24,8 +24,19 @@ logger = logging.getLogger(__name__)
 
 router = APIRouter()
 device_gateway = DeviceGateway()
-device_gateway.set_voice_runtime(build_voice_runtime(bus=device_gateway.bus))
 app_gateway = AppGateway()
+
+
+def rebuild_voice_runtime() -> None:
+    """按当前 `settings`（含 4D 的 DB 覆盖）重建语音运行时。
+
+    启动时 `build_voice_runtime()` 早于 DB 覆盖加载，只能先建一次；`lifespan`
+    与设置写入后都必须调用本函数，否则新 Key/开关要等进程重启。
+    """
+    device_gateway.set_voice_runtime(build_voice_runtime(bus=device_gateway.bus))
+
+
+rebuild_voice_runtime()
 
 
 class StarletteChannel:

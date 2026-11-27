@@ -2,6 +2,10 @@
 
 本目录用于记录「实体语音陪伴机器人（第二代）」迁移过程中每一次代码修改、测试结果、决策与遗留问题，便于后续代码管理与审核。
 
+> **分支历史说明**：2026-11-27 已把 Phase 3 及之后的细粒度提交按阶段压缩为 6 个提交。
+> 各日志表格里出现的 8 位哈希是压缩前的提交号，仅作当时的审查记录；压缩前的完整历史
+> 保留在本地分支 `backup/pre-squash-2026-11-27`。
+
 ## 约定
 
 - 每次修改一个「区块（Block）」写一份日志：`NN_<block>.md`，编号递增。
@@ -50,3 +54,4 @@
 | 28 | Phase 4-4B（上）：服务端 + App 基础设施 | ✅ 已完成（含 App 审查修复；Task 9 见 29） | 角色 `model_id`/`web_search_mode`、`client_msg_id` 幂等、`turn_state` 广播、转写纠正 PUT；App REST 仓库/SSE/WS/角色页；SSE `Call.cancel()` 真断连、120s 空闲超时、离线门控、WS 30s 稳定退避、401 按 Token 去重、`avatar` 保全；服务端 **425 passed**、App **100 例**、双构建成功 |
 | 29 | Phase 4-4B（下）：App 会话列表 / 流式聊天 / 记忆 / 导航作用域 | ✅ 已完成（三轮 App 审查修复；真机待办） | 按路由 `ViewModelStore`（弹栈即取消 SSE）、导航栈与 Token 混合恢复、`isOnline` 写守卫、SSE 终态后 IO 抑制与 429 倒计时、WS 断线清 `turnStates`、写请求在途禁止弹栈、列表代次防「复活」、服务端 `turn_end` 补 `conversation_id` 且先发事件再清理、`ErrorMapper` 文案收敛；App **19 suites / 137 例**、服务端 **425 passed**、debug/release 构建成功；真机/真实流式未验证 |
 | 30 | Phase 4-4C：设备列表 / 遥控 | ✅ 已完成（三轮审查修复；真机待办） | 服务端 `GET /api/devices` 每项 `online`（撤销即离线）；App WS 可写句柄与 `send()`、重连清设备缓存/重拉快照；设备页（配对码倒计时/改名/绑定/撤销墓碑/WS 在线合并与 REST 回退）；遥控命令构造与 200ms 防抖、ack≠成功（按 `action_id` 等 `action.result`）、急停结算在途动作、5s ack / 15s 软超时 / 45s 硬结算、校准草稿冻结、离线门控、结果条按动作序号裁决；App **24 suites / 223 例**、服务端 **427 passed**、debug/release 构建成功；真机与真实舵机未验证 |
+| 31 | Phase 4-4D：设置 / Token、备份、素材包 | ✅ 已完成（七轮审查修复；真机待办） | 服务端 `app_settings` + AES-GCM、设置/密钥端点与 `SEARCH_ENABLED` 门控、Token 列表过滤撤销/过期、备份预览/导入/导出（TTL/owner/限流/413 早退/临时目录清理）、素材包 ZIP 校验与启用/回滚/取帧；App 设置页（Key 只写不回显）、备份页、素材页（上传/确认/回滚/首帧）、`Settings/Backup/Assets` 路由；语音运行时按配置指纹热替换（锁内快照，原值保存不打断通话）、chunked 上传边读边限、导入失败可重试、素材首帧防串包、刷新/确认竞态防护；服务端 **506 passed / 1 既有失败**、App **34 suites / 278 例**、debug/release 构建成功；真机与真实云未验证 |

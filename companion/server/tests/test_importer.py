@@ -1,3 +1,4 @@
+import asyncio
 import json
 import sqlite3
 import zipfile
@@ -151,7 +152,7 @@ def test_validator_and_parser(sample_backup_zip: Path, tmp_path: Path):
 @pytest.mark.asyncio
 async def test_import_service(sample_backup_zip: Path, tmp_path: Path):
     # 测试预览报告生成
-    preview = ImportService.generate_preview(sample_backup_zip)
+    preview = ImportService.generate_preview(sample_backup_zip, "test-owner")
     assert preview["summary"]["assistant_count"] == 1
     assert preview["summary"]["conversation_count"] == 1
     assert preview["summary"]["message_node_count"] == 1
@@ -166,7 +167,7 @@ async def test_import_service(sample_backup_zip: Path, tmp_path: Path):
         
     async_session = async_sessionmaker(test_engine, class_=AsyncSession, expire_on_commit=False)
     async with async_session() as session:
-        result = await ImportService.execute_import(preview["preview_id"], session)
+        result = await ImportService.execute_import(preview["preview_id"], "test-owner", session)
         assert result["status"] == "success"
         assert result["imported_assistants"] == 1
         assert result["imported_conversations"] == 1
@@ -192,6 +193,75 @@ def _make_settings_backup(path: Path, **assistant_fields) -> Path:
 
 
 @pytest.mark.asyncio
+async def test_failed_import_keeps_preview_for_retry(
+    sample_backup_zip: Path, tmp_path: Path
+):
+    """DB 写入失败不能被伪装成 preview_expired，也不能丢掉预览。"""
+    from companion.server.app.importer import service as importer_service
+
+    preview = ImportService.generate_preview(sample_backup_zip, "test-owner")
+    preview_id = preview["preview_id"]
+    entry = importer_service._PREVIEW_CACHE[preview_id]
+    good_memories = list(entry["data"]["parsed_data"]["memories"])
+
+    test_engine = create_async_engine(
+        f"sqlite+aiosqlite:///{(tmp_path / 'retry.db').as_posix()}"
+    )
+    async with test_engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    async_session = async_sessionmaker(
+        test_engine, class_=AsyncSession, expire_on_commit=False
+    )
+
+    try:
+        # 未知列会让 MemoryModel(**m) 在事务里抛 TypeError。
+        entry["data"]["parsed_data"]["memories"] = [
+            {"content": "x", "bogus_column": 1}
+        ]
+        async with async_session() as session:
+            with pytest.raises(TypeError):
+                await ImportService.execute_import(preview_id, "test-owner", session)
+
+        assert preview_id in importer_service._PREVIEW_CACHE
+        assert importer_service._PREVIEW_CACHE[preview_id]["claimed"] is False
+
+        entry["data"]["parsed_data"]["memories"] = good_memories
+        async with async_session() as session:
+            result = await ImportService.execute_import(
+                preview_id, "test-owner", session
+            )
+        assert result["status"] == "success"
+        assert result["imported_memories"] == 1
+        assert preview_id not in importer_service._PREVIEW_CACHE
+    finally:
+        importer_service._PREVIEW_CACHE.pop(preview_id, None)
+        await test_engine.dispose()
+
+
+@pytest.mark.asyncio
+async def test_cancelled_import_releases_preview(sample_backup_zip: Path):
+    """取消（CancelledError）也要解除占用，重试不能误报 preview_expired。"""
+    from companion.server.app.importer import service as importer_service
+
+    preview = ImportService.generate_preview(sample_backup_zip, "owner")
+    preview_id = preview["preview_id"]
+
+    class _CancellingDb:
+        def begin(self):
+            raise asyncio.CancelledError()
+
+    try:
+        with pytest.raises(asyncio.CancelledError):
+            await ImportService.execute_import(
+                preview_id, "owner", _CancellingDb()
+            )
+        assert preview_id in importer_service._PREVIEW_CACHE
+        assert importer_service._PREVIEW_CACHE[preview_id]["claimed"] is False
+    finally:
+        importer_service._PREVIEW_CACHE.pop(preview_id, None)
+
+
+@pytest.mark.asyncio
 async def test_web_search_mode_and_model_survive_import(tmp_path: Path):
     """新导出的 webSearchMode=on 不能被回退成 auto，已存在角色的 model_id 也要更新。"""
     test_engine = create_async_engine(
@@ -210,9 +280,10 @@ async def test_web_search_mode_and_model_survive_import(tmp_path: Path):
                 enableWebSearch=False,
                 webSearchMode="on",
                 chatModelId="deepseek-reasoner",
-            )
+            ),
+            "test-owner",
         )
-        await ImportService.execute_import(first["preview_id"], session)
+        await ImportService.execute_import(first["preview_id"], "test-owner", session)
 
     async with async_session() as session:
         assistant = await session.get(AssistantModel, "asst-web")
@@ -226,10 +297,11 @@ async def test_web_search_mode_and_model_survive_import(tmp_path: Path):
             tmp_path / "second.zip",
             webSearchMode="auto",
             chatModelId="deepseek-chat",
-        )
+        ),
+        "test-owner",
     )
     async with async_session() as session:
-        await ImportService.execute_import(second["preview_id"], session)
+        await ImportService.execute_import(second["preview_id"], "test-owner", session)
 
     async with async_session() as session:
         assistant = await session.get(AssistantModel, "asst-web")

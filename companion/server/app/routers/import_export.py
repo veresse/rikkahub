@@ -1,73 +1,126 @@
-import io
 import json
+import logging
 import os
 import shutil
 import sqlite3
 import tempfile
 import zipfile
+from datetime import datetime
 from pathlib import Path
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File
 from fastapi.responses import FileResponse
+from starlette.background import BackgroundTask
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from pydantic import BaseModel
 
+from companion.server.app.config import settings
 from companion.server.app.database import get_db
 from companion.server.app.importer.service import ImportService
 from companion.server.app.models.assistant import AssistantModel
 from companion.server.app.models.conversation import ConversationModel
 from companion.server.app.models.message_node import MessageNodeModel
 from companion.server.app.models.memory import MemoryModel
+from companion.server.app.security.dependencies import AuthContext, require_app_token
 
 router = APIRouter(prefix="/backup", tags=["backup"])
+
+logger = logging.getLogger(__name__)
+
+_UPLOAD_CHUNK_BYTES = 64 * 1024
+
 
 class ImportConfirmRequest(BaseModel):
     preview_id: str
 
+
 @router.post("/preview")
-async def preview_backup(file: UploadFile = File(...)):
+async def preview_backup(
+    file: UploadFile = File(...),
+    auth: AuthContext = Depends(require_app_token),
+):
     """
-    上传 RikkaHub 备份包 (ZIP)，生成预览报告，不直接入库
+    上传 RikkaHub 备份包 (ZIP)，生成预览报告，不直接入库。
+
+    上传按块写入临时文件并计数：超过 `MAX_UPLOAD_SIZE_BYTES` 立即 413，
+    不把超大包整个读进内存。预览结果只属于当前 Token。
     """
-    if not file.filename.endswith(".zip"):
+    if not (file.filename or "").lower().endswith(".zip"):
         raise HTTPException(status_code=400, detail="必须上传 .zip 格式的备份文件")
 
-    # 存入临时文件
-    with tempfile.NamedTemporaryFile(delete=False, suffix=".zip") as tmp:
-        shutil.copyfileobj(file.file, tmp)
-        tmp_path = Path(tmp.name)
-
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".zip")
+    tmp_path = Path(tmp.name)
     try:
-        report = ImportService.generate_preview(tmp_path)
+        copied = 0
+        while True:
+            chunk = file.file.read(_UPLOAD_CHUNK_BYTES)
+            if not chunk:
+                break
+            copied += len(chunk)
+            if copied > settings.MAX_UPLOAD_SIZE_BYTES:
+                raise HTTPException(status_code=413, detail="file_too_large")
+            tmp.write(chunk)
+        tmp.close()
+
+        report = ImportService.generate_preview(tmp_path, auth.token_id)
         return report
+    except HTTPException:
+        raise
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"解析备份文件失败: {str(e)}")
+        # 不回显异常原文：SQLAlchemy/解析器的消息可能带备份内容或参数。
+        # 只记录异常类型，不回显任何正文/Key。
+        logger.warning("backup preview failed: %s", type(e).__name__)
+        raise HTTPException(status_code=400, detail="backup_parse_failed")
     finally:
+        try:
+            tmp.close()
+        except Exception:
+            pass
         if tmp_path.exists():
             os.remove(tmp_path)
 
+
 @router.post("/confirm")
-async def confirm_import(req: ImportConfirmRequest, db: AsyncSession = Depends(get_db)):
+async def confirm_import(
+    req: ImportConfirmRequest,
+    db: AsyncSession = Depends(get_db),
+    auth: AuthContext = Depends(require_app_token),
+):
     """
-    用户在网页核对预览报告无误后，点击确认，在单个事务内批量落库
+    用户在网页核对预览报告无误后，点击确认，在单个事务内批量落库。
     """
     try:
-        res = await ImportService.execute_import(req.preview_id, db)
+        res = await ImportService.execute_import(req.preview_id, auth.token_id, db)
         return res
+    except ValueError as e:
+        # 只有预览守卫自己的错误码才是“过期”；其它 ValueError 是导入过程
+        # 出错，不能伪装成过期（否则用户会被要求重新上传备份）。
+        if str(e) == "preview_expired":
+            raise HTTPException(status_code=400, detail="preview_expired")
+        logger.warning("backup import failed: ValueError")
+        raise HTTPException(status_code=400, detail="import_failed")
     except Exception as e:
-        raise HTTPException(status_code=400, detail=f"导入数据失败: {str(e)}")
+        logger.warning("backup import failed: %s", type(e).__name__)
+        raise HTTPException(status_code=400, detail="import_failed")
+
 
 @router.get("/export")
-async def export_backup(db: AsyncSession = Depends(get_db)):
+async def export_backup(
+    db: AsyncSession = Depends(get_db),
+    auth: AuthContext = Depends(require_app_token),
+):
     """
-    将当前服务器 SQLite 中的全部角色、会话、分支消息树与记忆打包成标准 RikkaHub 兼容 ZIP 供下载
+    将当前服务器 SQLite 中的全部角色、会话、分支消息树与记忆打包成标准 RikkaHub 兼容 ZIP 供下载。
+
+    临时目录在响应发送完毕后由后台任务删除；构造失败时也会清理。
     """
     temp_dir = Path(tempfile.mkdtemp(prefix="export_"))
+    conn: sqlite3.Connection | None = None
     try:
         # 1. 导出 settings.json
         ast_res = await db.execute(select(AssistantModel))
         assistants = ast_res.scalars().all()
-        
+
         settings_assistants = []
         for a in assistants:
             # 优先从 raw_snapshot 中恢复完整数据，并同步更新修改过的核心字段
@@ -156,6 +209,7 @@ async def export_backup(db: AsyncSession = Depends(get_db)):
 
         conn.commit()
         conn.close()
+        conn = None
 
         # 3. 压缩成 ZIP
         zip_output = temp_dir / "rikkahub_backup_export.zip"
@@ -163,10 +217,22 @@ async def export_backup(db: AsyncSession = Depends(get_db)):
             zf.write(settings_json_path, "settings.json")
             zf.write(export_db_path, "rikka_hub.db")
 
+        filename = f"rikkahub_backup_{datetime.now():%Y%m%d}.zip"
         return FileResponse(
             zip_output,
-            filename="rikkahub_backup_server.zip",
-            media_type="application/zip"
+            filename=filename,
+            media_type="application/zip",
+            # 发送完毕后删除临时目录，避免导出目录越积越多。
+            background=BackgroundTask(shutil.rmtree, temp_dir, True),
         )
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"导出备份失败: {str(e)}")
+        # 失败时先关掉 sqlite 句柄再删目录：Windows 上句柄未关会让 rmtree
+        # 静默失败，导出目录会越积越多。
+        if conn is not None:
+            try:
+                conn.close()
+            except Exception:
+                pass
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        logger.warning("backup export failed: %s", type(e).__name__)
+        raise HTTPException(status_code=500, detail="export_failed")

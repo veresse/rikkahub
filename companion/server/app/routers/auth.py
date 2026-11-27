@@ -129,7 +129,17 @@ async def list_tokens(
     auth: AuthContext = Depends(require_app_token),
     db: AsyncSession = Depends(get_db),
 ):
-    result = await db.execute(select(AppTokenModel).order_by(AppTokenModel.created_at.desc()))
+    # 只列仍然有效的登录（未撤销、未过期）；撤销/过期的行保留在库里
+    # 供审计，但不能再出现在设备管理列表里。
+    now = _now_ms()
+    result = await db.execute(
+        select(AppTokenModel)
+        .where(
+            AppTokenModel.revoked_at.is_(None),
+            AppTokenModel.expires_at > now,
+        )
+        .order_by(AppTokenModel.created_at.desc())
+    )
     tokens = result.scalars().all()
     return [
         TokenView(
@@ -151,11 +161,15 @@ async def revoke_token(
     auth: AuthContext = Depends(require_app_token),
     db: AsyncSession = Depends(get_db),
 ):
-    await db.execute(
+    result = await db.execute(
         update(AppTokenModel)
         .where(AppTokenModel.id == token_id, AppTokenModel.revoked_at.is_(None))
         .values(revoked_at=_now_ms())
     )
+    if result.rowcount == 0:
+        # 已撤销 / 不存在：不能再报成功，否则 App 会显示一次空操作成功。
+        await db.rollback()
+        raise HTTPException(status_code=404, detail="token_not_found")
     await db.commit()
     await _close_ws_connections(token_id)
     return {"status": "revoked", "token_id": token_id}

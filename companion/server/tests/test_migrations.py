@@ -61,19 +61,33 @@ def test_empty_database_round_trip(tmp_path):
     } <= cols
     assert "enable_action_sync" in table_columns(db_path, "assistants")
     assert "web_search_mode" in table_columns(db_path, "assistants")
-    assert {"app_tokens", "pairing_codes"} <= table_names(db_path)
+    assert {"app_tokens", "pairing_codes", "app_settings", "asset_packages"} <= table_names(db_path)
 
-    command.downgrade(cfg, "-1")
-    assert "web_search_mode" not in table_columns(db_path, "assistants")
+    # 4D 的 0005 只加素材包表；按 revision 显式回退，避免“head-1”随新迁移漂移。
+    command.downgrade(cfg, "0004_app_settings")
+    assert "asset_packages" not in table_names(db_path)
+    assert "app_settings" in table_names(db_path)
+
+    # 0004 只加设置表。
+    command.downgrade(cfg, "0003_assistant_model_search")
+    assert "app_settings" not in table_names(db_path)
+    assert "web_search_mode" in table_columns(db_path, "assistants")
     assert "app_tokens" in table_names(db_path)
 
-    command.downgrade(cfg, "-1")
+    command.downgrade(cfg, "0002_v2_actions_auth")
+    assert "web_search_mode" not in table_columns(db_path, "assistants")
+    assert "app_tokens" in table_names(db_path)
+    assert "enable_action_sync" in table_columns(db_path, "assistants")
+
+    command.downgrade(cfg, "0001_v1_baseline")
     assert "app_tokens" not in table_names(db_path)
     assert "enable_action_sync" not in table_columns(db_path, "assistants")
 
     command.upgrade(cfg, "head")
     assert "app_tokens" in table_names(db_path)
     assert "web_search_mode" in table_columns(db_path, "assistants")
+    assert "app_settings" in table_names(db_path)
+    assert "asset_packages" in table_names(db_path)
 
 
 def test_0003_backfills_web_search_mode(tmp_path):

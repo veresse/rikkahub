@@ -619,8 +619,30 @@ class DeviceGateway:
         self._shutting_down = False
 
     def set_voice_runtime(self, runtime: Any | None) -> None:
-        """启动时注入语音运行时；None 表示关闭语音管线。"""
+        """启动时注入语音运行时；None 表示关闭语音管线。
+
+        已连接的 `DeviceSession` 也立即改用新运行时：否则改 Key/关闭语音都要
+        等设备重连。`VoiceSession` 在构造时捕获当轮的运行时/配置，空闲（IDLE）
+        并不会关闭它，所以运行时一旦更换就必须关掉旧会话，让下一轮
+        `voice.start` 按新 Key/模型重建；否则已连接设备会一直用旧 Key。
+        """
+        previous = self._voice_runtime
         self._voice_runtime = runtime
+        changed = runtime is not previous
+        for session in list(self._sessions):
+            session.voice_runtime = runtime
+            if not changed or session.voice is None:
+                continue
+            try:
+                asyncio.get_running_loop().create_task(session.close_voice())
+            except RuntimeError:
+                # 没有事件循环（同步测试/解释器退出）：直接丢弃旧会话，
+                # 下一轮会按新运行时重建。
+                session.voice = None
+                begin = session._voice_begin_task
+                session._voice_begin_task = None
+                if begin is not None and not begin.done():
+                    begin.cancel()
 
     def open_for_connections(self) -> None:
         """应用（重新）启动时允许注册新链路。

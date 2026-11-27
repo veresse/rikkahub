@@ -9,17 +9,25 @@ import kotlinx.coroutines.launch
 import me.rerere.companion.BuildConfig
 import me.rerere.companion.data.api.RetrofitApiFactory
 import me.rerere.companion.data.repo.AssistantRepository
+import me.rerere.companion.data.repo.AssetRepository
 import me.rerere.companion.data.repo.AuthRepository
+import me.rerere.companion.data.repo.BackupRepository
 import me.rerere.companion.data.repo.ChatRepository
 import me.rerere.companion.data.repo.ConversationRepository
 import me.rerere.companion.data.repo.DeviceRepository
 import me.rerere.companion.data.repo.HttpAssistantRepository
+import me.rerere.companion.data.repo.HttpAssetRepository
 import me.rerere.companion.data.repo.HttpAuthRepository
+import me.rerere.companion.data.repo.HttpBackupRepository
 import me.rerere.companion.data.repo.HttpChatRepository
 import me.rerere.companion.data.repo.HttpConversationRepository
 import me.rerere.companion.data.repo.HttpDeviceRepository
 import me.rerere.companion.data.repo.HttpMemoryRepository
+import me.rerere.companion.data.repo.HttpSettingsRepository
+import me.rerere.companion.data.repo.HttpTokenRepository
 import me.rerere.companion.data.repo.MemoryRepository
+import me.rerere.companion.data.repo.SettingsRepository
+import me.rerere.companion.data.repo.TokenRepository
 import me.rerere.companion.data.session.Clock
 import me.rerere.companion.data.session.SessionManager
 import me.rerere.companion.data.store.KeystoreSecureStore
@@ -62,6 +70,14 @@ class AppContainer(
         HttpChatRepository(apiFactory, sessionManager)
     val deviceRepository: DeviceRepository =
         HttpDeviceRepository(apiFactory, sessionManager)
+    val settingsRepository: SettingsRepository =
+        HttpSettingsRepository(apiFactory, sessionManager)
+    val tokenRepository: TokenRepository =
+        HttpTokenRepository(apiFactory, sessionManager)
+    val backupRepository: BackupRepository =
+        HttpBackupRepository(apiFactory, sessionManager)
+    val assetRepository: AssetRepository =
+        HttpAssetRepository(apiFactory, sessionManager)
 
     val appWsManager: AppWsManager = AppWsManager(
         connector = OkHttpWsConnector(),

@@ -69,6 +69,9 @@ class Settings(BaseSettings):
     DEEPSEEK_API_KEY: str = ""
     DEEPSEEK_BASE_URL: str = "https://api.deepseek.com"
     DEEPSEEK_DEFAULT_MODEL: str = "deepseek-chat"
+    # 仅测试/自建代理需要：允许把 API 发往非 deepseek.com 域名。
+    # 默认关闭，避免普通 App Token 把已保存的 Key 引到攻击者主机。
+    DEEPSEEK_ALLOW_CUSTOM_BASE_URL: bool = False
 
     # 语音云服务 (阿里云百炼)
     DASHSCOPE_API_KEY: str = ""
@@ -98,6 +101,9 @@ class Settings(BaseSettings):
     # 下行 TTS 帧长；与设备 hello 请求不同时以本值为准并附 warning。
     VOICE_DOWNLINK_FRAME_MS: int = 60
 
+    # 联网搜索总开关；角色级 web_search_mode 仍决定是否触发。
+    SEARCH_ENABLED: bool = True
+
     # 动作编排限制
     MAX_ACTIONS_PER_TURN: int = 3
     ACTION_RESULT_TIMEOUT_EXTRA_MS: int = 1500
@@ -115,6 +121,12 @@ class Settings(BaseSettings):
     # 限制与配额 (防 Zip 炸弹和滥用)
     MAX_UPLOAD_SIZE_BYTES: int = 100 * 1024 * 1024  # 100 MB
     MAX_ZIP_EXTRACTED_BYTES: int = 500 * 1024 * 1024  # 500 MB
+
+    # 4D 素材包：仓库里的 ZIP 与解压后都单独设上限，避免复用备份的大额度。
+    ASSET_MAX_ARCHIVE_BYTES: int = 10 * 1024 * 1024
+    ASSET_MAX_EXTRACTED_BYTES: int = 20 * 1024 * 1024
+    ASSET_MAX_FRAMES: int = 240
+    ASSET_MAX_FRAME_BYTES: int = 512 * 1024
 
     @property
     def database_url(self) -> str:

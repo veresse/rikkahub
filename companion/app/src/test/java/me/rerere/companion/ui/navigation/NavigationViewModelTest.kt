@@ -60,6 +60,9 @@ class NavigationViewModelTest {
             AppRoute.AssistantEdit(null, "instance-2"),
             AppRoute.Devices,
             AppRoute.Remote("d1", "客厅机器人"),
+            AppRoute.Settings,
+            AppRoute.Backup,
+            AppRoute.Assets,
         )
 
         routes.forEach { route ->
@@ -83,6 +86,10 @@ class NavigationViewModelTest {
             AppRoute.Remote("d2", "书房机器人").viewModelKey(),
         )
         assertNotEquals(AppRoute.Devices.viewModelKey(), chat.viewModelKey())
+        assertEquals("backup", AppRoute.Backup.viewModelKey())
+        assertNotEquals(AppRoute.Backup.viewModelKey(), AppRoute.Settings.viewModelKey())
+        assertEquals("assets", AppRoute.Assets.viewModelKey())
+        assertNotEquals(AppRoute.Assets.viewModelKey(), AppRoute.Backup.viewModelKey())
     }
 
     @Test

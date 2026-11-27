@@ -4,11 +4,14 @@ package me.rerere.companion.ui.navigation
  * 手写导航栈的路由表。
  *
  * 4B 用 [Assistants]/[Conversations]/[Chat]/[Memories]/[AssistantEdit]；
- * 4C 追加 [Devices] 与 [Remote]。
+ * 4C 追加 [Devices] 与 [Remote]；4D 追加 [Settings]、[Backup] 与 [Assets]。
  */
 sealed interface AppRoute {
     data object Assistants : AppRoute
     data object Devices : AppRoute
+    data object Settings : AppRoute
+    data object Backup : AppRoute
+    data object Assets : AppRoute
     data class Conversations(val assistantId: String, val assistantName: String) : AppRoute
     data class Chat(
         val conversationId: String,

@@ -5,10 +5,11 @@ from fastapi import Depends, FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from companion.server.app.config import settings
-from companion.server.app.database import init_db
+from companion.server.app.database import AsyncSessionLocal, init_db
 from companion.server.app.routers import (
     actions,
     assistants,
+    assets,
     auth,
     chat,
     conversations,
@@ -16,6 +17,7 @@ from companion.server.app.routers import (
     import_export,
     memories,
     app_update,
+    settings as settings_router,
     ws,
 )
 from companion.server.app.security.dependencies import require_app_token
@@ -24,12 +26,15 @@ from companion.server.app.services.application_shutdown import (
     LIFESPAN_SHUTDOWN_TIMEOUT_SECONDS,
     bounded_shutdown_application,
 )
+from companion.server.app.services.upload_limits import ContentLengthLimitMiddleware
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # 服务启动时执行 Alembic 迁移到 head
     await init_db()
+    # 迁移后加载 DB 里的设置覆盖（API Key 等），再开放请求处理。
+    await prepare_settings_runtime()
     # 同进程重新运行 lifespan（测试/嵌入式）时复位停机标志，否则所有握手都会被
     # 上一次停机的 `_shutting_down` 拒绝。
     ws.device_gateway.open_for_connections()
@@ -40,6 +45,19 @@ async def lifespan(app: FastAPI):
     await bounded_shutdown_application(
         LIFESPAN_SHUTDOWN_TIMEOUT_SECONDS, source="lifespan shutdown"
     )
+
+
+async def prepare_settings_runtime() -> None:
+    """加载 DB 覆盖并按其重建语音运行时。
+
+    `ws.py` 导入时已按环境变量建过运行时；DB 覆盖加载后必须重建，否则 4D
+    保存的语音 Key/开关要等进程重启才生效。启动与测试共用本函数。
+    """
+    from companion.server.app.services.app_settings import AppSettingsService
+
+    async with AsyncSessionLocal() as session:
+        await AppSettingsService.load_and_apply(session)
+    ws.rebuild_voice_runtime()
 
 
 app = FastAPI(
@@ -58,6 +76,21 @@ if settings.CORS_ALLOW_ORIGINS:
         allow_headers=["*"],
     )
 
+# 上传体积早退：必须在路由读取 multipart 之前按 Content-Length 拒绝。
+app.add_middleware(
+    ContentLengthLimitMiddleware,
+    rules={
+        "/api/backup/preview": (
+            lambda: settings.MAX_UPLOAD_SIZE_BYTES,
+            "file_too_large",
+        ),
+        "/api/assets/preview": (
+            lambda: settings.ASSET_MAX_ARCHIVE_BYTES,
+            "archive_too_large",
+        ),
+    },
+)
+
 # 注册 API 路由
 api_prefix = "/api"
 app_protected = [Depends(require_app_token)]
@@ -70,6 +103,8 @@ app.include_router(chat.router, prefix=api_prefix, dependencies=app_protected)
 app.include_router(import_export.router, prefix=api_prefix, dependencies=app_protected)
 app.include_router(actions.router, prefix=api_prefix, dependencies=app_protected)
 app.include_router(app_update.router, prefix=api_prefix, dependencies=app_protected)
+app.include_router(settings_router.router, prefix=api_prefix, dependencies=app_protected)
+app.include_router(assets.router, prefix=api_prefix, dependencies=app_protected)
 # devices 内部混有公开配对端点，鉴权按端点声明
 app.include_router(devices.router, prefix=api_prefix)
 

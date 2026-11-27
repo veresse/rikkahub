@@ -546,14 +546,18 @@ class ChatOrchestrator:
                 snapshot["all_nodes"] = all_nodes
 
             # 联网搜索三态：off 不搜；auto 走关键词触发；on 每轮强制。
+            # 另外受服务端总开关约束（关闭时不触网、不注入检索结果）。
             search_mode = getattr(assistant, "web_search_mode", None) or (
                 "auto" if assistant.enable_web_search else "off"
             )
-            should_search = search_mode == "on" or (
-                search_mode == "auto"
-                and any(
-                    w in user_text
-                    for w in ["今天", "新闻", "天气", "最新", "查一下", "搜索"]
+            should_search = settings.SEARCH_ENABLED and (
+                search_mode == "on"
+                or (
+                    search_mode == "auto"
+                    and any(
+                        w in user_text
+                        for w in ["今天", "新闻", "天气", "最新", "查一下", "搜索"]
+                    )
                 )
             )
             if should_search:
