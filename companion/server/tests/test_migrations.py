@@ -60,7 +60,12 @@ def test_empty_database_round_trip(tmp_path):
         "token_hash",
     } <= cols
     assert "enable_action_sync" in table_columns(db_path, "assistants")
+    assert "web_search_mode" in table_columns(db_path, "assistants")
     assert {"app_tokens", "pairing_codes"} <= table_names(db_path)
+
+    command.downgrade(cfg, "-1")
+    assert "web_search_mode" not in table_columns(db_path, "assistants")
+    assert "app_tokens" in table_names(db_path)
 
     command.downgrade(cfg, "-1")
     assert "app_tokens" not in table_names(db_path)
@@ -68,6 +73,35 @@ def test_empty_database_round_trip(tmp_path):
 
     command.upgrade(cfg, "head")
     assert "app_tokens" in table_names(db_path)
+    assert "web_search_mode" in table_columns(db_path, "assistants")
+
+
+def test_0003_backfills_web_search_mode(tmp_path):
+    db_path = tmp_path / "backfill.db"
+    cfg = make_config(db_path)
+
+    command.upgrade(cfg, "0002_v2_actions_auth")
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        "INSERT INTO assistants (id, name, avatar, system_prompt, context_message_limit, "
+        "enable_memory, use_global_memory, enable_web_search, enable_action_sync, raw_snapshot) "
+        "VALUES ('on-1', '开搜索', '{}', '', 0, 0, 0, 1, 1, '{}')"
+    )
+    conn.execute(
+        "INSERT INTO assistants (id, name, avatar, system_prompt, context_message_limit, "
+        "enable_memory, use_global_memory, enable_web_search, enable_action_sync, raw_snapshot) "
+        "VALUES ('off-1', '关搜索', '{}', '', 0, 0, 0, 0, 1, '{}')"
+    )
+    conn.commit()
+    conn.close()
+
+    command.upgrade(cfg, "head")
+
+    conn = sqlite3.connect(db_path)
+    rows = dict(conn.execute("SELECT id, web_search_mode FROM assistants").fetchall())
+    conn.close()
+
+    assert rows == {"on-1": "auto", "off-1": "off"}
 
 
 def test_v1_database_upgrade_preserves_data(tmp_path):

@@ -15,6 +15,10 @@ class TestHttpServer : AutoCloseable {
         private set
     var lastRequestBody: String = ""
         private set
+    var lastRequestMethod: String = ""
+        private set
+    var lastRequestUri: String = ""
+        private set
 
     val baseUrl: String
         get() = "http://127.0.0.1:${server.address.port}/"
@@ -22,6 +26,8 @@ class TestHttpServer : AutoCloseable {
     init {
         server.createContext("/") { exchange ->
             lastRequestHeaders = exchange.requestHeaders
+            lastRequestMethod = exchange.requestMethod
+            lastRequestUri = exchange.requestURI.toString()
             lastRequestBody = exchange.requestBody.readBytes().toString(Charsets.UTF_8)
             val stub = if (stubs.isEmpty()) Stub(500, """{"detail":"no_stub"}""", emptyMap()) else stubs.removeFirst()
             stub.headers.forEach { (name, value) -> exchange.responseHeaders.add(name, value) }

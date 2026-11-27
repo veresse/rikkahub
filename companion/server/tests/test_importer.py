@@ -182,3 +182,56 @@ async def test_import_service(sample_backup_zip: Path, tmp_path: Path):
         assert node is not None
         assert node.select_index == 2
         assert len(node.messages) == 3
+
+
+def _make_settings_backup(path: Path, **assistant_fields) -> Path:
+    assistant = {"id": "asst-web", "name": "角色", **assistant_fields}
+    with zipfile.ZipFile(path, "w") as zf:
+        zf.writestr("settings.json", json.dumps({"assistants": [assistant]}))
+    return path
+
+
+@pytest.mark.asyncio
+async def test_web_search_mode_and_model_survive_import(tmp_path: Path):
+    """新导出的 webSearchMode=on 不能被回退成 auto，已存在角色的 model_id 也要更新。"""
+    test_engine = create_async_engine(
+        f"sqlite+aiosqlite:///{(tmp_path / 'web-mode.db').as_posix()}"
+    )
+    async with test_engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+    async_session = async_sessionmaker(
+        test_engine, class_=AsyncSession, expire_on_commit=False
+    )
+
+    async with async_session() as session:
+        first = ImportService.generate_preview(
+            _make_settings_backup(
+                tmp_path / "first.zip",
+                enableWebSearch=False,
+                webSearchMode="on",
+                chatModelId="deepseek-reasoner",
+            )
+        )
+        await ImportService.execute_import(first["preview_id"], session)
+
+    async with async_session() as session:
+        assistant = await session.get(AssistantModel, "asst-web")
+        assert assistant is not None
+        assert assistant.web_search_mode == "on"
+        assert assistant.enable_web_search is True
+        assert assistant.model_id == "deepseek-reasoner"
+
+    second = ImportService.generate_preview(
+        _make_settings_backup(
+            tmp_path / "second.zip",
+            webSearchMode="auto",
+            chatModelId="deepseek-chat",
+        )
+    )
+    async with async_session() as session:
+        await ImportService.execute_import(second["preview_id"], session)
+
+    async with async_session() as session:
+        assistant = await session.get(AssistantModel, "asst-web")
+        assert assistant.web_search_mode == "auto"
+        assert assistant.model_id == "deepseek-chat"

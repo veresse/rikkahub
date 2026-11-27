@@ -28,7 +28,7 @@ class AuthApiTest {
                 200,
                 """{"token":"t0","token_id":"id0","username":"admin","expires_at":1700000000000}""",
             )
-            val api = RetrofitAuthApiFactory({ null }, {}).create(server.baseUrl)
+            val api = RetrofitApiFactory({ null }, {}).create(server.baseUrl)
 
             val response = api.login(LoginRequest(username = "admin", password = "pw"))
 
@@ -43,7 +43,7 @@ class AuthApiTest {
     fun `adds bearer token to authenticated requests`() = runBlocking {
         TestHttpServer().use { server ->
             server.enqueue(200, "{}")
-            val api = RetrofitAuthApiFactory({ session }, {}).create(server.baseUrl)
+            val api = RetrofitApiFactory({ session }, {}).create(server.baseUrl)
 
             api.logout()
 
@@ -57,7 +57,7 @@ class AuthApiTest {
             server.enqueue(401, """{"detail":"token_revoked"}""")
             server.enqueue(401, """{"detail":"token_revoked"}""")
             var notified = 0
-            val api = RetrofitAuthApiFactory({ session }, { notified += 1 }).create(server.baseUrl)
+            val api = RetrofitApiFactory({ session }, { notified += 1 }).create(server.baseUrl)
 
             repeat(2) {
                 try {
@@ -77,7 +77,7 @@ class AuthApiTest {
         TestHttpServer().use { server ->
             server.enqueue(401, """{"detail":"invalid_credentials"}""")
             var notified = 0
-            val api = RetrofitAuthApiFactory({ session }, { notified += 1 }).create(server.baseUrl)
+            val api = RetrofitApiFactory({ session }, { notified += 1 }).create(server.baseUrl)
 
             try {
                 api.login(LoginRequest(username = "admin", password = "bad"))
@@ -95,7 +95,7 @@ class AuthApiTest {
         TestHttpServer().use { server ->
             var current = session
             val notified = mutableListOf<String>()
-            val factory = RetrofitAuthApiFactory({ current }, { notified += it })
+            val factory = RetrofitApiFactory({ current }, { notified += it })
 
             server.enqueue(401, """{"detail":"token_revoked"}""")
             try {
@@ -112,7 +112,7 @@ class AuthApiTest {
             } catch (_: HttpException) {
             }
 
-            // 同一工厂内 Token 变化必须重新获得一次清退机会，否则二次登录后 401 会“失聪”。
+            // 同一工厂的 Token 变化必须重新获得一次清退机会，否则二次登录后 401 会“失聪”。
             assertEquals(listOf("t0", "t1"), notified)
         }
     }

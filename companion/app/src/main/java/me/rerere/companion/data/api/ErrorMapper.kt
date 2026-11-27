@@ -30,14 +30,15 @@ object ErrorMapper {
         val explicit = payload?.get("message")?.let { element ->
             runCatching { element.jsonPrimitive.contentOrNull }.getOrNull()
         }
-        if (!explicit.isNullOrBlank()) {
+        // 5xx 的 message 可能来自上游/框架，可能含内部信息，只给固定文案。
+        if (!explicit.isNullOrBlank() && status < 500) {
             return AppError.Http(codeOf(payload, status), explicit, retrySeconds)
         }
 
         when (val detail = payload?.get("detail")) {
             is JsonPrimitive -> if (detail.isString) {
                 val code = detail.content
-                return AppError.Http(code, messages[code] ?: code, retrySeconds)
+                return AppError.Http(code, displayOf(code, status), retrySeconds)
             }
 
             is JsonArray -> return AppError.Http("validation_error", "请求参数不合法", retrySeconds)
@@ -45,6 +46,18 @@ object ErrorMapper {
         }
 
         return AppError.Http(codeOf(payload, status), defaultMessage(status), retrySeconds)
+    }
+
+    /**
+     * 已知 code 用固定中文；旧服务端的 `detail` 是中文句子，可原样展示；
+     * 其余英文 code/混合了英文标识的文案不透出（避免内部标识/异常文案进 UI）。
+     */
+    private fun displayOf(code: String, status: Int): String {
+        if (status >= 500) return defaultMessage(status)
+        messages[code]?.let { return it }
+        val hasAsciiLetters = code.any { it in 'A'..'Z' || it in 'a'..'z' }
+        val hasCjk = code.any { it.code > 0x7F }
+        return if (hasCjk && !hasAsciiLetters) code else defaultMessage(status)
     }
 
     fun retryAfterSeconds(header: String?): Int? {

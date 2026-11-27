@@ -81,7 +81,9 @@ async def export_backup(db: AsyncSession = Depends(get_db)):
             data["enableMemory"] = a.enable_memory
             data["useGlobalMemory"] = a.use_global_memory
             data["enableWebSearch"] = a.enable_web_search
+            data["webSearchMode"] = a.web_search_mode
             data["enableActionSync"] = a.enable_action_sync
+            data["chatModelId"] = a.model_id
             settings_assistants.append(data)
 
         settings_json_path = temp_dir / "settings.json"

@@ -108,7 +108,11 @@ class RecordingSink:
         ]
 
 
-def scripted_chat(*sentences: str, error: str | None = None):
+def scripted_chat(
+    *sentences: str,
+    error: str | None = None,
+    user_message_id: str | None = "u-1",
+):
     calls: list[tuple[str, str, str]] = []
 
     async def factory(
@@ -120,7 +124,10 @@ def scripted_chat(*sentences: str, error: str | None = None):
             return
         for sentence in sentences:
             yield {"type": "content", "delta": sentence}
-        yield {"type": "done", "finish_reason": "stop"}
+        done: dict[str, Any] = {"type": "done", "finish_reason": "stop"}
+        if user_message_id is not None:
+            done["user_message_id"] = user_message_id
+        yield done
 
     factory.calls = calls  # type: ignore[attr-defined]
     return factory
@@ -546,6 +553,10 @@ async def test_normal_turn_streams_two_segments_and_completes_on_last_played():
     end = bus.only("turn_end")[0]
     assert end["finish_reason"] == "stop"
     assert end["interrupted"] is False
+    assert end["user_message_id"] == "u-1"
+    assert end["conversation_id"] == "conv-1"
+    asr_final = bus.only("asr_final")[0]
+    assert asr_final["conversation_id"] == "conv-1"
     assert session.last_finish_reason == "stop"
     assert session.turn_id is None
 
@@ -721,6 +732,7 @@ async def test_cancel_turn_marks_interrupted_and_drops_late_segments():
     end = bus.only("turn_end")[0]
     assert end["interrupted"] is True
     assert end["finish_reason"] == "interrupted"
+    assert end["conversation_id"] == "conv-1"
     # 本轮已取消，迟到的回执不推进任何状态。
     assert session.segment_played(0) is False
 

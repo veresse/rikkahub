@@ -355,8 +355,9 @@ idle_timeout, invalid_turn, invalid_frame, unsupported_protocol, internal_error}
 ```
 
 - `event` ∈ `{"turn_start","asr_partial","asr_final","tts_segment_start","tts_segment_end","turn_end"}`。
-- `turn_start` 带 `turn_id` 与可选 `conversation_id`；`turn_end` 带 `turn_id`、`interrupted` 与
-  `finish_reason`（`stop/interrupted/error/timeout/playback_timeout`）。
+- `turn_start` 带 `turn_id` 与可选 `conversation_id`；`asr_final` 也带可选 `conversation_id`（App 依赖它
+  把转写归到正确会话）；`turn_end` 带 `turn_id`、`conversation_id`（可选）、
+  `interrupted` 与 `finish_reason`（`stop/interrupted/error/timeout/playback_timeout`）。
 - `tts_segment_start` 带 `turn_id/segment_seq/text`；`tts_segment_end` 带 `turn_id/segment_seq`。
 - 默认不下发原始音频；`text` 允许 App 展示与纠正。
 

@@ -170,6 +170,7 @@ def build_voice_runtime(
                 conversation_id,
                 text,
                 cancel_reason=cancel_reason,
+                source="voice",
             ):
                 yield chunk
 

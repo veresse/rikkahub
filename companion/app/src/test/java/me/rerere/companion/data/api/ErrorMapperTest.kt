@@ -2,6 +2,7 @@ package me.rerere.companion.data.api
 
 import me.rerere.companion.core.AppError
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -47,6 +48,32 @@ class ErrorMapperTest {
         assertEquals(0, ErrorMapper.retryAfterSeconds("-3"))
         assertNull(ErrorMapper.retryAfterSeconds(null))
         assertNull(ErrorMapper.retryAfterSeconds("abc"))
+    }
+
+    @Test
+    fun `unknown english detail does not leak internal code`() {
+        val error = ErrorMapper.map(400, """{"detail":"some_internal_code"}""")
+        assertEquals("some_internal_code", error.code)
+        assertEquals("请求失败（400）", error.message)
+    }
+
+    @Test
+    fun `mixed internal text in detail is not shown`() {
+        val detail = "ValueError: 参数非法"
+        val error = ErrorMapper.map(400, """{"detail":"$detail"}""")
+        assertEquals(detail, error.code)
+        assertEquals("请求失败（400）", error.message)
+    }
+
+    @Test
+    fun `server error message is not trusted`() {
+        val error = ErrorMapper.map(
+            500,
+            """{"detail":"boom","message":"Traceback: secret path /opt/app"}""",
+        )
+        assertEquals("boom", error.code)
+        assertFalse(error.message.contains("Traceback"))
+        assertTrue(error.message.contains("500"))
     }
 
     @Test

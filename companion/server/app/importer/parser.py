@@ -44,6 +44,11 @@ class BackupParser:
             if unsupported:
                 unsupported_features.append(f"角色「{raw.get('name', '未命名')}」包含暂不支持项: {', '.join(unsupported)}")
 
+            # `webSearchMode` 是新导出的权威三态；旧备份只有布尔值。
+            search_mode = raw.get("webSearchMode")
+            if search_mode not in {"off", "auto", "on"}:
+                search_mode = "auto" if raw.get("enableWebSearch") else "off"
+
             assistant = {
                 "id": str(raw.get("id")),
                 "name": raw.get("name", "未命名角色"),
@@ -54,7 +59,8 @@ class BackupParser:
                 "context_message_limit": raw.get("contextMessageLimit", 0),
                 "enable_memory": bool(raw.get("enableMemory", False)),
                 "use_global_memory": bool(raw.get("useGlobalMemory", False)),
-                "enable_web_search": bool(raw.get("enableWebSearch", False)),
+                "enable_web_search": search_mode != "off",
+                "web_search_mode": search_mode,
                 "enable_action_sync": bool(raw.get("enableActionSync", True)),
                 "model_id": str(raw.get("chatModelId")) if raw.get("chatModelId") else None,
                 "raw_snapshot": raw  # 保存完整原始 JSON，避免信息丢失

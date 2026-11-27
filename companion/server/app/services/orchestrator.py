@@ -25,6 +25,7 @@ from companion.server.app.services.device_registry import (
     get_device_link,
     resolve_device_for_conversation,
 )
+from companion.server.app.services.events import get_event_bus, publish_async
 from companion.server.app.services.search_provider import SearchProvider
 from companion.server.app.services.tool_calls import ToolCallAccumulator
 
@@ -90,6 +91,13 @@ _PERSIST_LOCKS: weakref.WeakKeyDictionary[
 _CANCEL_TOTAL_TIMEOUT = 2.0
 _CANCEL_SETTLE_TIMEOUT = 1.5
 
+# 正在生成的 turn_key：同一 client_msg_id 的并发重试必须回 duplicate_in_progress，
+# 而不是排队/覆盖。单事件循环内“检查 + 加入”之间没有 await，天然原子。
+_INFLIGHT_TURNS: set[str] = set()
+
+# 每个会话当前活跃的 turn_key：旧轮的 idle 晚于新轮 generating 时必须被丢弃。
+_ACTIVE_TURN: dict[str, str] = {}
+
 
 def _persist_locks_for(
     loop: asyncio.AbstractEventLoop,
@@ -117,6 +125,185 @@ def get_persist_lock(conv_id: str) -> asyncio.Lock:
 
 
 class ChatOrchestrator:
+    @staticmethod
+    def _mark_turn_active(conversation_id: str, turn_key: str) -> None:
+        _ACTIVE_TURN[conversation_id] = turn_key
+
+    @classmethod
+    async def _publish_turn_state(
+        cls, conversation_id: str, state: str, source: str, turn_key: str
+    ) -> None:
+        """广播生成状态；订阅者异常绝不影响生成主流程。"""
+        try:
+            await get_event_bus().publish(
+                cls._turn_state_payload(conversation_id, state, source, turn_key)
+            )
+        except Exception:
+            logger.debug(
+                "turn_state publish failed: %s state=%s", conversation_id, state
+            )
+
+    @staticmethod
+    def _turn_state_payload(
+        conversation_id: str, state: str, source: str, turn_key: str
+    ) -> dict[str, Any]:
+        return {
+            "v": 2,
+            "type": "conversation.turn_state",
+            "conversation_id": conversation_id,
+            "state": state,
+            "source": source,
+            "turn_id": turn_key,
+            "turn_key": turn_key,
+        }
+
+    @classmethod
+    def _publish_turn_idle(
+        cls, conversation_id: str, turn_key: str, source: str
+    ) -> bool:
+        """只有当前活跃轮次能置 idle，旧轮迟到事件被丢弃。
+
+        用后台任务广播：取消路径上 finally 里的 `await` 会被再次取消，
+        若同步 await 慢订阅者，App 会永久停在 generating。状态本身已在
+        同一 tick 内同步更新，不依赖广播完成。
+        """
+        if _ACTIVE_TURN.get(conversation_id) != turn_key:
+            return False
+        _ACTIVE_TURN.pop(conversation_id, None)
+        publish_async(
+            get_event_bus(),
+            cls._turn_state_payload(conversation_id, "idle", source, turn_key),
+        )
+        return True
+
+    @staticmethod
+    def _is_generating_status(chunk: Any) -> bool:
+        return (
+            isinstance(chunk, dict)
+            and chunk.get("type") == "status"
+            and chunk.get("status") == "generating"
+        )
+
+    @staticmethod
+    def derive_turn_key(conversation_id: str, client_msg_id: str | None) -> str:
+        """幂等键：同一 client_msg_id 在任意时刻重试都映射到同一轮。
+
+        语音轮次没有 client_msg_id，保持每轮随机，不与 App 重试混用。
+        """
+        if client_msg_id:
+            return str(
+                uuid.uuid5(
+                    uuid.NAMESPACE_URL,
+                    f"chat:{conversation_id}:{client_msg_id}",
+                )
+            )
+        return str(uuid.uuid4())
+
+    @staticmethod
+    def message_ids(conversation_id: str, turn_key: str) -> tuple[str, str]:
+        """返回 (user_message_id, assistant_message_id)，与 _save_turn 完全一致。"""
+        return (
+            str(
+                uuid.uuid5(
+                    uuid.NAMESPACE_URL,
+                    f"companion:{conversation_id}:{turn_key}:user",
+                )
+            ),
+            str(
+                uuid.uuid5(
+                    uuid.NAMESPACE_URL,
+                    f"companion:{conversation_id}:{turn_key}:assistant",
+                )
+            ),
+        )
+
+    @staticmethod
+    def _message_text(message: dict[str, Any]) -> str:
+        parts = message.get("parts") or []
+        return "".join(
+            str(part.get("text") or "")
+            for part in parts
+            if isinstance(part, dict)
+        )
+
+    @classmethod
+    def _is_replayable_turn(cls, message: dict[str, Any]) -> bool:
+        """只有完整回答才能 replay；中断/空回答允许同 id 重试覆盖。"""
+        return not message.get("interrupted") and bool(
+            cls._message_text(message).strip()
+        )
+
+    @classmethod
+    async def _find_saved_turn_message(
+        cls,
+        db: AsyncSession,
+        conversation_id: str,
+        assistant_id: str,
+        *,
+        scan_conversation: bool,
+    ) -> tuple[MessageNodeModel, int] | None:
+        """按 assistant 消息 id 定位已落库的助手消息。
+
+        普通轮次的消息 id 同时是节点 id（快路径）。重新生成/取消落库的候选
+        只存在于节点内部，需要扫一遍本会话节点；该扫描只在幂等重试时启用，
+        避免语音轮次等随机 turn_key 每轮多做一次查询。
+        """
+        node = await db.get(MessageNodeModel, assistant_id)
+        if node is not None and node.conversation_id == conversation_id:
+            for index, message in enumerate(list(node.messages or [])):
+                if message.get("id") == assistant_id:
+                    return node, index
+        if not scan_conversation:
+            return None
+        result = await db.execute(
+            select(MessageNodeModel).where(
+                MessageNodeModel.conversation_id == conversation_id
+            )
+        )
+        for candidate in result.scalars().all():
+            for index, message in enumerate(list(candidate.messages or [])):
+                if message.get("id") == assistant_id:
+                    return candidate, index
+        return None
+
+    @classmethod
+    async def _find_replayed_turn(
+        cls,
+        db: AsyncSession,
+        conversation_id: str,
+        turn_key: str,
+        regenerate_node_id: str | None,
+        *,
+        scan_conversation: bool = True,
+    ) -> dict[str, Any] | None:
+        """同一 client_msg_id 的完整回答已落库时返回 done 附加字段。
+
+        幂等判定只看消息 id 是否已落库，不看请求是否带 `regenerate_node_id`：
+        两者不一致时若按请求参数猜位置，同一条消息会被写两次。
+
+        中断/空回答不算完成：返回 None，让同一 turn_key 重新生成，并由
+        `_save_turn` 就地覆盖旧候选，否则断线重试永远只能拿到半句或空回答。
+        """
+        user_id, assistant_id = cls.message_ids(conversation_id, turn_key)
+        found = await cls._find_saved_turn_message(
+            db,
+            conversation_id,
+            assistant_id,
+            scan_conversation=scan_conversation,
+        )
+        if found is None:
+            return None
+        node, index = found
+        message = list(node.messages or [])[index]
+        if not cls._is_replayable_turn(message):
+            return None
+        return {
+            "assistant_message_id": assistant_id,
+            # 普通轮次的助手消息 id 同时是节点 id；重新生成的候选没有独立用户节点。
+            "user_message_id": user_id if node.id == assistant_id else None,
+            "finish_reason": message.get("finishReason") or "stop",
+        }
+
     @staticmethod
     async def build_context(
         db: AsyncSession,
@@ -208,6 +395,8 @@ class ChatOrchestrator:
         *,
         cancel_reason: str = "server_cancel",
         client: Any | None = None,
+        client_msg_id: str | None = None,
+        source: str = "app",
     ) -> AsyncGenerator[dict[str, Any], None]:
         """流式生成入口。
 
@@ -215,16 +404,42 @@ class ChatOrchestrator:
         部分回复落库并标记 `interrupted=True`，再向上抛出；正常完成由内部
         生成器自己落库。语音轮次通过 `cancel_reason="barge_in"` 让在途动作
         的 `action.stop` 使用正确原因。
+
+        `client_msg_id` 是 App 生成的幂等键：同一 id 已落库时直接回
+        `done(replayed=true)`（不调用模型），生成中重试回 `duplicate_in_progress`。
         """
+        turn_key = cls.derive_turn_key(conversation_id, client_msg_id)
+        idempotent = client_msg_id is not None
+        replayed = await cls._find_replayed_turn(
+            db,
+            conversation_id,
+            turn_key,
+            regenerate_node_id,
+            scan_conversation=idempotent,
+        )
+        if replayed is not None:
+            yield {
+                "type": "done",
+                "finish_reason": replayed.pop("finish_reason", "stop"),
+                "replayed": True,
+                **replayed,
+            }
+            return
+        if turn_key in _INFLIGHT_TURNS:
+            yield {"type": "error", "error": "duplicate_in_progress"}
+            return
+        _INFLIGHT_TURNS.add(turn_key)
+
         snapshot: dict[str, Any] = {
             "text": "",
             "reasoning": "",
             "usage": None,
             "all_nodes": None,
             "saved": False,
-            # 本轮落库幂等键：只在本轮的重试间复用，跨轮次绝不相同，
-            # 避免“取消落库未完成时开始下一轮”被误判为同一轮。
-            "turn_key": str(uuid.uuid4()),
+            # 本轮落库幂等键：client_msg_id 存在时跨重试稳定，否则每轮随机。
+            "turn_key": turn_key,
+            # 只有幂等轮次才需要按消息 id 扫描历史节点。
+            "idempotent": idempotent,
         }
         inner = cls._stream_chat_inner(
             db,
@@ -234,10 +449,17 @@ class ChatOrchestrator:
             cancel_reason=cancel_reason,
             client=client,
             snapshot=snapshot,
-            turn_key=snapshot["turn_key"],
+            turn_key=turn_key,
         )
+        started = False
         try:
             async for chunk in inner:
+                if not started and cls._is_generating_status(chunk):
+                    started = True
+                    cls._mark_turn_active(conversation_id, turn_key)
+                    await cls._publish_turn_state(
+                        conversation_id, "generating", source, turn_key
+                    )
                 yield chunk
         except (asyncio.CancelledError, GeneratorExit):
             loop = asyncio.get_running_loop()
@@ -283,10 +505,14 @@ class ChatOrchestrator:
                     all_nodes=snapshot["all_nodes"],
                     regenerate_node_id=regenerate_node_id,
                     turn_key=snapshot["turn_key"],
+                    idempotent=bool(snapshot.get("idempotent")),
                     timeout=max(0.05, deadline - loop.time()),
                 )
             raise
         finally:
+            _INFLIGHT_TURNS.discard(turn_key)
+            if started:
+                cls._publish_turn_idle(conversation_id, turn_key, source)
             await inner.aclose()
 
     @classmethod
@@ -319,8 +545,18 @@ class ChatOrchestrator:
             if snapshot is not None:
                 snapshot["all_nodes"] = all_nodes
 
-            # 联网搜索支持判断 (简易意图触发)
-            if assistant.enable_web_search and any(w in user_text for w in ["今天", "新闻", "天气", "最新", "查一下", "搜索"]):
+            # 联网搜索三态：off 不搜；auto 走关键词触发；on 每轮强制。
+            search_mode = getattr(assistant, "web_search_mode", None) or (
+                "auto" if assistant.enable_web_search else "off"
+            )
+            should_search = search_mode == "on" or (
+                search_mode == "auto"
+                and any(
+                    w in user_text
+                    for w in ["今天", "新闻", "天气", "最新", "查一下", "搜索"]
+                )
+            )
+            if should_search:
                 yield {"type": "status", "status": "searching", "message": "正在联网搜索实时信息..."}
                 search_results = await SearchProvider.search(user_text)
                 if search_results:
@@ -366,6 +602,7 @@ class ChatOrchestrator:
 
                 async for chunk in client.stream_chat(
                     messages=working_messages,
+                    model=assistant.model_id or None,
                     temperature=assistant.temperature,
                     top_p=assistant.top_p,
                     tools=tools_for_call,
@@ -459,6 +696,7 @@ class ChatOrchestrator:
                     all_nodes=all_nodes,
                     regenerate_node_id=regenerate_node_id,
                     turn_key=turn_key,
+                    idempotent=bool(snapshot.get("idempotent")) if snapshot else False,
                 )
             )
             if snapshot is not None:
@@ -468,7 +706,15 @@ class ChatOrchestrator:
                 # 只有 commit 成功返回后才标记；取消落在 commit 中时外层仍会重试。
                 snapshot["saved"] = True
 
-            yield {"type": "done", "finish_reason": "stop", "assistant_message_id": assistant_msg["id"]}
+            yield {
+                "type": "done",
+                "finish_reason": "stop",
+                "assistant_message_id": assistant_msg["id"],
+                "user_message_id": None if regenerate_node_id else cls.message_ids(
+                    conversation_id, turn_key
+                )[0],
+                "replayed": False,
+            }
 
     @staticmethod
     async def _settle_save_task(
@@ -503,32 +749,27 @@ class ChatOrchestrator:
         interrupted: bool = False,
         finish_reason: str = "stop",
         turn_key: str | None = None,
+        idempotent: bool = False,
     ) -> dict[str, Any]:
         """正常结束与取消共用的落库：用户节点始终写，助手节点即使为空也写。
 
         `turn_key` 是本轮落库的幂等键：同一轮取消重试会复用它并命中已提交
         节点；不同轮次（包括取消后立刻开始的新一轮）使用不同键，绝不互相
-        复用。节点下标在落库锁内按数据库当前最大值重新计算。
+        复用。命中已提交的完整回答直接返回（幂等 replay）；命中中断/空回答
+        则用本次结果就地覆盖，避免重试后留下空回答且再也无法生成。
         """
         turn_key = turn_key or str(uuid.uuid4())
+        user_message_id, assistant_message_id = cls.message_ids(
+            conversation_id, turn_key
+        )
         user_msg = {
-            "id": str(
-                uuid.uuid5(
-                    uuid.NAMESPACE_URL,
-                    f"companion:{conversation_id}:{turn_key}:user",
-                )
-            ),
+            "id": user_message_id,
             "role": "USER",
             "parts": [{"text": user_text}],
             "createdAt": time.strftime("%Y-%m-%dT%H:%M:%S"),
         }
         assistant_msg: dict[str, Any] = {
-            "id": str(
-                uuid.uuid5(
-                    uuid.NAMESPACE_URL,
-                    f"companion:{conversation_id}:{turn_key}:assistant",
-                )
-            ),
+            "id": assistant_message_id,
             "role": "ASSISTANT",
             "parts": [],
             "createdAt": time.strftime("%Y-%m-%dT%H:%M:%S"),
@@ -547,40 +788,65 @@ class ChatOrchestrator:
         async with get_persist_lock(conversation_id):
             if regenerate_node_id:
                 # 重新生成某一轮：将新回复追加为候选分支，更新 select_index。
-                # 同一 turn_key 的重试若已追加过，直接复用，避免重复候选。
+                # 同一 turn_key 的重试若已追加过完整回答，直接复用；若上次是
+                # 中断/空回答，则覆盖该候选（保留分支位置），不做重复追加。
                 node = await db.get(MessageNodeModel, regenerate_node_id)
                 if node:
                     messages = list(node.messages or [])
-                    for message in messages:
-                        if message.get("id") == assistant_msg["id"]:
-                            return message
-                    node.messages = [*messages, assistant_msg]
-                    node.select_index = len(node.messages) - 1
+                    existing_index = next(
+                        (
+                            index
+                            for index, message in enumerate(messages)
+                            if message.get("id") == assistant_msg["id"]
+                        ),
+                        None,
+                    )
+                    if existing_index is not None and cls._is_replayable_turn(
+                        messages[existing_index]
+                    ):
+                        return messages[existing_index]
+                    if existing_index is not None:
+                        messages[existing_index] = assistant_msg
+                        node.messages = messages
+                        node.select_index = existing_index
+                    else:
+                        node.messages = [*messages, assistant_msg]
+                        node.select_index = len(node.messages) - 1
             else:
-                existing = await db.get(
-                    MessageNodeModel, assistant_msg["id"]
+                found = await cls._find_saved_turn_message(
+                    db,
+                    conversation_id,
+                    assistant_msg["id"],
+                    scan_conversation=idempotent,
                 )
-                if existing is not None:
-                    return cls._select_message(existing, assistant_msg)
+                if found is not None:
+                    node, index = found
+                    messages = list(node.messages or [])
+                    if cls._is_replayable_turn(messages[index]):
+                        return messages[index]
+                    # 中断/空回答的重试：用本次完整回复覆盖同一条消息。
+                    messages[index] = assistant_msg
+                    node.messages = messages
+                    node.select_index = index
+                else:
+                    next_index = await cls._next_node_index(db, conversation_id)
+                    user_node = MessageNodeModel(
+                        id=user_msg["id"],
+                        conversation_id=conversation_id,
+                        node_index=next_index,
+                        messages=[user_msg],
+                        select_index=0,
+                    )
+                    db.add(user_node)
 
-                next_index = await cls._next_node_index(db, conversation_id)
-                user_node = MessageNodeModel(
-                    id=user_msg["id"],
-                    conversation_id=conversation_id,
-                    node_index=next_index,
-                    messages=[user_msg],
-                    select_index=0,
-                )
-                db.add(user_node)
-
-                assistant_node = MessageNodeModel(
-                    id=assistant_msg["id"],
-                    conversation_id=conversation_id,
-                    node_index=next_index + 1,
-                    messages=[assistant_msg],
-                    select_index=0,
-                )
-                db.add(assistant_node)
+                    assistant_node = MessageNodeModel(
+                        id=assistant_msg["id"],
+                        conversation_id=conversation_id,
+                        node_index=next_index + 1,
+                        messages=[assistant_msg],
+                        select_index=0,
+                    )
+                    db.add(assistant_node)
 
             # 更新会话更新时间
             conv = await db.get(ConversationModel, conversation_id)

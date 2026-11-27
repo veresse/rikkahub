@@ -19,6 +19,8 @@ class AssistantModel(Base):
     enable_memory: Mapped[bool] = mapped_column(Boolean, default=False)
     use_global_memory: Mapped[bool] = mapped_column(Boolean, default=False)
     enable_web_search: Mapped[bool] = mapped_column(Boolean, default=False)
+    # 三态：off 不搜索、auto 关键词触发、on 每轮强制搜索；enable_web_search 仅为兼容旧数据/导出同步。
+    web_search_mode: Mapped[str] = mapped_column(String(8), default="off")
     enable_action_sync: Mapped[bool] = mapped_column(Boolean, default=True)
     model_id: Mapped[str | None] = mapped_column(String(100), nullable=True)
     raw_snapshot: Mapped[dict] = mapped_column(JSON, default=dict)  # 保留原始未映射字段，防止数据丢失

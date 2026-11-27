@@ -67,6 +67,10 @@ class _TurnResources:
     turn: asyncio.Task | None
     downlink: DownlinkSender | None
     timers: list[asyncio.Task]
+    user_message_id: str | None = None
+    # 轮次开始时的会话归属：取消清理在后台跑、甚至新轮次已开始，也不能用
+    # `self.conversation_id`（可能已被下一轮改写）去广播 turn_end。
+    conversation_id: str | None = None
 
 NON_FATAL_ERRORS = {"busy", "invalid_turn", "invalid_frame"}
 
@@ -100,6 +104,9 @@ class VoiceSession:
         self.generation = 0
         self.frames_received = 0
         self.conversation_id: str | None = None
+        # 本轮已落库的 USER 消息 id：由聊天 `done` 事件带出，供 turn_end 给 App
+        # 定位“这条语音输入”以便纠正转写。
+        self._turn_user_message_id: str | None = None
         # 本轮最后一个 TTS 段的序号；设备回执到这个序号才结束轮次。
         self.last_segment_seq: int | None = None
         self.last_finish_reason: str | None = None
@@ -150,6 +157,7 @@ class VoiceSession:
         self._last_turn_seq = -1
         self._last_segment_seq = -1
         self.conversation_id = None
+        self._turn_user_message_id = None
         self.last_segment_seq = None
         self.last_finish_reason = None
         self._reset_turn_buffers()
@@ -553,7 +561,12 @@ class VoiceSession:
         text = (self._asr_last_text or "").strip()
         if not text:
             raise ProviderError("no_speech")
-        await self._emit("asr_final", turn_id=turn_id, text=text)
+        await self._emit(
+            "asr_final",
+            turn_id=turn_id,
+            conversation_id=self.conversation_id,
+            text=text,
+        )
         return text
 
     async def _generate_and_speak(
@@ -605,6 +618,10 @@ class VoiceSession:
                     fatal = code == "busy"
                     await self._fail(code, gen, turn_id, fatal=fatal)
                     return
+                elif chunk_type == "done":
+                    user_message_id = chunk.get("user_message_id")
+                    if isinstance(user_message_id, str) and user_message_id:
+                        self._turn_user_message_id = user_message_id
             if not self._turn_ok(gen, turn_id):
                 return
             for sentence in segmenter.flush():
@@ -798,13 +815,20 @@ class VoiceSession:
     async def _cancel_cleanup(
         self, turn_id: str, reason: str, resources: _TurnResources
     ) -> None:
+        fields: dict[str, Any] = {
+            "turn_id": turn_id,
+            "interrupted": True,
+            "finish_reason": "interrupted",
+        }
+        if resources.user_message_id:
+            fields["user_message_id"] = resources.user_message_id
+        if resources.conversation_id:
+            fields["conversation_id"] = resources.conversation_id
+        # 先广播再清理：关闭 ASR/TTS 可能需要数秒，期间新轮次已经开始，
+        # 迟到的 turn_end 会被 App 按 turn_id 丢弃；顺序反过来会让“本轮已结束”
+        # 的消息永远排在下一轮之后。
+        await self._emit("turn_end", **fields)
         await self._cleanup_resources(resources)
-        await self._emit(
-            "turn_end",
-            turn_id=turn_id,
-            interrupted=True,
-            finish_reason="interrupted",
-        )
         logger.debug(
             "voice turn cancelled: %s reason=%s", self.device_id, reason
         )
@@ -838,6 +862,16 @@ class VoiceSession:
             turn_id=turn_id,
             interrupted=interrupted,
             finish_reason=finish_reason,
+            **(
+                {"user_message_id": resources.user_message_id}
+                if resources.user_message_id
+                else {}
+            ),
+            **(
+                {"conversation_id": resources.conversation_id}
+                if resources.conversation_id
+                else {}
+            ),
         )
         await self._cleanup_resources(resources)
 
@@ -856,6 +890,8 @@ class VoiceSession:
             turn=self._turn_task,
             downlink=self._downlink,
             timers=list(self._timers),
+            user_message_id=self._turn_user_message_id,
+            conversation_id=self.conversation_id,
         )
         self._asr = None
         self._pump_task = None
