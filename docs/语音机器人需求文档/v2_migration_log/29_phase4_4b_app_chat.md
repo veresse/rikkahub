@@ -58,10 +58,13 @@
   损坏/未知类型回退到角色列表。
 - `activeTokenId` 也保存：旋转时 Token 未变 → 不清栈；Token 变化 → `clearAll()` 并把栈重置为角色列表，
   避免看到上一个账号的页面。
-- `popRoute` 400ms 节流：连点两次返回不会一次弹两级（第二次点击会落在上一页的返回按钮上）。
-  `pushRoute` 会重置节流，避免「弹栈 → 立刻进入新页 → 立刻返回」被吞掉；弹回根页后的
-  400ms 内仍吞掉返回，否则深度 2 的第二下会直接结束 Activity（清空 ViewModelStore、
-  取消在途写请求），窗口过后才恢复系统默认退出。
+- `popRoute` 400ms 节流只保证「刚弹过一级后，同一次连点不再弹第二级」；深度 2 时第二下
+  会落在根页的返回键上，由根页的 400ms 屏蔽窗口兜住。`pushRoute` 会重置节流，避免
+  「弹栈 → 立刻进入新页 → 立刻返回」被吞掉。
+- 根页始终注册 `BackHandler`：回调内同步读 `state.value.deletingId`，删除在途时吞掉返回；
+  其余情况显式 `finish()`（不再依赖 `enabled` 的组合快照）。窗口过后才恢复退出。
+- 每次“弹回根页”都递增 `rootBlockEpoch` 重新计时：否则窗口内再次弹回根页时
+  `blockingRootBack` 仍为 `true`，`LaunchedEffect` 不会重启，窗口会提前失效。
 - 两个 `rememberSaveable` 使用**位置作用域**（自定义 `key` 已被 Compose 废弃），代码注释了
   「新的 rememberSaveable 只能追加在它们之后」的顺序约束。
 
@@ -108,7 +111,8 @@
 - 各页返回按钮在 `saving/creating/deleting/correcting` 时禁用；按钮回调里同步读
   `viewModel.state.value`（`collectAsState` 的值落后一帧，只靠它做 `enabled` 会留下窗口）；
 - `AppNav` 在对应路由上注册 `BackHandler`，回调内同步读 ViewModel 最新状态后决定是否弹栈；
-  根页删除角色时也注册，避免系统返回结束 Activity 取消 DELETE；
+  根页始终注册回调，删除角色时直接返回、其余情况显式 `finish()`，避免系统返回结束
+  Activity 取消 DELETE；
 - 只有角色编辑页保存成功后由事件流触发 `popRoute()`；新建会话是 `pushRoute(Chat)`，
   记忆保存是就地刷新，不弹栈。
 
@@ -196,13 +200,22 @@ cd companion\server
 2. 返回节流是全局且不随导航重置 → `pushRoute` 重置；弹回根页后 400ms 内继续吞返回。
 3. `BackHandler(enabled = 组合状态)` 落后一帧 → 改为始终注册、回调内同步读 `state.value`；
    四处返回按钮也改为回调内同步判断。
-4. 根页删除角色时系统返回会结束 Activity → 根页补 `BackHandler`。
+4. 根页删除角色时系统返回会结束 Activity → 根页补 `BackHandler`。第三轮版本仍用
+   组合状态 `deletingId` 做 `enabled`，第四轮改为始终注册、回调内读 `state.value`
+   并在非删除状态显式 `finish()`（§6.5）。
 5. 贴底判定读不到布局且把「最后一条只露出顶部」当底部 → 改用 `canScrollForward` 的
-   `derivedStateOf`，只在用户本就在底部时跟随。
-6. 列表长度变化无条件跳底 → 合并为一个「仅贴底才跟随」的 effect。
+   `derivedStateOf`，只在用户本就在底部时跟随。**第四轮复审指出该派生值在
+   `LaunchedEffect` 里采样发生在布局之后，长历史首次进入不会滚到底**，已改为
+   `followTail`（§6.5）。
+6. 列表长度变化无条件跳底 → 合并为一个「仅贴底才跟随」的 effect。同样被 §6.5 的
+   `followTail` 方案取代（初始为 true，只由用户手势关闭）。
 7. 旧轮 `turn_end` 可能晚于新轮 `turn_start` → 服务端改为先发 `turn_end` 再清理 ASR/TTS；
-   App 记录 `turn_start.turn_id` 并丢弃不匹配的 `turn_end`。
+   App 记录 `turn_start.turn_id` 并丢弃不匹配的 `turn_end`。第四轮补：有活跃轮次时，
+   缺少 `turn_id` 的 `turn_end` 同样丢弃。
 8. 测试有效性 → 新增「旧列表不复活已删除会话」「旧语音轮 `turn_end` 不覆盖新轮」两条。
+   第三轮版本的列表用例并不能失败：Fake 在 `listGate.await()` 之后才读 `items`，
+   删除后返回的已经是空列表。第四轮改为 **先快照再 await**，并补删除后立即
+   `loading == false` 的断言，使旧快照路径真正可判别。
 
 日志事实订正（本文件）：删除「去掉废弃 `rememberSaveable` key」的表述（该 key 在 `fe8124c7`
 已不存在）；「连点两次返回不会一次弹两级」限定为深度 ≥ 3，深度 2 的问题已由本轮修复；
@@ -222,6 +235,39 @@ cd companion\server
   `ChatViewModelTest` 的无 `conversation_id` 过滤）在修复前就能通过，属于回归防护而非失败测试。
 - 进程被回收后恢复到「聊天页」时，若会话已在别处删除，会显示加载失败 + 返回，符合预期但无测试。
 - 服务端 `voice.event` 的广播范围依赖「单管理员」假设，多账号化时需要按 `token_id` 定向。
+
+### 6.5 第四轮（`92eca45e` + `bc2a1441` 后独立复审）
+
+结论「PASS WITH FIXES」：无 P0；P1×1（长历史首次进入不滚到底）+ P2×6。修复如下：
+
+1. **P1 滚动跟随**（`ChatScreen.kt`）：`atBottom` 在 `LaunchedEffect` 里采样发生在布局之后，
+   首次进入长会话时读不到正确值，历史停在最旧一条。改为 `followTail`（初始 `true`），
+   用 `snapshotFlow { isScrollInProgress to !canScrollForward }` 只在用户手势期间更新；
+   初始加载、自己发送、流式增量都会跟随，上滑阅读不被抢。
+2. **根页返回窗口**（`AppNav.kt`）：根页 `BackHandler` 始终注册，回调内同步读
+   `deletingId`；非删除状态显式 `activity.finish()`，屏蔽窗口内直接吞掉。
+3. **根页窗口计时**（`AppNav.kt`）：新增 `rootBlockEpoch`，每次弹回根页都重启 400ms 计时，
+   避免窗口内二次弹回时提前失效。
+4. **删除误杀后续刷新**（`ConversationsViewModel.kt`）：记录删除开始时的
+   `refreshGeneration`，只在代次未变时递增；删除开始后的手动刷新可以正常落地。
+5. **`turn_end` 归属**（`ChatViewModel.kt`）：有活跃轮次时 `turnId == null` 也丢弃，
+   测试补了该分支。
+6. **测试有效性**（`FakeConversationRepository.kt` + `ConversationsViewModelTest.kt`）：
+   列表先快照再 `await` gate；删除后、放行 gate 前断言 `loading == false`，旧快照路径
+   现在真的能失败。
+7. **`_cancel_cleanup` 清理窗口**（`pipeline.py`）：`_emit(turn_end)` 放进 `try`，
+   `_cleanup_resources` 放进 `finally` 并用 `asyncio.shield` 包裹；shutdown 取消落在
+   emit 上时 ASR/TTS 仍会关闭。
+
+验证（真实输出）：
+
+- `cd companion/app && ./gradlew testDebugUnitTest assembleDebug` →
+  `suites=21 tests=159 failures=0 errors=0`，BUILD SUCCESSFUL。
+- `cd companion/server && python -m pytest -q` → `427 passed in 14.26s`。
+- `protocol_v2.md` 5.3 的 `asr_final` 示例补上 `conversation_id`。
+
+仍未修（保留在 §6.4）：无 Compose/Robolectric 级导航与 UI 门控用例、`AssistantEdit`
+保存/返回并发用例、进程恢复后会话已删用例。
 
 ## 7. 未完成 / 风险
 

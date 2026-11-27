@@ -827,8 +827,12 @@ class VoiceSession:
         # 先广播再清理：关闭 ASR/TTS 可能需要数秒，期间新轮次已经开始，
         # 迟到的 turn_end 会被 App 按 turn_id 丢弃；顺序反过来会让“本轮已结束”
         # 的消息永远排在下一轮之后。
-        await self._emit("turn_end", **fields)
-        await self._cleanup_resources(resources)
+        try:
+            await self._emit("turn_end", **fields)
+        finally:
+            # shutdown 可能在 emit 期间取消本任务：清理必须照常执行，
+            # 否则 ASR/TTS 连接会泄漏；shield 防止二次取消打断 close/gather。
+            await asyncio.shield(self._cleanup_resources(resources))
         logger.debug(
             "voice turn cancelled: %s reason=%s", self.device_id, reason
         )

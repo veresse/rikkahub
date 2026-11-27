@@ -26,6 +26,7 @@ from companion.server.app.security.rate_limit import clear, is_limited, record
 from companion.server.app.security.tokens import generate_token, hash_token
 from companion.server.app.services.device_registry import (
     device_lifecycle_lock,
+    device_link_is_online,
     get_device_link,
 )
 from companion.shared.catalog import get_catalog
@@ -71,6 +72,11 @@ def _client_ip(request: Request) -> str:
 
 
 def _serialize_device(device: DeviceModel) -> dict:
+    # 撤销后的设备即使链路对象还留在注册表里（关闭失败/竞态）也不算在线：
+    # App 拿到「已撤销但在线」会显示成可遥控，所有命令却必然失败。
+    online = bool(device.is_active) and device_link_is_online(
+        get_device_link(device.id)
+    )
     return {
         "id": device.id,
         "name": device.name,
@@ -80,6 +86,7 @@ def _serialize_device(device: DeviceModel) -> dict:
         "bound_assistant_id": device.bound_assistant_id,
         "bound_conversation_id": device.bound_conversation_id,
         "is_active": device.is_active,
+        "online": online,
         "volume": device.volume,
         "idle_enabled": device.idle_enabled,
         "pan_offset": device.pan_offset,

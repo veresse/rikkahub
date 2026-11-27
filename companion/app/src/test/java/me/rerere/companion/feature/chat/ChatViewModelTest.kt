@@ -516,7 +516,7 @@ class ChatViewModelTest {
         val vm = viewModel(wsEvents = ws)
         main.scheduler.advanceUntilIdle()
 
-        fun voice(event: String, turnId: String, interrupted: Boolean) = WsEvent.Voice(
+        fun voice(event: String, turnId: String?, interrupted: Boolean) = WsEvent.Voice(
             event = event,
             deviceId = "d1",
             turnId = turnId,
@@ -531,6 +531,11 @@ class ChatViewModelTest {
         ws.tryEmit(voice("turn_start", "t2", false))
         // 旧轮取消清理晚到：不得把 t1 的中断状态贴到正在进行的 t2 上。
         ws.tryEmit(voice("turn_end", "t1", true))
+        main.scheduler.advanceUntilIdle()
+        assertFalse(vm.state.value.voiceInterrupted)
+
+        // 缺少 turn_id 的 turn_end 同样无法证明属于 t2，必须丢弃。
+        ws.tryEmit(voice("turn_end", null, true))
         main.scheduler.advanceUntilIdle()
         assertFalse(vm.state.value.voiceInterrupted)
 

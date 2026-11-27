@@ -33,7 +33,21 @@ class OkHttpWsConnector(
             request,
             object : WebSocketListener() {
                 override fun onOpen(webSocket: WebSocket, response: Response) {
-                    trySend(WsFrame.Open)
+                    // 先发可写句柄再发 Open：管理器一进入 Connected 就能 send()，
+                    // 否则紧跟在 Connected 之后的命令会因 sink 还没发布而“未送达”。
+                    val writable = trySend(
+                        WsFrame.Writable(WsSink { webSocket.send(it) }),
+                    ).isSuccess
+                    if (!writable) {
+                        // 下游已关闭/缓冲满：不要再宣布 Connected。
+                        webSocket.cancel()
+                        return
+                    }
+                    // Open 发不出去同样致命：sink 已发布但没有 Connected，缓存不会清、
+                    // 页面也不会重拉快照，等于半死连接。
+                    if (!trySend(WsFrame.Open).isSuccess) {
+                        webSocket.cancel()
+                    }
                 }
 
                 override fun onMessage(webSocket: WebSocket, text: String) {

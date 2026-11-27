@@ -111,12 +111,17 @@ class ConversationsViewModel(
             _events.tryEmit(ConversationsEvent.Message("上一个删除还在进行中"))
             return
         }
+        // 只作废“删除开始前”发出的列表请求：删除开始后用户手动刷新拿到的
+        // 是删除后的列表，不能被误杀，否则列表停在旧数据上。
+        val generationAtDeleteStart = refreshGeneration
         _state.update { it.copy(deletingId = id) }
         viewModelScope.launch {
             when (val result = repository.delete(id)) {
                 is AppResult.Ok -> {
                     // 作废在途的列表请求：它拿到的是删除前的快照，返回后会把会话“复活”。
-                    refreshGeneration += 1
+                    if (refreshGeneration == generationAtDeleteStart) {
+                        refreshGeneration += 1
+                    }
                     _state.update { current ->
                         current.copy(
                             deletingId = null,

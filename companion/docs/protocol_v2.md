@@ -351,7 +351,7 @@ idle_timeout, invalid_turn, invalid_frame, unsupported_protocol, internal_error}
 `voice.event` 由服务端通过 `/app/ws` 发布给所有在线 App，**不会**下发给设备。
 
 ```json
-{"v": 2, "type": "voice.event", "event": "asr_final", "turn_id": "uuid", "text": "今天天气怎么样"}
+{"v": 2, "type": "voice.event", "event": "asr_final", "turn_id": "uuid", "conversation_id": "uuid", "text": "今天天气怎么样"}
 ```
 
 - `event` ∈ `{"turn_start","asr_partial","asr_final","tts_segment_start","tts_segment_end","turn_end"}`。

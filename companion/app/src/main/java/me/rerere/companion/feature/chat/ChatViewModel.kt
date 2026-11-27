@@ -465,8 +465,9 @@ class ChatViewModel(
             "turn_end" -> {
                 // 旧轮的取消清理可能在新轮 turn_start 之后才发出 turn_end；
                 // 用 turn_id 守卫，避免把上一轮的中断状态贴到新轮。
+                // 有活跃轮次时，缺少 turn_id 的 end 也无法证明属于本轮，一律丢弃。
                 val active = activeVoiceTurnId
-                if (active != null && event.turnId != null && event.turnId != active) return
+                if (active != null && event.turnId != active) return
                 activeVoiceTurnId = null
                 _state.update { it.copy(voiceInterrupted = event.interrupted) }
             }

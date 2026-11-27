@@ -58,6 +58,7 @@ fun AssistantsScreen(
     onOpen: (AssistantDto) -> Unit,
     onEdit: (String) -> Unit,
     onDelete: (String) -> Unit,
+    onDevices: () -> Unit,
     onLogout: () -> Unit,
 ) {
     val snackbarHostState = remember { SnackbarHostState() }
@@ -77,6 +78,9 @@ fun AssistantsScreen(
                 TopAppBar(
                     title = { Text("角色") },
                     actions = {
+                        TextButton(onClick = onDevices) {
+                            Text("设备")
+                        }
                         TextButton(onClick = onRefresh, enabled = online && !state.loading) {
                             Text("刷新")
                         }

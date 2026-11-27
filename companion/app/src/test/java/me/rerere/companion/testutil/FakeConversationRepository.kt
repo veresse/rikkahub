@@ -32,9 +32,12 @@ class FakeConversationRepository : ConversationRepository {
     )
 
     override suspend fun list(assistantId: String?): AppResult<List<ConversationDto>> {
+        // 先快照再等待：gate 模拟的是“请求在途”，返回的必须是调用当时的列表。
+        // 若在 await 之后才读 items，删除后的空列表会让“旧列表复活”测试形同虚设。
+        val snapshot = items.toList()
         listGate?.await()
         listError?.let { return AppResult.Err(it) }
-        return AppResult.Ok(items.toList())
+        return AppResult.Ok(snapshot)
     }
 
     override suspend fun create(assistantId: String, title: String): AppResult<String> {

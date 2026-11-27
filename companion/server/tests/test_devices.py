@@ -11,6 +11,7 @@ from companion.server.app.models.device import DeviceModel
 from companion.server.app.services.device_registry import (
     register_device_link,
     reset_device_links,
+    unregister_device_link,
 )
 
 
@@ -172,3 +173,71 @@ async def test_device_token_cannot_be_used_as_app_token(client, auth_headers):
         "/api/assistants", headers={"Authorization": f"Bearer {device_token}"}
     )
     assert resp.status_code == 401
+
+
+class _ReadyLink:
+    """最小链路对象：只实现 `device_link_is_online` 读的属性。"""
+
+    def __init__(self):
+        self.ready = True
+        self.closing = False
+        self.closed = False
+
+    async def send(self, command):
+        raise AssertionError("device list must not send commands")
+
+    async def get_status(self):
+        return {}
+
+    async def close(self, code, reason):
+        pass
+
+
+async def test_device_list_reports_online_from_live_link(client, auth_headers):
+    _, pair = await _new_device(client, auth_headers)
+    device_id = pair.json()["device_id"]
+
+    listing = await client.get("/api/devices", headers=auth_headers)
+    row = next(d for d in listing.json() if d["id"] == device_id)
+    # 没有 /device/ws 链路 -> 离线
+    assert row["online"] is False
+
+    link = _ReadyLink()
+    register_device_link(device_id, link)
+    try:
+        listing = await client.get("/api/devices", headers=auth_headers)
+        row = next(d for d in listing.json() if d["id"] == device_id)
+        assert row["online"] is True
+
+        # 收尾阶段（closing）必须按离线处理，否则 App 会显示在线但所有指令都失败。
+        link.closing = True
+        listing = await client.get("/api/devices", headers=auth_headers)
+        row = next(d for d in listing.json() if d["id"] == device_id)
+        assert row["online"] is False
+
+        link.closing = False
+        link.ready = False
+        listing = await client.get("/api/devices", headers=auth_headers)
+        row = next(d for d in listing.json() if d["id"] == device_id)
+        assert row["online"] is False
+    finally:
+        unregister_device_link(device_id, link)
+        reset_device_links()
+
+
+async def test_revoked_device_is_never_online(client, auth_headers):
+    _, pair = await _new_device(client, auth_headers)
+    device_id = pair.json()["device_id"]
+
+    link = _ReadyLink()
+    register_device_link(device_id, link)
+    try:
+        await client.delete(f"/api/devices/{device_id}", headers=auth_headers)
+        listing = await client.get("/api/devices", headers=auth_headers)
+        row = next(d for d in listing.json() if d["id"] == device_id)
+        assert row["is_active"] is False
+        # 链路对象可能因为关闭失败还留在注册表里，但已撤销设备不得显示在线。
+        assert row["online"] is False
+    finally:
+        unregister_device_link(device_id, link)
+        reset_device_links()

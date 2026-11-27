@@ -48,8 +48,10 @@ private class RouteViewModelStoreOwner : ViewModelStoreOwner {
  */
 fun AppRoute.viewModelKey(): String = when (this) {
     AppRoute.Assistants -> "assistants"
+    AppRoute.Devices -> "devices"
     is AppRoute.Conversations -> "conversations:$assistantId"
     is AppRoute.Chat -> "chat:$conversationId"
     is AppRoute.Memories -> "memories:$assistantId"
+    is AppRoute.Remote -> "remote:$deviceId"
     is AppRoute.AssistantEdit -> "assistant-edit:$instanceId"
 }

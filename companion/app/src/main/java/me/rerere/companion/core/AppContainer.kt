@@ -12,10 +12,12 @@ import me.rerere.companion.data.repo.AssistantRepository
 import me.rerere.companion.data.repo.AuthRepository
 import me.rerere.companion.data.repo.ChatRepository
 import me.rerere.companion.data.repo.ConversationRepository
+import me.rerere.companion.data.repo.DeviceRepository
 import me.rerere.companion.data.repo.HttpAssistantRepository
 import me.rerere.companion.data.repo.HttpAuthRepository
 import me.rerere.companion.data.repo.HttpChatRepository
 import me.rerere.companion.data.repo.HttpConversationRepository
+import me.rerere.companion.data.repo.HttpDeviceRepository
 import me.rerere.companion.data.repo.HttpMemoryRepository
 import me.rerere.companion.data.repo.MemoryRepository
 import me.rerere.companion.data.session.Clock
@@ -58,6 +60,8 @@ class AppContainer(
         HttpMemoryRepository(apiFactory, sessionManager)
     val chatRepository: ChatRepository =
         HttpChatRepository(apiFactory, sessionManager)
+    val deviceRepository: DeviceRepository =
+        HttpDeviceRepository(apiFactory, sessionManager)
 
     val appWsManager: AppWsManager = AppWsManager(
         connector = OkHttpWsConnector(),

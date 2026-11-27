@@ -58,16 +58,27 @@ class AppWsManager(
     private var running = false
     private var job: Job? = null
 
+    /** 每次 start/stop 递增；旧 runLoop 收尾时不得清掉新连接的 sink/状态。 */
+    @Volatile
+    private var generation = 0
+
+    /** 当前可写句柄；只在连接已建立时非空，断线/停止后必须立即失效。 */
+    @Volatile
+    private var sink: WsSink? = null
+
     fun start() {
         if (running) return
         running = true
-        job = scope.launch { runLoop() }
+        val gen = ++generation
+        job = scope.launch { runLoop(gen) }
     }
 
     fun stop() {
         running = false
+        generation += 1
         job?.cancel()
         job = null
+        sink = null
         _connection.value = ConnectionState.Stopped
         // 登出/停止后不得把上一个账号的设备与生成状态留给下一个账号。
         _devices.value = emptyMap()
@@ -79,26 +90,31 @@ class AppWsManager(
         networkEpoch.update { it + 1 }
     }
 
-    private suspend fun runLoop() {
+    private suspend fun runLoop(gen: Int) {
         var attempt = 0
         var unauthorized = false
         try {
-            while (currentCoroutineContext().isActive && running) {
+            while (currentCoroutineContext().isActive && running && gen == generation) {
                 val session = sessionProvider() ?: break
                 val epochBefore = networkEpoch.value
                 var openedAt: Long? = null
                 _connection.value = ConnectionState.Connecting
                 try {
                     connector.connect(wsUrl(session.serverUrl), session.token).collect { frame ->
-                        if (!running) return@collect
+                        if (!running || gen != generation) return@collect
                         when (frame) {
                             is WsFrame.Open -> {
                                 openedAt = now()
                                 // 新连接不继承上一连接的生成状态：断线期间的 idle 帧已丢，
                                 // 保留会让该会话永久“生成中”而无法再发送。
                                 _turnStates.value = emptyMap()
+                                // 设备在线态同理：上一连接的缓存可能已过期，先清空，
+                                // 等新连接的 device.status/report 或页面刷新重新填充。
+                                _devices.value = emptyMap()
                                 _connection.value = ConnectionState.Connected
                             }
+
+                            is WsFrame.Writable -> sink = frame.sink
 
                             is WsFrame.Text -> {
                                 _connection.value = ConnectionState.Connected
@@ -106,6 +122,8 @@ class AppWsManager(
                             }
 
                             is WsFrame.Closed -> {
+                                // 先失效再处理 4401：回调里可能触发登出并 stop()。
+                                sink = null
                                 if (frame.code == CLOSE_TOKEN_REVOKED) {
                                     unauthorized = true
                                     running = false
@@ -113,7 +131,7 @@ class AppWsManager(
                                 }
                             }
 
-                            is WsFrame.Failed -> Unit
+                            is WsFrame.Failed -> sink = null
                         }
                     }
                 } catch (e: CancellationException) {
@@ -121,6 +139,10 @@ class AppWsManager(
                 } catch (_: Exception) {
                     // 连接层异常按普通断线处理，日志不得包含事件载荷。
                 }
+                // 流正常/异常结束都算连接失效：旧句柄可能指向已关闭的 socket。
+                // 若已被 stop()/重新 start() 取代，不得清掉新连接的句柄与状态。
+                if (gen != generation) return
+                sink = null
                 if (!running || unauthorized) break
 
                 // 断线期间的 idle 帧会丢；保留旧 generating 会让会话永久无法发送。
@@ -145,9 +167,20 @@ class AppWsManager(
                 }
             }
         } finally {
-            _connection.value = ConnectionState.Stopped
+            if (gen == generation) {
+                sink = null
+                _connection.value = ConnectionState.Stopped
+            }
         }
     }
+
+    /**
+     * 发送一条 App→服务端命令。
+     *
+     * 连接不可写时返回 `false`：调用方必须把它当失败处理（例如显示“未送达”），
+     * 不能乐观地认为命令已入队。
+     */
+    fun send(text: String): Boolean = sink?.send(text) ?: false
 
     /** 只处理 `v == 2` 的已知类型；未知/坏帧静默丢弃。 */
     private fun handle(raw: String) {
@@ -172,9 +205,18 @@ class AppWsManager(
 
             "device.report" -> {
                 val deviceId = payload.string("device_id") ?: return
-                val report = payload["report"] as? JsonObject ?: JsonObject(emptyMap())
-                _devices.update { current ->
-                    current + (deviceId to DeviceStatus(deviceId, online = true))
+                // 服务端 `remote.get_status` 与固件上报都是**扁平**字段（协议 §5.2）；
+                // 旧夹具用过 `{"report":{...}}`。两种都接受：有嵌套就先取嵌套，
+                // 否则用顶层（顶层多出的信封字段会被读取方忽略）。
+                val report = payload["report"] as? JsonObject ?: payload
+                // `source=server` 是 get_status 快照，可能晚于 offline 事件到达；
+                // 在线态只认固件上报（无 source）与 device.status，避免“复活”离线设备。
+                // source 允许放在信封或 report 内：两种实现都按同一规则处理。
+                val source = payload.string("source") ?: report.string("source")
+                if (source != "server") {
+                    _devices.update { current ->
+                        current + (deviceId to DeviceStatus(deviceId, online = true))
+                    }
                 }
                 emit(WsEvent.DeviceReport(deviceId, report))
             }

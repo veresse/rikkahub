@@ -32,23 +32,29 @@ private fun encodeRoute(route: AppRoute): String = json.encodeToString(
     RouteRecord(
         type = when (route) {
             AppRoute.Assistants -> "assistants"
+            AppRoute.Devices -> "devices"
             is AppRoute.Conversations -> "conversations"
             is AppRoute.Chat -> "chat"
             is AppRoute.Memories -> "memories"
+            is AppRoute.Remote -> "remote"
             is AppRoute.AssistantEdit -> "assistant-edit"
         },
         a = when (route) {
             AppRoute.Assistants -> null
+            AppRoute.Devices -> null
             is AppRoute.Conversations -> route.assistantId
             is AppRoute.Chat -> route.conversationId
             is AppRoute.Memories -> route.assistantId
+            is AppRoute.Remote -> route.deviceId
             is AppRoute.AssistantEdit -> route.assistantId
         },
         b = when (route) {
             AppRoute.Assistants -> null
+            AppRoute.Devices -> null
             is AppRoute.Conversations -> route.assistantName
             is AppRoute.Chat -> route.assistantId
             is AppRoute.Memories -> route.assistantName
+            is AppRoute.Remote -> route.deviceName
             is AppRoute.AssistantEdit -> route.instanceId
         },
         c = when (route) {
@@ -62,6 +68,13 @@ private fun decodeRoute(encoded: String): AppRoute {
     val record = runCatching { json.decodeFromString<RouteRecord>(encoded) }.getOrNull()
         ?: return AppRoute.Assistants
     return when (record.type) {
+        "devices" -> AppRoute.Devices
+
+        "remote" -> AppRoute.Remote(
+            deviceId = record.a.orEmpty(),
+            deviceName = record.b.orEmpty(),
+        )
+
         "conversations" -> AppRoute.Conversations(
             assistantId = record.a.orEmpty(),
             assistantName = record.b.orEmpty(),

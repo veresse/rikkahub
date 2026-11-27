@@ -4,6 +4,7 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
+import org.junit.Assert.assertNotEquals
 import org.junit.Assert.assertNotSame
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -57,11 +58,31 @@ class NavigationViewModelTest {
             AppRoute.Memories("a1", "角色"),
             AppRoute.AssistantEdit("a1", "instance-1"),
             AppRoute.AssistantEdit(null, "instance-2"),
+            AppRoute.Devices,
+            AppRoute.Remote("d1", "客厅机器人"),
         )
 
         routes.forEach { route ->
             assertEquals(route, decodeRouteForTest(encodeRouteForTest(route)))
         }
+    }
+
+    @Test
+    fun `remote route keeps device id and name`() {
+        val route = AppRoute.Remote("d1", "客厅机器人")
+        assertEquals(route, decodeRouteForTest(encodeRouteForTest(route)))
+    }
+
+    @Test
+    fun `view model keys distinguish chats and remote devices`() {
+        assertEquals(chat.viewModelKey(), AppRoute.Chat("c1", "a1", "角色").viewModelKey())
+        assertNotEquals(chat.viewModelKey(), otherChat.viewModelKey())
+        assertEquals("remote:d1", AppRoute.Remote("d1", "客厅机器人").viewModelKey())
+        assertNotEquals(
+            AppRoute.Remote("d1", "客厅机器人").viewModelKey(),
+            AppRoute.Remote("d2", "书房机器人").viewModelKey(),
+        )
+        assertNotEquals(AppRoute.Devices.viewModelKey(), chat.viewModelKey())
     }
 
     @Test

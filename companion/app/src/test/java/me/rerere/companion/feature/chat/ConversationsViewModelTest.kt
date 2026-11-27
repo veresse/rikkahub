@@ -92,6 +92,8 @@ class ConversationsViewModelTest {
         vm.delete("c1")
         main.scheduler.advanceUntilIdle()
         assertTrue(vm.state.value.items.isEmpty())
+        // 删除成功必须立刻解除 loading；否则在途列表被作废后页面会一直转圈。
+        assertEquals(false, vm.state.value.loading)
 
         gate.complete(Unit)
         main.scheduler.advanceUntilIdle()

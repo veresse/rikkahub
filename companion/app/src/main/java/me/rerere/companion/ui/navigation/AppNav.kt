@@ -1,6 +1,7 @@
 package me.rerere.companion.ui.navigation
 
 import androidx.activity.compose.BackHandler
+import androidx.activity.compose.LocalActivity
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
@@ -27,8 +28,13 @@ import me.rerere.companion.feature.chat.ConversationsScreen
 import me.rerere.companion.feature.chat.ConversationsViewModel
 import me.rerere.companion.feature.chat.MemoriesScreen
 import me.rerere.companion.feature.chat.MemoriesViewModel
+import me.rerere.companion.feature.devices.DevicesEvent
+import me.rerere.companion.feature.devices.DevicesScreen
+import me.rerere.companion.feature.devices.DevicesViewModel
 import me.rerere.companion.feature.login.LoginScreen
 import me.rerere.companion.feature.login.LoginViewModel
+import me.rerere.companion.feature.remote.RemoteScreen
+import me.rerere.companion.feature.remote.RemoteViewModel
 
 /** 返回节流窗口：同一次连点不弹两级，也不在弹回根页后立刻退出应用。 */
 private const val ROOT_BACK_BLOCK_MILLIS = 400L
@@ -77,7 +83,9 @@ fun AppNav(container: AppContainer) {
     // 弹回根页后的短暂窗口内继续吞掉返回：否则深度 2 的第二下会直接结束
     // Activity，清空 ViewModelStore 并取消在途写请求。窗口过后恢复系统默认退出。
     var blockingRootBack by remember { mutableStateOf(false) }
-    LaunchedEffect(blockingRootBack) {
+    // 每次弹回根页都递增：即使当前已经在屏蔽窗口内，也要把 400ms 重新计时。
+    var rootBlockEpoch by remember { mutableStateOf(0) }
+    LaunchedEffect(rootBlockEpoch) {
         if (!blockingRootBack) return@LaunchedEffect
         delay(ROOT_BACK_BLOCK_MILLIS)
         blockingRootBack = false
@@ -98,7 +106,10 @@ fun AppNav(container: AppContainer) {
         if (now - lastPopAt < ROOT_BACK_BLOCK_MILLIS) return
         lastPopAt = now
         val removed = backStack.removeAt(backStack.lastIndex)
-        if (backStack.size <= 1) blockingRootBack = true
+        if (backStack.size <= 1) {
+            blockingRootBack = true
+            rootBlockEpoch += 1
+        }
         // 弹栈即销毁该页 ViewModel：取消 SSE、停止收集 WS，重进时重新拉详情。
         navigationViewModel.clearRoute(removed)
     }
@@ -132,8 +143,15 @@ fun AppNav(container: AppContainer) {
     when (route) {
         AppRoute.Assistants -> {
             val state by assistantsViewModel.state.collectAsStateWithLifecycle()
-            // 根页面删除角色时禁止返回：系统返回会结束 Activity 并取消 DELETE。
-            BackHandler(enabled = state.deletingId != null) { }
+            val activity = LocalActivity.current
+            // 根页始终接管返回：删除在途时吞掉，其余情况显式结束 Activity。
+            // 必须同步读 `state.value`：collectAsState 落后一帧，用它做 enabled
+            // 会留下“删除已开始但仍能退出、请求被取消”的窗口。
+            BackHandler {
+                if (assistantsViewModel.state.value.deletingId != null) return@BackHandler
+                if (blockingRootBack) return@BackHandler
+                activity?.finish()
+            }
             AssistantsScreen(
                 state = state,
                 events = assistantsViewModel.events,
@@ -145,7 +163,117 @@ fun AppNav(container: AppContainer) {
                 },
                 onEdit = { id -> pushRoute(AppRoute.AssistantEdit(assistantId = id)) },
                 onDelete = assistantsViewModel::delete,
+                onDevices = { pushRoute(AppRoute.Devices) },
                 onLogout = container::logout,
+            )
+        }
+
+        AppRoute.Devices -> {
+            val devicesViewModel: DevicesViewModel = viewModel(
+                viewModelStoreOwner = navigationViewModel.ownerFor(route),
+                key = "devices",
+                factory = viewModelFactory {
+                    initializer {
+                        DevicesViewModel(
+                            repository = container.deviceRepository,
+                            assistantRepository = container.assistantRepository,
+                            conversationRepository = container.conversationRepository,
+                            deviceStatuses = container.appWsManager.devices,
+                            connection = container.appWsManager.connection,
+                            isOnline = { container.isOnline.value },
+                        )
+                    }
+                },
+            )
+            val state by devicesViewModel.state.collectAsStateWithLifecycle()
+            // 从遥控页返回时在线状态/绑定可能已变；重进列表就重新拉一次快照。
+            LaunchedEffect(Unit) { devicesViewModel.refresh() }
+            // 写操作在途时禁止返回：弹栈会取消请求，结果不确定。
+            BackHandler {
+                if (devicesViewModel.state.value.busyId != null) return@BackHandler
+                if (backStack.lastOrNull() == route) popRoute()
+            }
+            LaunchedEffect(devicesViewModel) {
+                devicesViewModel.events.collect { event ->
+                    if (event is DevicesEvent.OpenRemote && backStack.lastOrNull() == route) {
+                        pushRoute(AppRoute.Remote(event.deviceId, event.deviceName))
+                    }
+                }
+            }
+            DevicesScreen(
+                state = state,
+                online = online,
+                onRefresh = devicesViewModel::refresh,
+                onCreatePairCode = { devicesViewModel.createPairCode() },
+                onDismissPairCode = devicesViewModel::dismissPairCode,
+                onRename = devicesViewModel::rename,
+                onStartBind = devicesViewModel::startBind,
+                onSetBindingAssistant = devicesViewModel::setBindingAssistant,
+                onSetBindingConversation = devicesViewModel::setBindingConversation,
+                onBind = devicesViewModel::bind,
+                onDismissBinding = devicesViewModel::dismissBinding,
+                onRevoke = devicesViewModel::revoke,
+                onOpenRemote = devicesViewModel::openRemote,
+                onDismissSnackbar = devicesViewModel::dismissSnackbar,
+                onBack = {
+                    if (devicesViewModel.state.value.busyId == null &&
+                        backStack.lastOrNull() == route
+                    ) {
+                        popRoute()
+                    }
+                },
+            )
+        }
+
+        is AppRoute.Remote -> {
+            val remoteViewModel: RemoteViewModel = viewModel(
+                viewModelStoreOwner = navigationViewModel.ownerFor(route),
+                key = "remote-${route.deviceId}",
+                factory = viewModelFactory {
+                    initializer {
+                        RemoteViewModel(
+                            deviceId = route.deviceId,
+                            deviceName = route.deviceName,
+                            repository = container.deviceRepository,
+                            ws = container.appWsManager,
+                            isOnline = { container.isOnline.value },
+                        )
+                    }
+                },
+            )
+            val state by remoteViewModel.state.collectAsStateWithLifecycle()
+            // 先订阅事件再发命令：ViewModel.start() 内部负责顺序。
+            LaunchedEffect(remoteViewModel) { remoteViewModel.start() }
+            // 在途动作不因弹栈丢 ack/结果：与 4B 的写请求策略一致。
+            val goBack = {
+                if (remoteViewModel.state.value.sendingAction == null &&
+                    backStack.lastOrNull() == route
+                ) {
+                    popRoute()
+                }
+            }
+            BackHandler { goBack() }
+            RemoteScreen(
+                state = state,
+                networkOnline = online,
+                onBack = goBack,
+                onVolumeChange = remoteViewModel::onVolumeChange,
+                onVolumeCommit = remoteViewModel::commitVolume,
+                onToggleMute = remoteViewModel::toggleMute,
+                onPanTiltChange = remoteViewModel::onPanTiltChange,
+                onPanTiltCommit = remoteViewModel::commitPanTilt,
+                onPlayAction = remoteViewModel::playAction,
+                onStop = remoteViewModel::stopAll,
+                onToggleIdle = remoteViewModel::toggleIdle,
+                onSetIntensity = remoteViewModel::setIntensity,
+                onSetSpeed = remoteViewModel::setSpeed,
+                onSetRepeat = remoteViewModel::setRepeat,
+                onPreviewCalibration = remoteViewModel::previewCalibration,
+                onCommitCalibrationPreview = remoteViewModel::commitCalibrationPreview,
+                onCancelCalibration = remoteViewModel::cancelCalibration,
+                onSaveCalibration = remoteViewModel::saveCalibration,
+                onRefreshCatalog = remoteViewModel::refreshCatalog,
+                onDismissResult = remoteViewModel::dismissResult,
             )
         }
 

@@ -30,11 +30,11 @@ import androidx.compose.material3.TextButton
 import androidx.compose.material3.TopAppBar
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
-import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
+import androidx.compose.runtime.snapshotFlow
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontStyle
@@ -77,13 +77,20 @@ fun ChatScreen(
     }
 
     val lastTextLength = state.messages.lastOrNull()?.text?.length ?: 0
-    // 只有用户本来就停在底部时才跟随新内容/流式增量；否则保留其阅读位置。
-    // 用 canScrollForward 判断“下方还有内容”，避免把“最后一条很长、只露出顶部”
-    // 误判成在底部。
-    val atBottom by remember { derivedStateOf { !listState.canScrollForward } }
+    // 是否跟随最新消息：初始为 true（打开长会话要落在底部），只有用户自己
+    // 向上拖动时才关闭。不能在 LaunchedEffect 里现场读 `canScrollForward`：
+    // 首次组合时 list 尚未布局，会读到“下方没有内容”，长历史就不会滚到底。
+    var followTail by remember { mutableStateOf(true) }
+    LaunchedEffect(listState) {
+        snapshotFlow { listState.isScrollInProgress to !listState.canScrollForward }
+            .collect { (scrolling, atBottom) ->
+                // 只认用户手势期间的位置；内容增长导致的 canScrollForward 变化不算。
+                if (scrolling) followTail = atBottom
+            }
+    }
     LaunchedEffect(state.messages.size, lastTextLength) {
         if (state.messages.isEmpty()) return@LaunchedEffect
-        if (atBottom) {
+        if (followTail) {
             listState.scrollToItem(state.messages.lastIndex)
         }
     }

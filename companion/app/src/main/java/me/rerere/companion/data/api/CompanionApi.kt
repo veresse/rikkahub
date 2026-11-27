@@ -1,5 +1,6 @@
 package me.rerere.companion.data.api
 
+import me.rerere.companion.data.api.dto.ActionCatalogDto
 import me.rerere.companion.data.api.dto.AssistantDraft
 import me.rerere.companion.data.api.dto.AssistantDto
 import me.rerere.companion.data.api.dto.ChatRequestDto
@@ -8,9 +9,14 @@ import me.rerere.companion.data.api.dto.ConversationDetailDto
 import me.rerere.companion.data.api.dto.ConversationDto
 import me.rerere.companion.data.api.dto.CorrectionDto
 import me.rerere.companion.data.api.dto.CreatedDto
+import me.rerere.companion.data.api.dto.DeviceBindBody
+import me.rerere.companion.data.api.dto.DeviceDto
+import me.rerere.companion.data.api.dto.DeviceRenameBody
 import me.rerere.companion.data.api.dto.MemoryDto
 import me.rerere.companion.data.api.dto.MemoryUpsert
 import me.rerere.companion.data.api.dto.MessageTextUpdate
+import me.rerere.companion.data.api.dto.PairCodeDto
+import me.rerere.companion.data.api.dto.PairCodeRequest
 import me.rerere.companion.data.api.dto.StatusDto
 import okhttp3.ResponseBody
 import retrofit2.Call
@@ -91,6 +97,29 @@ interface CompanionApi {
 
     @DELETE("api/memories/{id}")
     suspend fun deleteMemory(@Path("id") id: String): StatusDto
+
+    // ---- 4C：设备管理 ----
+
+    @GET("api/devices")
+    suspend fun listDevices(): List<DeviceDto>
+
+    @POST("api/devices/pair-code")
+    suspend fun createPairCode(@Body body: PairCodeRequest): PairCodeDto
+
+    @PUT("api/devices/bind")
+    suspend fun bindDevice(@Body body: DeviceBindBody): StatusDto
+
+    @PUT("api/devices/{id}")
+    suspend fun renameDevice(
+        @Path("id") id: String,
+        @Body body: DeviceRenameBody,
+    ): StatusDto
+
+    @DELETE("api/devices/{id}")
+    suspend fun revokeDevice(@Path("id") id: String): StatusDto
+
+    @GET("api/actions/catalog")
+    suspend fun actionCatalog(): ActionCatalogDto
 
     @Streaming
     @POST("api/chat/completions")

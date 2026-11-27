@@ -1,16 +1,21 @@
 package me.rerere.companion.data.ws
 
-import kotlinx.coroutines.awaitCancellation
 import kotlinx.coroutines.ExperimentalCoroutinesApi
-import kotlinx.coroutines.flow.Flow
+import kotlinx.coroutines.NonCancellable
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.flow
 import kotlinx.coroutines.flow.flowOf
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.advanceTimeBy
 import kotlinx.coroutines.test.runCurrent
 import kotlinx.coroutines.test.runTest
+import kotlinx.coroutines.withContext
 import me.rerere.companion.data.store.StoredSession
+import me.rerere.companion.testutil.FakeConnector
+import me.rerere.companion.testutil.RecordingSink
+import me.rerere.companion.testutil.keepOpen
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -25,22 +30,6 @@ class AppWsManagerTest {
         username = "admin",
         expiresAtMillis = Long.MAX_VALUE,
     )
-
-    private class FakeConnector(
-        private val scripts: MutableList<Flow<WsFrame>>,
-    ) : WsConnector {
-        val attempts = mutableListOf<String>()
-
-        override fun connect(url: String, token: String): Flow<WsFrame> {
-            attempts += url
-            return if (scripts.isEmpty()) flow { awaitCancellation() } else scripts.removeAt(0)
-        }
-    }
-
-    private fun keepOpen(vararg frames: WsFrame): Flow<WsFrame> = flow {
-        frames.forEach { emit(it) }
-        awaitCancellation()
-    }
 
     private fun statusFrame(online: Boolean, reason: String = ""): WsFrame.Text =
         WsFrame.Text(
@@ -83,6 +72,75 @@ class AppWsManagerTest {
         assertTrue(events.any { it is WsEvent.DeviceReport })
         assertTrue(events.any { it is WsEvent.TurnStateChanged })
 
+        manager.stop()
+    }
+
+    @Test
+    fun `reconnect clears cached device statuses`() = runTest {
+        val connector = FakeConnector(
+            mutableListOf(
+                flowOf(
+                    WsFrame.Open,
+                    statusFrame(online = true),
+                    WsFrame.Closed(1011, "lost"),
+                ),
+                keepOpen(WsFrame.Open),
+            ),
+        )
+        val manager = AppWsManager(connector, { session }, {}, backgroundScope)
+        manager.start()
+        runCurrent()
+        assertEquals(true, manager.devices.value["d1"]?.online)
+
+        advanceTimeBy(1_000)
+        runCurrent()
+
+        assertEquals(2, connector.attempts.size)
+        // 新连接不继承上一连接的设备在线缓存：等 device.status/report 重新填充。
+        assertNull(manager.devices.value["d1"])
+        manager.stop()
+    }
+
+    @Test
+    fun `flat device report is accepted and marks the device online`() = runTest {
+        val connector = FakeConnector(
+            mutableListOf(
+                keepOpen(
+                    WsFrame.Open,
+                    WsFrame.Text(
+                        """{"v":2,"type":"device.report","device_id":"d1","volume":30,"state":"idle"}""",
+                    ),
+                ),
+            ),
+        )
+        val manager = AppWsManager(connector, { session }, {}, backgroundScope)
+        manager.start()
+        runCurrent()
+
+        assertEquals(true, manager.devices.value["d1"]?.online)
+        manager.stop()
+    }
+
+    @Test
+    fun `server status snapshot does not resurrect an offline device`() = runTest {
+        val connector = FakeConnector(
+            mutableListOf(
+                keepOpen(
+                    WsFrame.Open,
+                    statusFrame(online = false, reason = "device_offline"),
+                    WsFrame.Text(
+                        """{"v":2,"type":"device.report","device_id":"d1",
+                           "source":"server","volume":30,"state":"idle"}""",
+                    ),
+                ),
+            ),
+        )
+        val manager = AppWsManager(connector, { session }, {}, backgroundScope)
+        manager.start()
+        runCurrent()
+
+        // get_status 快照可能晚于 offline 事件：不得把设备翻回在线。
+        assertFalse(manager.devices.value["d1"]!!.online)
         manager.stop()
     }
 
@@ -299,5 +357,135 @@ class AppWsManagerTest {
     fun `builds ws and wss urls`() {
         assertEquals("ws://host:8000/app/ws", AppWsManager.wsUrl("http://host:8000/"))
         assertEquals("wss://host/app/ws", AppWsManager.wsUrl("https://host"))
+    }
+
+    private val command = """{"v":2,"type":"remote.get_status","request_id":"r1","device_id":"d1"}"""
+
+    @Test
+    fun `send is refused before connecting and after the socket closes`() = runTest {
+        val sink = RecordingSink()
+        val connector = FakeConnector(
+            mutableListOf(
+                flowOf(
+                    WsFrame.Open,
+                    WsFrame.Writable(sink),
+                    WsFrame.Closed(1011, "lost"),
+                ),
+            ),
+        )
+        val manager = AppWsManager(connector, { session }, {}, backgroundScope, now = { 0L })
+
+        assertEquals(false, manager.send(command))
+
+        manager.start()
+        runCurrent()
+
+        // 流已结束并进入重连等待：旧 sink 必须失效，不能往半死连接里写。
+        assertEquals(false, manager.send(command))
+        assertTrue(sink.sent.isEmpty())
+
+        manager.stop()
+    }
+
+    @Test
+    fun `send works while the socket is open and stops after stop`() = runTest {
+        val sink = RecordingSink()
+        val connector = FakeConnector(
+            mutableListOf(
+                keepOpen(
+                    WsFrame.Open,
+                    WsFrame.Writable(sink),
+                    statusFrame(online = true),
+                ),
+            ),
+        )
+        val manager = AppWsManager(connector, { session }, {}, backgroundScope, now = { 0L })
+        manager.start()
+        runCurrent()
+
+        assertEquals(true, manager.send(command))
+        assertEquals(listOf(command), sink.sent)
+
+        manager.stop()
+        assertEquals(false, manager.send(command))
+        assertEquals(1, sink.sent.size)
+    }
+
+    @Test
+    fun `send reports refusal when the sink refuses the frame`() = runTest {
+        val connector = FakeConnector(
+            mutableListOf(
+                keepOpen(
+                    WsFrame.Open,
+                    WsFrame.Writable(WsSink { false }),
+                ),
+            ),
+        )
+        val manager = AppWsManager(connector, { session }, {}, backgroundScope, now = { 0L })
+        manager.start()
+        runCurrent()
+
+        assertEquals(false, manager.send(command))
+        manager.stop()
+    }
+
+    @Test
+    fun `nested server snapshot does not resurrect an offline device`() = runTest {
+        val connector = FakeConnector(
+            mutableListOf(
+                keepOpen(
+                    WsFrame.Open,
+                    statusFrame(online = false, reason = "device_offline"),
+                    WsFrame.Text(
+                        """{"v":2,"type":"device.report","device_id":"d1",
+                           "report":{"source":"server","volume":30,"state":"idle"}}""",
+                    ),
+                ),
+            ),
+        )
+        val manager = AppWsManager(connector, { session }, {}, backgroundScope)
+        manager.start()
+        runCurrent()
+
+        // source 放在嵌套 report 里也必须识别。
+        assertFalse(manager.devices.value["d1"]!!.online)
+        manager.stop()
+    }
+
+    @Test
+    fun `restarting does not let the old loop clear the new sink or connection`() = runTest {
+        val oldSink = RecordingSink()
+        val newSink = RecordingSink()
+        val connector = FakeConnector(
+            mutableListOf(
+                // 旧连接：`Open`+句柄后卡在不可取消的等待里，取消不会立即收尾，
+                // 模拟“旧 runLoop 的 finally 晚于新连接建立”。
+                flow {
+                    emit(WsFrame.Open)
+                    emit(WsFrame.Writable(oldSink))
+                    withContext(NonCancellable) { delay(50) }
+                },
+                keepOpen(WsFrame.Open, WsFrame.Writable(newSink)),
+            ),
+        )
+        val manager = AppWsManager(connector, { session }, {}, backgroundScope, now = { 0L })
+        manager.start()
+        runCurrent()
+        assertEquals(ConnectionState.Connected, manager.connection.value)
+
+        manager.stop()
+        manager.start()
+        runCurrent()
+        assertEquals(ConnectionState.Connected, manager.connection.value)
+
+        // 50ms 后旧协程才收尾：generation 守卫必须让新连接保持 Connected、sink 不被清空。
+        advanceTimeBy(100)
+        runCurrent()
+
+        assertEquals(ConnectionState.Connected, manager.connection.value)
+        assertTrue(manager.send(command))
+        assertEquals(listOf(command), newSink.sent)
+        assertTrue(oldSink.sent.isEmpty())
+        manager.stop()
     }
 }
