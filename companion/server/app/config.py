@@ -72,13 +72,18 @@ class Settings(BaseSettings):
 
     # 语音云服务 (阿里云百炼)
     DASHSCOPE_API_KEY: str = ""
+    DASHSCOPE_REGION: str = "cn-beijing"
     DASHSCOPE_ASR_MODEL: str = "fun-asr-realtime"
     DASHSCOPE_TTS_MODEL: str = "qwen-audio-3.0-tts-flash"
     DASHSCOPE_TTS_VOICE: str = "cherry"  # 默认温柔男声预设
     # TTS 容器：ogg（DashScope 流式 Opus）或 raw（每块当一包）；真机烟测后再定。
     DASHSCOPE_TTS_CONTAINER: str = "ogg"
+    # Block C：真实适配器。URL 覆盖只用于本地假 WS/SSE 测试，默认空表示按设计构造。
+    DASHSCOPE_WORKSPACE_ID: str = ""
+    DASHSCOPE_ASR_WS_URL: str = ""
+    DASHSCOPE_TTS_HTTP_URL: str = ""
 
-    # 语音管线（Block B）。VOICE_PROVIDER=mock|unavailable；dashscope 留到 Block C。
+    # 语音管线。VOICE_PROVIDER=mock|unavailable|dashscope。
     # 默认 unavailable：未配置云 Key 时语音入口明确回 asr_unavailable，不会静默占用。
     VOICE_ENABLED: bool = True
     VOICE_PROVIDER: str = "unavailable"

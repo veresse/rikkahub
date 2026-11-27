@@ -44,4 +44,5 @@
 | 22 | Phase 3 停机（三）：offline 补偿 | ✅ 已完成 | 取消越过 unregister 后靠 `pending_offline_reason` 补发、`_teardown()` 取消回填、offline at-least-once、测试隔离与 mutation 超时区分；231 passed |
 | 23 | 音频 Block 设计（ASR/TTS/barge-in） | ✅ 设计已批准 | 协议补齐、纯 Python Ogg、VoiceSession/打断/落库/超时方案；子块 A→B→C |
 | 24 | 音频 Block A：协议 / 帧 / Ogg / 传输 | ✅ 已完成（已审查修复） | 12B 帧、Ogg mux/demux、`send_bytes/send_audio`、VoiceSession 门控、模拟器二进制、协议 §4.8/§5.4；364 passed、mutation 17/17 |
-| 25 | 音频 Block B：Mock 管线 / 打断 / 落库 / 网关接线 | ✅ 已完成（七轮审查修复） | 流式分句、Mock ASR/TTS、下行节流、完整轮次、barge-in、取消落库、运行时注入、6 例真实 WS 语音 e2e；旧轮清理隔离、每轮 `turn_key` 幂等落库、落库锁内重算下标、取消预算、barge-in 后可立即重开、GeneratorExit 先释放锁、speaker 按轮隔离等修复；403 passed、mutation 15/15 |
+| 25 | 音频 Block B：Mock 管线 / 打断 / 落库 / 网关接线 | ✅ 已完成（八轮审查修复） | 流式分句、Mock ASR/TTS、下行节流、完整轮次、barge-in、取消落库、运行时注入、6 例真实 WS 语音 e2e；旧轮清理隔离、每轮 `turn_key` 幂等落库、落库锁内重算下标、取消预算、barge-in 后可立即重开、GeneratorExit 先释放锁、speaker 按轮隔离等修复；403 passed、mutation 15/15 |
+| 26 | 音频 Block C：真实 DashScope 适配器 | ✅ 已完成（三轮审查修复；真实云/真机待办） | ASR WebSocket `fun-asr-realtime`、TTS HTTP SSE `qwen-audio-3.0-tts-flash`、URL/配置/区域、缺 Key 降级、烟测脚本；本地假 WS/SSE 覆盖握手/上行/final/finish 超时/断线/close 竞态/连接异常与完整轮次；**448 passed**、mutation 15/15 + 9/9；真实云与真机未验证 |

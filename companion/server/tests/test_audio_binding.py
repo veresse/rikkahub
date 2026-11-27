@@ -12,6 +12,10 @@ from companion.server.app.audio.binding import (
     build_voice_runtime,
     resolve_conversation_for_device,
 )
+from companion.server.app.audio.dashscope import (
+    DashScopeAsrProvider,
+    DashScopeTtsProvider,
+)
 from companion.server.app.audio.providers import (
     MockAsrProvider,
     MockTtsProvider,
@@ -219,8 +223,51 @@ def test_runtime_mock_provider(monkeypatch):
 
 def test_runtime_unknown_provider_falls_back_to_unavailable(monkeypatch):
     monkeypatch.setattr(settings, "VOICE_ENABLED", True)
-    monkeypatch.setattr(settings, "VOICE_PROVIDER", "dashscope")
+    monkeypatch.setattr(settings, "VOICE_PROVIDER", "not-a-provider")
     runtime = build_voice_runtime(bus=object())
     assert runtime is not None
     assert isinstance(runtime.asr, UnavailableAsrProvider)
     assert isinstance(runtime.tts, UnavailableTtsProvider)
+
+
+def test_runtime_dashscope_without_key_falls_back(monkeypatch, caplog):
+    monkeypatch.setattr(settings, "VOICE_ENABLED", True)
+    monkeypatch.setattr(settings, "VOICE_PROVIDER", "dashscope")
+    monkeypatch.setattr(settings, "DASHSCOPE_API_KEY", "")
+    with caplog.at_level("WARNING"):
+        runtime = build_voice_runtime(bus=object())
+    assert runtime is not None
+    assert isinstance(runtime.asr, UnavailableAsrProvider)
+    assert isinstance(runtime.tts, UnavailableTtsProvider)
+    assert "DASHSCOPE_API_KEY" in caplog.text
+
+
+def test_runtime_dashscope_with_key_builds_adapters(monkeypatch):
+    monkeypatch.setattr(settings, "VOICE_ENABLED", True)
+    monkeypatch.setattr(settings, "VOICE_PROVIDER", "dashscope")
+    monkeypatch.setattr(settings, "DASHSCOPE_API_KEY", "sk-test-key")
+    monkeypatch.setattr(settings, "DASHSCOPE_ASR_WS_URL", "ws://127.0.0.1:9001/asr")
+    monkeypatch.setattr(settings, "DASHSCOPE_TTS_HTTP_URL", "http://127.0.0.1:9002/tts")
+
+    runtime = build_voice_runtime(bus=object())
+    assert runtime is not None
+    assert isinstance(runtime.asr, DashScopeAsrProvider)
+    assert isinstance(runtime.tts, DashScopeTtsProvider)
+    # 构造阶段不联网；override 只影响 URL，不触发连接。
+    assert runtime.asr._url == "ws://127.0.0.1:9001/asr"
+    assert runtime.tts._url == "http://127.0.0.1:9002/tts"
+
+
+def test_runtime_dashscope_builds_workspace_url(monkeypatch):
+    monkeypatch.setattr(settings, "VOICE_ENABLED", True)
+    monkeypatch.setattr(settings, "VOICE_PROVIDER", "dashscope")
+    monkeypatch.setattr(settings, "DASHSCOPE_API_KEY", "sk-test-key")
+    monkeypatch.setattr(settings, "DASHSCOPE_ASR_WS_URL", "")
+    monkeypatch.setattr(settings, "DASHSCOPE_WORKSPACE_ID", "ws-123")
+    monkeypatch.setattr(settings, "DASHSCOPE_REGION", "cn-shanghai")
+
+    runtime = build_voice_runtime(bus=object())
+    assert runtime is not None
+    assert runtime.asr._url == (
+        "wss://ws-123.cn-shanghai.maas.aliyuncs.com/api-ws/v1/inference"
+    )

@@ -13,6 +13,10 @@ from typing import Any
 
 from sqlalchemy import select
 
+from companion.server.app.audio.dashscope import (
+    DashScopeAsrProvider,
+    DashScopeTtsProvider,
+)
 from companion.server.app.audio.providers import (
     MockAsrProvider,
     MockTtsProvider,
@@ -81,17 +85,38 @@ async def resolve_conversation_for_device(
 
 
 def _build_providers() -> tuple[Any, Any]:
-    """按 `VOICE_PROVIDER` 选择 provider；未知/未实现的值一律按不可用处理。"""
+    """按 `VOICE_PROVIDER` 选择 provider；未知/未配置 Key 一律按不可用处理。"""
     provider = (settings.VOICE_PROVIDER or "").strip().lower()
     if provider == "mock":
         return (
             MockAsrProvider([{"final": "（mock）你好，我在。"}]),
             MockTtsProvider(),
         )
+    if provider == "dashscope":
+        if not (settings.DASHSCOPE_API_KEY or "").strip():
+            # 缺 Key 时明确降级，绝不尝试连接云服务。
+            logger.warning(
+                "VOICE_PROVIDER=dashscope but DASHSCOPE_API_KEY is empty; "
+                "falling back to unavailable"
+            )
+            return UnavailableAsrProvider(), UnavailableTtsProvider()
+        return (
+            DashScopeAsrProvider(
+                settings.DASHSCOPE_API_KEY,
+                model=settings.DASHSCOPE_ASR_MODEL,
+                url=settings.DASHSCOPE_ASR_WS_URL,
+                workspace_id=settings.DASHSCOPE_WORKSPACE_ID,
+                region=settings.DASHSCOPE_REGION,
+            ),
+            DashScopeTtsProvider(
+                settings.DASHSCOPE_API_KEY,
+                model=settings.DASHSCOPE_TTS_MODEL,
+                voice=settings.DASHSCOPE_TTS_VOICE,
+                url=settings.DASHSCOPE_TTS_HTTP_URL,
+            ),
+        )
     if provider == "unavailable":
         return UnavailableAsrProvider(), UnavailableTtsProvider()
-    # dashscope 等真实适配器留到 Block C：未接入前明确回 asr_unavailable，
-    # 绝不偷偷使用未验证的云连接。
     logger.warning(
         "voice provider %r not implemented, falling back to unavailable",
         provider,
