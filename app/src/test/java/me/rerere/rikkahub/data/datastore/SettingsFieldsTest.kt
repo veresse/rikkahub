@@ -136,7 +136,8 @@ private val SAMPLE = Settings(
     suggestionPrompt = "suggestion",
     ocrModelId = id(5),
     ocrPrompt = "ocr",
-    enableAutoCompress = false,
+    // 本仓库的默认值是 false（上游为 true），样本取 true 才能与默认值区分开
+    enableAutoCompress = true,
     autoCompressThreshold = 0.9f,
     assistantId = id(20),
     providers = listOf(ProviderSetting.OpenAI(id = id(31), name = "Provider")),
