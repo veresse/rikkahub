@@ -17,6 +17,13 @@ on:
       source_ref:
         type: string
         required: true
+    outputs:
+      version:
+        description: '本次发布的版本号'
+        value: ${{ jobs.build.outputs.version }}
+      tag:
+        description: '本次发布的 Release 标签'
+        value: ${{ jobs.build.outputs.tag }}
 
 concurrency:
   group: custom-release-publish
@@ -28,6 +35,9 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    outputs:
+      version: ${{ steps.vars.outputs.version }}
+      tag: ${{ steps.vars.outputs.tag }}
 
     steps:
       - name: Checkout Code
@@ -104,7 +114,10 @@ jobs:
       - name: Grant execute permission for gradlew
         run: chmod +x gradlew
 
-      - name: Build with Gradle
+      # 先跑单元测试再出包：测试失败时不花时间做 R8 和打包。单元测试包含自定义功能的回归测试，
+      # 任何来源（手动推送、定时同步、手动触发）的构建都必须通过后才会发布。
+      - name: Test and build with Gradle
+        id: gradle
         env:
           KEYSTORE_FILE: ${{ github.workspace }}/app/custom-release.jks
           KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
@@ -113,10 +126,24 @@ jobs:
           APK_VERSION_NAME: ${{ steps.vars.outputs.version }}
           APK_VERSION_CODE: ${{ steps.vars.outputs.code }}
         run: |
-          ./gradlew assembleGithubRelease -PcustomVersionName="$APK_VERSION_NAME" -PcustomVersionCode="$APK_VERSION_CODE" --no-daemon --stacktrace
+          ./gradlew :app:testGithubDebugUnitTest assembleGithubRelease -PcustomVersionName="$APK_VERSION_NAME" -PcustomVersionCode="$APK_VERSION_CODE" --no-daemon --stacktrace
 
-      - name: Upload APKs to GitHub Release
+      - name: Upload unit test report
+        if: failure() && steps.gradle.conclusion == 'failure'
+        uses: actions/upload-artifact@v4
+        with:
+          name: unit-test-reports
+          path: app/build/reports/tests/
+          if-no-files-found: ignore
+          retention-days: 14
+
+      # 先以草稿上传全部 APK，再公开：应用内更新读取 releases/latest，公开的 Release 必须已经带齐安装包。
+      # 发布串行进行（concurrency 组 custom-release-publish），不会与手动推送触发的构建互相覆盖。
+      - name: Upload APKs to draft GitHub Release
+        id: release
         uses: softprops/action-gh-release@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
           tag_name: ${{ steps.vars.outputs.tag }}
           target_commitish: ${{ inputs.source_ref || github.sha }}
@@ -129,5 +156,20 @@ jobs:
             - 支持手机端一键平滑覆盖更新（签名永久一致）
           files: |
             app/build/outputs/apk/github/release/*.apk
-          draft: false
+          draft: true
           prerelease: false
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_ID: ${{ steps.release.outputs.id }}
+          TAG: ${{ steps.vars.outputs.tag }}
+        run: |
+          set -euo pipefail
+          COUNT=$(gh api "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}" --jq '[.assets[] | select(.name | endswith(".apk"))] | length')
+          if [ "$COUNT" -lt 1 ]; then
+            echo "::error::草稿 Release $TAG 中没有 APK，拒绝公开。"
+            exit 1
+          fi
+          gh api --method PATCH "repos/${GITHUB_REPOSITORY}/releases/${RELEASE_ID}" -F draft=false -f make_latest=true
+          echo "已公开 Release $TAG（$COUNT 个 APK）"

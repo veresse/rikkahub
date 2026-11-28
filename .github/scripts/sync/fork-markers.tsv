@@ -1,0 +1,37 @@
+# 自定义功能在上游代码中的挂载点。同步时由 verify_fork.py 校验，缺任何一项都禁止自动进入 main。
+# 格式（制表符分隔）：
+#   exists<TAB>路径                     文件必须存在
+#   contains<TAB>路径<TAB>标记          文件中必须包含该文本
+#
+# 上游重构了这些位置时，需要人工把对应自定义功能重新接入，然后更新本表。
+exists	.github/workflows/build-custom-release.yml
+exists	tools/database/upstream-integration.test.cjs
+exists	web-ui/pnpm-workspace.yaml
+exists	docs/app-updates.md
+#
+# 应用内更新：权限、组件、更新源、入口
+contains	app/src/github/AndroidManifest.xml	android.permission.REQUEST_INSTALL_PACKAGES
+contains	app/src/github/AndroidManifest.xml	.utils.UpdateDownloadReceiver
+contains	app/src/main/AndroidManifest.xml	.ui.activity.AppUpdateActivity
+contains	app/src/main/java/me/rerere/rikkahub/utils/UpdateChecker.kt	https://api.github.com/repos/veresse/rikkahub/releases/latest
+contains	app/src/main/java/me/rerere/rikkahub/di/AppModule.kt	AppUpdateWorker
+contains	app/src/main/java/me/rerere/rikkahub/RikkaHubApp.kt	AppUpdateWorker.schedule(
+contains	app/src/main/java/me/rerere/rikkahub/RouteActivity.kt	AppUpdatePrompt()
+contains	app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingAboutPage.kt	AppUpdateActivity
+#
+# 主动消息（自动聊天）：依赖注入、路由、设置入口、启动调度
+contains	app/src/main/java/me/rerere/rikkahub/di/AppModule.kt	AutoChatExecutionService(
+contains	app/src/main/java/me/rerere/rikkahub/di/AppModule.kt	AutoChatScheduler(
+contains	app/src/main/java/me/rerere/rikkahub/di/DataSourceModule.kt	autoChatRuleDao()
+contains	app/src/main/java/me/rerere/rikkahub/di/RepositoryModule.kt	AutoChatRepository(
+contains	app/src/main/java/me/rerere/rikkahub/di/ViewModelModule.kt	viewModelOf(::AutoChatViewModel)
+contains	app/src/main/java/me/rerere/rikkahub/RikkaHubApp.kt	resumeAutoChat(
+contains	app/src/main/java/me/rerere/rikkahub/RouteActivity.kt	entry<Screen.SettingAutoChat>
+contains	app/src/main/java/me/rerere/rikkahub/ui/pages/setting/SettingPage.kt	Screen.SettingAutoChat)
+contains	app/src/main/java/me/rerere/rikkahub/service/ChatService.kt	fun isSessionBusy(
+contains	app/src/main/java/me/rerere/rikkahub/service/ChatService.kt	suspend fun <T> withExistingSession(
+contains	app/src/main/java/me/rerere/rikkahub/data/db/AppDatabase.kt	version = 35
+contains	app/src/main/java/me/rerere/rikkahub/data/db/AppDatabaseFactory.kt	Migration_33_35
+contains	app/src/main/java/me/rerere/rikkahub/data/db/AppDatabaseFactory.kt	Migration_34_35
+contains	app/src/main/res/values/strings.xml	name="auto_chat_
+contains	app/src/main/res/values-zh/strings.xml	name="auto_chat_
