@@ -29,6 +29,9 @@
 | 编译或单元测试失败 | 交接 PR 指向 `sync/staging` 的合并结果 | 在该运行的 Artifacts 中查看单元测试报告，修复后合并或推送 main |
 | 构建期间 main 有新提交 | 放弃本次快进并报错 | 无需处理，下一次定时同步会基于新的 main 重新合并 |
 | 拉取或推送失败 | 自动重试 3 次 | 仍失败时查看日志；下一次定时运行会再次尝试 |
+| 上游改动了 `.github/workflows` 下的文件 | 工作流令牌无权推送，交接 PR 说明涉及文件 | 配置 Secret `SYNC_PUSH_TOKEN`（具备 `repo` + `workflow` 权限的 PAT）后重跑；或本地合并后推送 main |
+
+GitHub 只允许工作流自带令牌推送工作流文件与 main 一致的提交。因此合并冲突或上述情况下，交接分支无法放置上游提交，PR 分支只含一份处理说明（`.github/SYNC_HANDOFF.md`），网页 “Resolve conflicts” 不可用，请按 PR 正文在本地处理；配置 `SYNC_PUSH_TOKEN` 后交接分支恢复为可网页解决冲突的合并提交。
 
 处理完成后用 **Create a merge commit** 合并 PR（不要 Squash，否则上游提交不会成为 main 的祖先，下次同步会重复处理）。推送 main 会自动构建发布，下一次定时同步确认已追平上游后会自动关闭交接 PR。在 `sync/handoff` 分支上留下的人工提交不会被机器人覆盖或删除。
 

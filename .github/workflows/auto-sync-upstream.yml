@@ -33,6 +33,8 @@ env:
 # 流程：合并上游 → 自动解决"双方均只新增内容"的 XML 冲突 → 自定义修改保全校验 →
 #       推送到 staging 分支 → 编译 + 单元测试 + 发布 Release → 快进 main。
 # 任何一步受阻都不改动 main、不发布，并创建/刷新一个交接 PR 作为唯一的人工处理入口。
+# 注意：GITHUB_TOKEN 不能推送改动 .github/workflows 的提交。上游改了工作流文件时会受阻并走交接 PR；
+#       配置仓库 Secret SYNC_PUSH_TOKEN（具备 repo + workflow 权限的 PAT）后可自动通过。
 # 详细说明见 docs/upstream-sync.md。
 jobs:
   sync:
@@ -42,6 +44,8 @@ jobs:
       contents: write
       pull-requests: write
       issues: write
+    env:
+      SYNC_PUSH_TOKEN: ${{ secrets.SYNC_PUSH_TOKEN }}
     outputs:
       staged: ${{ steps.stage.outputs.staged }}
       staging_ref: ${{ steps.stage.outputs.staging_ref }}
@@ -64,9 +68,16 @@ jobs:
           DRILL_BASE: ${{ inputs.drill_base_ref }}
         run: |
           source "$SYNC_SCRIPTS/sync-lib.sh"
-          SHA=$(git rev-parse --verify "${DRILL_BASE}^{commit}")
-          git checkout -q --detach "$SHA"
-          retry 3 10 git push origin "+${SHA}:refs/heads/${DRILL_BASE_BRANCH}"
+          git rev-parse --verify --quiet "${DRILL_BASE}^{commit}" >/dev/null || { echo "::error::drill_base_ref 不是可识别的提交：$DRILL_BASE"; exit 1; }
+          git checkout -q --detach "${DRILL_BASE}^{commit}"
+          # GitHub 只放行工作流文件与 main 一致的推送，且旧提交里没有同步脚本：
+          # 演练基线保留历史内容，工作流文件和同步脚本取自当前 main
+          git rm -r -q --ignore-unmatch .github/workflows .github/scripts/sync
+          git checkout -q origin/main -- .github/workflows "$SYNC_SCRIPTS"
+          git commit -q --allow-empty -m "chore(auto-sync): [演练] 以当前 main 的工作流文件重建演练基线 [skip ci]"
+          SHA=$(git rev-parse HEAD)
+          echo "演练基线 $(git rev-parse --short "${DRILL_BASE}^{commit}")（工作流文件取自 main）→ $SHA"
+          push_guarded "+${SHA}:refs/heads/${DRILL_BASE_BRANCH}"
           {
             echo "SYNC_DRILL=1"
             echo "PR_BASE=${DRILL_BASE_BRANCH}"
@@ -191,7 +202,7 @@ jobs:
         run: |
           source "$SYNC_SCRIPTS/sync-lib.sh"
           echo "SYNC_STATE=drill-no-conflict" >> "$GITHUB_ENV"
-          git push origin --delete "$DRILL_BASE_BRANCH"
+          push_origin --delete "$DRILL_BASE_BRANCH"
           echo "::error::演练基线与上游之间没有冲突，未覆盖到冲突处理路径。请更换 drill_base_ref / drill_upstream_ref。"
           exit 1
 
@@ -224,17 +235,27 @@ jobs:
         if: steps.merge.outputs.result == 'merged' && steps.guard.outputs.ok == 'true'
         run: |
           source "$SYNC_SCRIPTS/sync-lib.sh"
-          retry 3 10 git push origin "+HEAD:refs/heads/$STAGING_BRANCH"
+          STATUS=0
+          push_guarded "+HEAD:refs/heads/$STAGING_BRANCH" || STATUS=$?
+          if [ "$STATUS" -eq 2 ]; then
+            # 上游改动了工作流文件，GITHUB_TOKEN 无权推送：交给交接 PR
+            echo "protected=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          [ "$STATUS" -eq 0 ]
           echo "SYNC_STATE=staged" >> "$GITHUB_ENV"
           echo "staged=true" >> "$GITHUB_OUTPUT"
           echo "staging_ref=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
 
       - name: Raise handoff PR
-        if: steps.merge.outputs.result == 'conflict' || steps.merge.outputs.result == 'no-history' || steps.guard.outputs.ok == 'false'
+        if: steps.merge.outputs.result == 'conflict' || steps.merge.outputs.result == 'no-history' || steps.guard.outputs.ok == 'false' || steps.stage.outputs.protected == 'true'
         env:
           RESULT: ${{ steps.merge.outputs.result }}
+          PROTECTED: ${{ steps.stage.outputs.protected }}
         run: |
           source "$SYNC_SCRIPTS/sync-lib.sh"
+          # 交接分支降级时，处理说明提交要落在自定义代码基线上（工作流文件与 main 一致）
+          export HANDOFF_NOTE_PARENT="$FORK_HEAD"
           case "$RESULT" in
             merged)
               HEAD_SHA=$(git rev-parse HEAD)
@@ -243,6 +264,32 @@ jobs:
               HEAD_SHA="$UPSTREAM_REF"
               TITLE="⚠️ 上游同步存在合并冲突，需要人工处理" ;;
           esac
+          if [ "$PROTECTED" = "true" ]; then
+            HEAD_SHA=""
+            TITLE="⚠️ 上游改动了工作流文件，自动同步无权推送，需要人工处理"
+            {
+              echo "上游的改动涉及 \`.github/workflows\` 下的文件。GitHub 不允许自动同步使用的工作流令牌推送这类改动，已通过自定义修改保全校验的合并结果无法进入构建和发布流程。"
+              echo
+              echo '涉及文件（合并结果相对当前 main）：'
+              # shellcheck disable=SC2016  # Markdown 反引号需要原样输出
+              git diff --name-only "$FORK_HEAD" HEAD -- .github/workflows | sed 's/^/- `/; s/$/`/'
+              echo
+              echo '### 处理方式'
+              # shellcheck disable=SC2016  # Markdown 反引号需要原样输出
+              echo '**方式 A（一次配置，长期有效）**：创建一个具备 `repo` 和 `workflow` 权限的 Personal Access Token（Fine-grained token 需勾选 Workflows 读写），添加为本仓库的 Secret `SYNC_PUSH_TOKEN`。之后重新运行本工作流即可自动完成。'
+              echo
+              echo '**方式 B（本地）**'
+              echo '```bash'
+              echo 'git fetch upstream'
+              echo "git merge $UPSTREAM_REF"
+              echo '# 如有冲突，逐个解决后 git add <文件>'
+              echo './gradlew :app:testGithubDebugUnitTest'
+              echo 'git push origin main'
+              echo '```'
+              echo
+              echo "推送到 main 后会自动构建并发布，手机端应用可通过应用内更新收到。下一次定时同步确认已追平上游后会自动关闭本 PR。"
+            } > "${RUNNER_TEMP}/handoff-report.md"
+          fi
           [ -n "${SYNC_DRILL:-}" ] && TITLE="[演练] $TITLE"
           BODY="${RUNNER_TEMP}/handoff-body.md"
           {
@@ -276,15 +323,22 @@ jobs:
           source "$SYNC_SCRIPTS/sync-lib.sh"
           if [ -n "${SYNC_DRILL:-}" ]; then
             echo "SYNC_STATE=drill-no-conflict" >> "$GITHUB_ENV"
-            git push origin --delete "$DRILL_BASE_BRANCH"
+            push_origin --delete "$DRILL_BASE_BRANCH"
             echo "::error::演练基线已经包含上游提交，未覆盖到冲突处理路径。"
             exit 1
           fi
           echo "SYNC_STATE=no-updates" >> "$GITHUB_ENV"
           handoff_resolve "main 已追平上游，同步已恢复，自动关闭本 PR。"
           if [ -n "$(git ls-remote origin "refs/heads/$STAGING_BRANCH")" ]; then
-            git push origin --delete "$STAGING_BRANCH"
+            push_origin --delete "$STAGING_BRANCH"
           fi
+
+      - name: Clean up drill on failure
+        if: failure() && steps.drill.outputs.drill == 'true'
+        run: |
+          source "$SYNC_SCRIPTS/sync-lib.sh"
+          drill_cleanup
+          [ -n "${SYNC_STATE:-}" ] || echo "SYNC_STATE=drill-failed" >> "$GITHUB_ENV"
 
       - name: Summary
         if: always()
@@ -295,6 +349,7 @@ jobs:
             blocked) NOTE="同步受阻，上游更新未进入 main，也未发布。请处理交接 PR。" ;;
             drill-ok) NOTE="演练完成：冲突被识别，交接 PR 已创建并自动关闭。" ;;
             drill-no-conflict) NOTE="演练未覆盖冲突路径。" ;;
+            drill-failed) NOTE="演练未完成，请检查上方步骤日志。" ;;
             *) NOTE="同步流程未完成，请检查上方步骤日志。" ;;
           esac
           {
@@ -329,6 +384,8 @@ jobs:
       contents: write
       pull-requests: write
       issues: write
+    env:
+      SYNC_PUSH_TOKEN: ${{ secrets.SYNC_PUSH_TOKEN }}
     steps:
       - name: Checkout main branch
         uses: actions/checkout@v4
@@ -346,7 +403,7 @@ jobs:
             echo "::error::main 在构建期间有新提交，无法快进到已验证的合并结果。已发布的 Release 基于合并结果；下一次同步会基于新的 main 重新合并。"
             exit 1
           fi
-          retry 3 10 git push origin "${STAGING_REF}:refs/heads/main"
+          push_guarded "${STAGING_REF}:refs/heads/main"
           echo "main 已快进到 $(git rev-parse --short "$STAGING_REF")"
 
       - name: Close handoff PR
@@ -373,7 +430,9 @@ jobs:
           exit 1
 
       - name: Clean up staging branch
-        run: git push origin --delete "$STAGING_BRANCH"
+        run: |
+          source "$SYNC_SCRIPTS/sync-lib.sh"
+          push_origin --delete "$STAGING_BRANCH"
 
   handoff:
     name: Raise handoff (build failed)
@@ -384,6 +443,8 @@ jobs:
       contents: write
       pull-requests: write
       issues: write
+    env:
+      SYNC_PUSH_TOKEN: ${{ secrets.SYNC_PUSH_TOKEN }}
     steps:
       - name: Checkout main branch
         uses: actions/checkout@v4
