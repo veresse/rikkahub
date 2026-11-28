@@ -5,22 +5,46 @@ on:
     # 每天北京时间 02:00、08:00、14:00、20:00
     - cron: '0 0,6,12,18 * * *'
   workflow_dispatch:
-    # 支持随时在 GitHub 网页上点击按钮立即主动检查同步
+    inputs:
+      drill_base_ref:
+        description: '演练（可选）：以该提交为同步基线重放冲突处理，验证交接 PR 告警链路；不改动 main、不发布'
+        type: string
+        required: false
+        default: ''
+      drill_upstream_ref:
+        description: '演练时合并的上游提交或分支（默认 upstream/master）'
+        type: string
+        required: false
+        default: ''
 
 concurrency:
   group: sync-upstream
   cancel-in-progress: false
 
+permissions:
+  contents: read
+
+env:
+  GH_TOKEN: ${{ github.token }}
+  SYNC_SCRIPTS: .github/scripts/sync
+  STAGING_BRANCH: sync/staging
+  DRILL_BASE_BRANCH: sync/drill-base
+
+# 流程：合并上游 → 自动解决"双方均只新增内容"的 XML 冲突 → 自定义修改保全校验 →
+#       推送到 staging 分支 → 编译 + 单元测试 + 发布 Release → 快进 main。
+# 任何一步受阻都不改动 main、不发布，并创建/刷新一个交接 PR 作为唯一的人工处理入口。
+# 详细说明见 docs/upstream-sync.md。
 jobs:
   sync:
     name: Check & Sync Upstream
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      pull-requests: write
+      issues: write
     outputs:
-      updated: ${{ steps.merge.outputs.updated }}
-      revision: ${{ steps.merge.outputs.revision }}
-
+      staged: ${{ steps.stage.outputs.staged }}
+      staging_ref: ${{ steps.stage.outputs.staging_ref }}
     steps:
       - name: Checkout main branch
         uses: actions/checkout@v4
@@ -33,51 +57,357 @@ jobs:
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
 
+      - name: Prepare drill
+        id: drill
+        if: inputs.drill_base_ref != ''
+        env:
+          DRILL_BASE: ${{ inputs.drill_base_ref }}
+        run: |
+          source "$SYNC_SCRIPTS/sync-lib.sh"
+          SHA=$(git rev-parse --verify "${DRILL_BASE}^{commit}")
+          git checkout -q --detach "$SHA"
+          retry 3 10 git push origin "+${SHA}:refs/heads/${DRILL_BASE_BRANCH}"
+          {
+            echo "SYNC_DRILL=1"
+            echo "PR_BASE=${DRILL_BASE_BRANCH}"
+          } >> "$GITHUB_ENV"
+          echo "drill=true" >> "$GITHUB_OUTPUT"
+
       - name: Fetch upstream repository
         run: |
-          git remote add upstream https://github.com/rikkahub/rikkahub.git
-          git fetch upstream master
+          source "$SYNC_SCRIPTS/sync-lib.sh"
+          git remote get-url upstream >/dev/null 2>&1 || git remote add upstream https://github.com/rikkahub/rikkahub.git
+          retry 3 10 git fetch upstream master
 
       - name: Compare with upstream
         id: check_diff
+        env:
+          DRILL_UPSTREAM: ${{ inputs.drill_upstream_ref }}
         run: |
-          BEHIND=$(git rev-list --count HEAD..upstream/master)
-          echo "behind_count=$BEHIND" >> $GITHUB_OUTPUT
-          echo ">>> 相比作者 upstream/master 落后提交数: $BEHIND"
-          echo "### Upstream check" >> "$GITHUB_STEP_SUMMARY"
-          echo "New upstream commits: $BEHIND" >> "$GITHUB_STEP_SUMMARY"
+          source "$SYNC_SCRIPTS/sync-lib.sh"
+          if [ -n "$DRILL_UPSTREAM" ]; then
+            SHA=$(git rev-parse --verify --quiet "${DRILL_UPSTREAM}^{commit}") \
+              || SHA=$(git rev-parse --verify "upstream/${DRILL_UPSTREAM}^{commit}")
+          else
+            SHA=$(git rev-parse upstream/master)
+          fi
+          BEHIND=$(git rev-list --count "HEAD..$SHA")
+          AHEAD=$(git rev-list --count "$SHA..HEAD")
+          {
+            echo "UPSTREAM_REF=$SHA"
+            echo "BEHIND=$BEHIND"
+            echo "AHEAD=$AHEAD"
+          } >> "$GITHUB_ENV"
+          echo "behind_count=$BEHIND" >> "$GITHUB_OUTPUT"
+          echo ">>> 上游提交 $SHA：落后 $BEHIND，自定义提交领先 $AHEAD"
 
-      - name: Merge and Push
+      - name: Merge upstream
         id: merge
         if: steps.check_diff.outputs.behind_count != '0'
         run: |
-          echo ">>> 检测到作者有新更新，正在自动合并..."
-          if ! git merge-base HEAD upstream/master >/dev/null; then
-            echo "::error::Missing shared upstream history. Integrate the verified original baseline before syncing."
-            exit 1
+          source "$SYNC_SCRIPTS/sync-lib.sh"
+          REPORT="${RUNNER_TEMP}/handoff-report.md"
+          git log --oneline -60 "HEAD..$UPSTREAM_REF" > "${RUNNER_TEMP}/upstream-commits.txt"
+          RESOLVED_LOG="${RUNNER_TEMP}/auto-resolve.log"
+          : > "$RESOLVED_LOG"
+
+          if ! BASE=$(git merge-base HEAD "$UPSTREAM_REF"); then
+            {
+              echo "main 与上游 master 没有共同祖先，可能是上游改写了历史或本仓库基线异常。"
+              echo
+              echo '### 处理方式'
+              echo '人工确认上游历史后，在本地重新建立基线并合并，再推送 main。'
+              echo
+              echo "推送到 main 后会自动构建并发布，手机端应用可通过应用内更新收到。下一次定时同步确认已追平上游后会自动关闭本 PR。"
+            } > "$REPORT"
+            echo "result=no-history" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
-          if ! git merge upstream/master --no-edit -m "chore(auto-sync): 自动同步原作者最新更新 (${{ steps.check_diff.outputs.behind_count }} commits)"; then
-            echo "::error::Upstream changes conflict with custom code. Resolve the listed files before publishing."
-            git diff --name-only --diff-filter=U
-            exit 1
+          {
+            echo "MERGE_BASE=$BASE"
+            echo "FORK_HEAD=$(git rev-parse HEAD)"
+          } >> "$GITHUB_ENV"
+
+          MERGE_STATUS=0
+          git -c merge.conflictStyle=diff3 merge --no-commit "$UPSTREAM_REF" > "${RUNNER_TEMP}/merge.log" 2>&1 || MERGE_STATUS=$?
+          cat "${RUNNER_TEMP}/merge.log"
+          if [ "$MERGE_STATUS" -eq 0 ]; then
+            echo "AUTO_RESOLVED=无" >> "$GITHUB_ENV"
+            echo "result=merged" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
-          git push origin main
-          echo "updated=true" >> "$GITHUB_OUTPUT"
-          echo "revision=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
-          echo "Merged upstream; release build follows in the build job." >> "$GITHUB_STEP_SUMMARY"
+
+          git diff --name-only --diff-filter=U > "${RUNNER_TEMP}/conflicts.txt" || true
+          if [ -z "${SYNC_DRILL:-}" ] && python3 "$SYNC_SCRIPTS/auto_resolve.py" --apply | tee "$RESOLVED_LOG"; then
+            RESOLVED=$(grep '^SOLVE ' "$RESOLVED_LOG" | sed 's/^SOLVE //; s/:.*//' | paste -sd '、' -)
+            echo "AUTO_RESOLVED=${RESOLVED:-无}" >> "$GITHUB_ENV"
+            echo "result=merged" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          {
+            echo "上游新增的 $BEHIND 个提交与自定义代码在以下文件产生冲突，无法安全自动合并："
+            echo
+            while IFS= read -r file; do echo "- \`$file\`"; done < "${RUNNER_TEMP}/conflicts.txt"
+            echo
+            echo '自动解决只处理"双方都只是新增内容"的 XML 冲突；其余情况需要人工判断。'
+            echo
+            echo '### 处理方式'
+            echo '**方式 A（网页）**：点击本 PR 中的 “Resolve conflicts”，逐个文件解决后选择 “Commit merge”，再用 **Create a merge commit** 合并本 PR。不要使用 Squash merge，否则上游提交不会成为 main 的祖先，下次同步会重复处理。'
+            echo
+            echo '**方式 B（本地）**'
+            echo '```bash'
+            echo 'git fetch upstream'
+            echo "git merge $UPSTREAM_REF"
+            echo "# 逐个解决冲突后：git add <文件>"
+            echo './gradlew :app:testGithubDebugUnitTest'
+            echo 'git commit && git push origin main'
+            echo '```'
+            echo
+            echo "两种方式推送到 main 后都会自动构建并发布，手机端应用可通过应用内更新收到。下一次定时同步确认已追平上游后会自动关闭本 PR。"
+          } > "$REPORT"
+          git merge --abort
+          echo "result=conflict" >> "$GITHUB_OUTPUT"
+
+      - name: Commit merge
+        if: steps.merge.outputs.result == 'merged'
+        run: |
+          source "$SYNC_SCRIPTS/sync-lib.sh"
+          {
+            echo "chore(auto-sync): 同步上游 $BEHIND 个提交 [skip ci]"
+            echo
+            echo "合并 rikkahub/rikkahub master 提交 $(git rev-parse --short "$MERGE_BASE")..$(git rev-parse --short "$UPSTREAM_REF")。"
+            echo "自定义修改保全校验、编译和单元测试全部通过后才会进入 main。"
+            echo "自动解决的纯新增冲突: ${AUTO_RESOLVED}"
+            echo
+            echo "上游提交:"
+            sed 's/^/- /' "${RUNNER_TEMP}/upstream-commits.txt"
+          } > "${RUNNER_TEMP}/merge-msg.txt"
+          git commit -q -F "${RUNNER_TEMP}/merge-msg.txt"
+          echo ">>> 合并提交 $(git rev-parse --short HEAD)"
+
+      - name: Handle drill without conflict
+        if: steps.drill.outputs.drill == 'true' && steps.merge.outputs.result == 'merged'
+        run: |
+          source "$SYNC_SCRIPTS/sync-lib.sh"
+          echo "SYNC_STATE=drill-no-conflict" >> "$GITHUB_ENV"
+          git push origin --delete "$DRILL_BASE_BRANCH"
+          echo "::error::演练基线与上游之间没有冲突，未覆盖到冲突处理路径。请更换 drill_base_ref / drill_upstream_ref。"
+          exit 1
+
+      - name: Verify custom changes are preserved
+        id: guard
+        if: steps.merge.outputs.result == 'merged'
+        run: |
+          source "$SYNC_SCRIPTS/sync-lib.sh"
+          if python3 "$SYNC_SCRIPTS/verify_fork.py" --markers "$SYNC_SCRIPTS/fork-markers.tsv" \
+            --merged HEAD --base "$MERGE_BASE" --fork "$FORK_HEAD"; then
+            echo "ok=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "ok=false" >> "$GITHUB_OUTPUT"
+          {
+            echo "合并上游后，自定义修改保全校验未通过（详见上方日志）。合并结果没有推送到 main。"
+            echo
+            echo '### 处理方式'
+            echo '本 PR 的分支包含合并结果，可直接查看差异并在分支上修复后用 **Create a merge commit** 合并；或在本地按上游提交逐个排查上游重构的位置，把自定义功能重新接入。'
+            echo
+            echo '- 上游删除或重命名了自定义文件：需要人工迁移自定义代码。'
+            # shellcheck disable=SC2016  # Markdown 反引号需要原样输出
+            echo '- 上游重构了挂载点：修复后同步更新 `.github/scripts/sync/fork-markers.tsv`。'
+            echo
+            echo "修复并推送到 main 后会自动构建并发布，手机端应用可通过应用内更新收到。下一次定时同步确认已追平上游后会自动关闭本 PR。"
+          } > "${RUNNER_TEMP}/handoff-report.md"
+
+      - name: Push merge to staging branch
+        id: stage
+        if: steps.merge.outputs.result == 'merged' && steps.guard.outputs.ok == 'true'
+        run: |
+          source "$SYNC_SCRIPTS/sync-lib.sh"
+          retry 3 10 git push origin "+HEAD:refs/heads/$STAGING_BRANCH"
+          echo "SYNC_STATE=staged" >> "$GITHUB_ENV"
+          echo "staged=true" >> "$GITHUB_OUTPUT"
+          echo "staging_ref=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+      - name: Raise handoff PR
+        if: steps.merge.outputs.result == 'conflict' || steps.merge.outputs.result == 'no-history' || steps.guard.outputs.ok == 'false'
+        env:
+          RESULT: ${{ steps.merge.outputs.result }}
+        run: |
+          source "$SYNC_SCRIPTS/sync-lib.sh"
+          case "$RESULT" in
+            merged)
+              HEAD_SHA=$(git rev-parse HEAD)
+              TITLE="⚠️ 上游同步后自定义修改校验未通过，需要人工处理" ;;
+            *)
+              HEAD_SHA="$UPSTREAM_REF"
+              TITLE="⚠️ 上游同步存在合并冲突，需要人工处理" ;;
+          esac
+          [ -n "${SYNC_DRILL:-}" ] && TITLE="[演练] $TITLE"
+          BODY="${RUNNER_TEMP}/handoff-body.md"
+          {
+            echo "## 上游同步受阻"
+            echo
+            echo "- 上游新增提交：$BEHIND 个（上游提交 \`$(git rev-parse --short "$UPSTREAM_REF")\`）"
+            echo "- 本仓库自定义提交：$AHEAD 个（相对上游）"
+            echo
+            cat "${RUNNER_TEMP}/handoff-report.md"
+            echo
+            echo '<details><summary>上游提交列表</summary>'
+            echo
+            sed 's/^/- /' "${RUNNER_TEMP}/upstream-commits.txt"
+            echo
+            echo '</details>'
+          } > "$BODY"
+          handoff_publish "$TITLE" "$BODY" "$HEAD_SHA"
+
+          if [ -n "${SYNC_DRILL:-}" ]; then
+            drill_cleanup
+            echo "SYNC_STATE=drill-ok" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          echo "SYNC_STATE=blocked" >> "$GITHUB_ENV"
+          echo "::error::同步受阻，已创建或刷新交接 PR。处理完成前，上游更新不会进入 main，也不会发布任何版本。"
+          exit 1
 
       - name: No updates
         if: steps.check_diff.outputs.behind_count == '0'
         run: |
-          echo ">>> 检查完毕：当前已是原作者最新代码，无需同步。"
-          echo "No new upstream commits. No APK was built or published by this run." >> "$GITHUB_STEP_SUMMARY"
+          source "$SYNC_SCRIPTS/sync-lib.sh"
+          if [ -n "${SYNC_DRILL:-}" ]; then
+            echo "SYNC_STATE=drill-no-conflict" >> "$GITHUB_ENV"
+            git push origin --delete "$DRILL_BASE_BRANCH"
+            echo "::error::演练基线已经包含上游提交，未覆盖到冲突处理路径。"
+            exit 1
+          fi
+          echo "SYNC_STATE=no-updates" >> "$GITHUB_ENV"
+          handoff_resolve "main 已追平上游，同步已恢复，自动关闭本 PR。"
+          if [ -n "$(git ls-remote origin "refs/heads/$STAGING_BRANCH")" ]; then
+            git push origin --delete "$STAGING_BRANCH"
+          fi
+
+      - name: Summary
+        if: always()
+        run: |
+          case "${SYNC_STATE:-interrupted}" in
+            staged) NOTE="合并通过保全校验，已推送到 \`$STAGING_BRANCH\`，等待构建、单元测试和发布。" ;;
+            no-updates) NOTE="当前已是上游最新代码，无需同步，没有构建或发布。" ;;
+            blocked) NOTE="同步受阻，上游更新未进入 main，也未发布。请处理交接 PR。" ;;
+            drill-ok) NOTE="演练完成：冲突被识别，交接 PR 已创建并自动关闭。" ;;
+            drill-no-conflict) NOTE="演练未覆盖冲突路径。" ;;
+            *) NOTE="同步流程未完成，请检查上方步骤日志。" ;;
+          esac
+          {
+            echo "### 上游同步结果"
+            echo
+            echo "| 项目 | 值 |"
+            echo "| --- | --- |"
+            echo "| 结果 | $NOTE |"
+            echo "| 上游提交 | \`${UPSTREAM_REF:-}\` |"
+            echo "| 上游新增提交数 | ${BEHIND:-} |"
+            echo "| 自定义提交数 | ${AHEAD:-} |"
+            echo "| 自动解决的纯新增冲突 | ${AUTO_RESOLVED:-} |"
+          } >> "$GITHUB_STEP_SUMMARY"
 
   build:
+    name: Build, test & release
     needs: sync
-    if: needs.sync.outputs.updated == 'true'
+    if: needs.sync.outputs.staged == 'true'
     permissions:
       contents: write
     uses: ./.github/workflows/build-custom-release.yml
     with:
-      source_ref: ${{ needs.sync.outputs.revision }}
+      source_ref: ${{ needs.sync.outputs.staging_ref }}
     secrets: inherit
+
+  promote:
+    name: Promote to main
+    needs: [sync, build]
+    if: needs.sync.outputs.staged == 'true' && needs.build.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+    steps:
+      - name: Checkout main branch
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Fast-forward main
+        env:
+          STAGING_REF: ${{ needs.sync.outputs.staging_ref }}
+        run: |
+          source "$SYNC_SCRIPTS/sync-lib.sh"
+          retry 3 10 git fetch origin main
+          if ! git merge-base --is-ancestor origin/main "$STAGING_REF"; then
+            echo "::error::main 在构建期间有新提交，无法快进到已验证的合并结果。已发布的 Release 基于合并结果；下一次同步会基于新的 main 重新合并。"
+            exit 1
+          fi
+          retry 3 10 git push origin "${STAGING_REF}:refs/heads/main"
+          echo "main 已快进到 $(git rev-parse --short "$STAGING_REF")"
+
+      - name: Close handoff PR
+        run: |
+          source "$SYNC_SCRIPTS/sync-lib.sh"
+          handoff_resolve "同步已恢复：上游更新已合并，构建和单元测试通过，Release 已发布，main 已更新。自动关闭本 PR。"
+
+      - name: Verify in-app update feed
+        env:
+          TAG: ${{ needs.build.outputs.tag }}
+        run: |
+          # 应用内更新读取 GitHub releases/latest；确认它已经对外提供新版本 APK
+          for _ in 1 2 3 4 5 6; do
+            JSON=$(gh api "repos/${GITHUB_REPOSITORY}/releases/latest" 2>/dev/null || echo '{}')
+            FEED=$(printf '%s' "$JSON" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('tag_name','none'), sum(a['name'].endswith('.apk') for a in d.get('assets',[])))" 2>/dev/null || echo "error 0")
+            read -r LATEST COUNT <<< "$FEED" || true
+            if [ "$LATEST" = "$TAG" ] && [ "${COUNT:-0}" -ge 1 ]; then
+              echo "releases/latest 已返回 $TAG，包含 $COUNT 个 APK"
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "::error::releases/latest 没有返回刚发布的 $TAG（当前为 ${LATEST:-空}，APK 数量 ${COUNT:-0}），应用内更新暂时拿不到新版本。"
+          exit 1
+
+      - name: Clean up staging branch
+        run: git push origin --delete "$STAGING_BRANCH"
+
+  handoff:
+    name: Raise handoff (build failed)
+    needs: [sync, build]
+    if: needs.sync.outputs.staged == 'true' && needs.build.result == 'failure'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      pull-requests: write
+      issues: write
+    steps:
+      - name: Checkout main branch
+        uses: actions/checkout@v4
+        with:
+          ref: main
+          fetch-depth: 0
+
+      - name: Raise handoff PR
+        env:
+          STAGING_REF: ${{ needs.sync.outputs.staging_ref }}
+        run: |
+          source "$SYNC_SCRIPTS/sync-lib.sh"
+          BODY="${RUNNER_TEMP}/handoff-body.md"
+          {
+            echo "上游已合并到分支 \`$STAGING_BRANCH\`，但编译或单元测试失败。main 没有改动，没有发布任何版本。"
+            echo
+            echo '### 处理方式'
+            echo '在页脚的运行记录中查看失败的构建步骤（单元测试报告在该运行的 Artifacts 中）。'
+            echo
+            echo '- 本 PR 的分支包含合并结果，可直接查看差异并在分支上修复后用 **Create a merge commit** 合并；'
+            echo '- 或在本地合并上游、修复后推送 main。'
+            echo
+            echo "两种方式推送到 main 后都会自动构建并发布，手机端应用可通过应用内更新收到。下一次定时同步确认已追平上游后会自动关闭本 PR。"
+          } > "$BODY"
+          handoff_publish "⚠️ 上游同步后构建失败，需要人工处理" "$BODY" "$STAGING_REF"
+          echo "::error::构建或单元测试失败，已创建或刷新交接 PR。处理完成前，上游更新不会进入 main，也不会发布任何版本。"
+          exit 1
